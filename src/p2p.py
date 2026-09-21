@@ -48,12 +48,16 @@ async def answer_offer(
         configuration = RTCConfiguration([RTCIceServer(urls=stun_servers)])
     peer = RTCPeerConnection(configuration=configuration)
     closed = False
+    dispatches: set[asyncio.Task] = set()
 
     async def close_once() -> None:
         nonlocal closed
         if closed:
             return
         closed = True
+        for task in list(dispatches):
+            task.cancel()
+        dispatches.clear()
         await on_close()
         with contextlib.suppress(Exception):
             await peer.close()
@@ -69,7 +73,9 @@ async def answer_offer(
                 else:
                     raw_value = raw
                 await on_message(channel, json.loads(raw_value))
-            asyncio.create_task(dispatch())
+            task = asyncio.create_task(dispatch())
+            dispatches.add(task)
+            task.add_done_callback(dispatches.discard)
 
         @channel.on("close")
         def on_channel_close():
@@ -82,9 +88,13 @@ async def answer_offer(
         if peer.connectionState in {"failed", "closed", "disconnected"}:
             await close_once()
 
-    await peer.setRemoteDescription(RTCSessionDescription(sdp=offer["sdp"], type=offer["type"]))
-    answer = await peer.createAnswer()
-    await peer.setLocalDescription(answer)
-    await wait_ice_complete(peer)
+    try:
+        await peer.setRemoteDescription(RTCSessionDescription(sdp=offer["sdp"], type=offer["type"]))
+        answer = await peer.createAnswer()
+        await peer.setLocalDescription(answer)
+        await wait_ice_complete(peer)
+    except Exception:
+        await close_once()
+        raise
     local = peer.localDescription
     return peer, {"type": local.type, "sdp": local.sdp}

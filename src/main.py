@@ -1,8 +1,8 @@
 from __future__ import annotations
-import argparse, asyncio, base64, contextlib, hmac, json, platform, secrets, socket, time
+import argparse, asyncio, base64, contextlib, hmac, json, os, platform, re, secrets, socket, time
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 import uvicorn
@@ -22,6 +22,30 @@ def make_id() -> str:
     return secrets.token_hex(8)
 
 
+def private_json(path: Path, value: Any) -> None:
+    """Write credentials atomically with owner-only permissions from creation."""
+    temporary = path.with_suffix('.tmp')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as output:
+        os.fchmod(output.fileno(), 0o600)
+        json.dump(value, output, ensure_ascii=False, indent=2)
+    temporary.replace(path)
+
+
+def harden_permissions(path: Path) -> None:
+    """Tighten an existing credential file left behind with default umask."""
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+
+
+def forwarding_headers(headers) -> dict[str, str]:
+    """Never send gateway credentials across the Agent trust boundary."""
+    blocked = {'authorization', 'cookie', 'proxy-authorization', 'host', 'content-length',
+               'forwarded', 'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host',
+               'x-forwarded-port', 'x-real-ip'}
+    return {k: v for k, v in headers.items() if k.lower() not in blocked}
+
+
 def hostname() -> str:
     return socket.gethostname() or platform.node() or "Unnamed device"
 
@@ -36,17 +60,16 @@ class Registry:
 
     def load(self):
         if self.path.exists():
+            harden_permissions(self.path)
             try:
                 self.devices = json.loads(self.path.read_text()).get("devices", {})
             except Exception:
                 self.devices = {}
 
     def save(self):
-        tmp = self.path.with_suffix(".tmp")
         devices = {key: {k: v for k, v in value.items() if k != "ws"}
                    for key, value in self.devices.items()}
-        tmp.write_text(json.dumps({"devices": devices}, ensure_ascii=False, indent=2))
-        tmp.replace(self.path)
+        private_json(self.path, {"devices": devices})
 
     def public(self):
         result = []
@@ -64,17 +87,21 @@ class Gateway:
         self.browser_ws: dict[str, WebSocket] = {}
         self.owners: dict[str, WebSocket] = {}
         self.p2p_answers: dict[str, asyncio.Future] = {}
+        self.device_send_locks: dict[int, asyncio.Lock] = {}
+        self.browser_send_locks: dict[str, asyncio.Lock] = {}
+        self.auth_failures: dict[str, list[float]] = {}
+        self.register_attempts: dict[str, list[float]] = {}
         self.app = FastAPI(title="OpenCode Mesh Gateway")
         self.routes()
 
     def check_auth(self, req: Request) -> bool:
         auth = self.cfg.get("auth", {})
         username = str(auth.get("username") or "")
-        if not username:
-            return True
+        if not username or not auth.get("password"):
+            return False
         password = str(auth.get("password") or "")
         expected = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
-        return hmac.compare_digest(req.headers.get("authorization", ""), expected)
+        return hmac.compare_digest(req.headers.get("authorization", "").encode(), expected.encode())
 
     def choose_device(self) -> tuple[str, dict[str, Any]] | None:
         preferred = str(self.cfg.get("default_device") or "")
@@ -86,6 +113,47 @@ class Gateway:
             if device.get("ws"):
                 return device_id, device
         return None
+
+    async def send_to_device(self, ws: WebSocket, message: dict[str, Any]) -> None:
+        """Serialize all Gateway writes to one Agent control connection."""
+        key = id(ws)
+        lock = self.device_send_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            await ws.send_text(json.dumps(message))
+
+    @staticmethod
+    def allow_rate(bucket: dict[str, list[float]], key: str, limit: int, window: float = 60) -> bool:
+        now = time.monotonic()
+        recent = [stamp for stamp in bucket.get(key, []) if now - stamp < window]
+        if len(recent) >= limit:
+            bucket[key] = recent
+            return False
+        recent.append(now)
+        bucket[key] = recent
+        return True
+
+    async def send_browser(self, bridge_id: str, payload: Any, binary: bool) -> None:
+        bridge = self.browser_ws.get(bridge_id)
+        if not bridge:
+            return
+        lock = self.browser_send_locks.setdefault(bridge_id, asyncio.Lock())
+        try:
+            async with lock:
+                if binary:
+                    await bridge.send_bytes(payload)
+                else:
+                    await bridge.send_text(payload)
+        except Exception:
+            self.browser_ws.pop(bridge_id, None)
+
+    async def close_browser(self, bridge_id: str, code: int) -> None:
+        bridge = self.browser_ws.get(bridge_id)
+        if not bridge:
+            return
+        lock = self.browser_send_locks.setdefault(bridge_id, asyncio.Lock())
+        with contextlib.suppress(Exception):
+            async with lock:
+                await bridge.close(code=code)
 
     def resolve_default_device(self) -> str | None:
         """Resolve the default device: the configured default_device first, otherwise the first online device."""
@@ -116,6 +184,9 @@ class Gateway:
             if path == "/_mesh/register" or path.startswith("/_mesh/agent/") or path.startswith("/_mesh/deregister/"):
                 return await call_next(req)
             if not self.check_auth(req):
+                client_ip = req.client.host if req.client else "unknown"
+                if not self.allow_rate(self.auth_failures, client_ip, 10):
+                    return JSONResponse({"error": "too many authentication failures"}, status_code=429)
                 return JSONResponse({"error": "unauthorized"}, status_code=401,
                                     headers={"WWW-Authenticate": 'Basic realm="OpenCode Mesh"'})
             return await call_next(req)
@@ -153,6 +224,9 @@ class Gateway:
 
         @app.post("/_mesh/p2p/offer")
         async def p2p_offer(req: Request):
+            client_ip = req.client.host if req.client else "unknown"
+            if not self.allow_rate(self.register_attempts, f"p2p:{client_ip}", 20):
+                return JSONResponse({"error": "too many P2P offers"}, status_code=429)
             data = await req.json()
             device_id = str(data.get("device_id") or self.cfg.get("default_device") or "")
             device = self.registry.devices.get(device_id) if device_id else None
@@ -165,11 +239,11 @@ class Gateway:
             future = asyncio.get_running_loop().create_future()
             self.p2p_answers[session_id] = future
             try:
-                await agent_ws.send_text(json.dumps({"type": "p2p_offer", "id": session_id,
-                                                     "offer": data, "stun_servers": self.cfg.get("stun_servers", [])}))
+                await self.send_to_device(agent_ws, {"type": "p2p_offer", "id": session_id,
+                                                     "offer": data, "stun_servers": self.cfg.get("stun_servers", [])})
                 return JSONResponse(await asyncio.wait_for(future, 20))
-            except Exception as exc:
-                return JSONResponse({"error": f"P2P connection failed: {exc}"}, status_code=502)
+            except Exception:
+                return JSONResponse({"error": "P2P connection failed"}, status_code=502)
             finally:
                 self.p2p_answers.pop(session_id, None)
 
@@ -206,29 +280,29 @@ class Gateway:
             elif explicit_device:
                 upstream_path = "/" + path
             open_item = {"type": "ws_open", "id": bridge_id, "path": upstream_path,
-                         "query": str(query), "headers": {k: v for k, v in client.headers.items()
-                         if k.lower() not in {"host", "content-length"}}}
+                         "query": str(query), "headers": forwarding_headers(client.headers)}
             try:
-                await agent_ws.send_text(json.dumps(open_item))
+                await self.send_to_device(agent_ws, open_item)
                 while True:
                     msg = await client.receive()
                     if msg.get("type") == "websocket.disconnect":
                         break
                     if msg.get("text") is not None:
-                        await agent_ws.send_text(json.dumps({"type": "ws_data", "id": bridge_id,
-                            "kind": "text", "data": msg["text"]}))
+                        await self.send_to_device(agent_ws, {"type": "ws_data", "id": bridge_id,
+                            "kind": "text", "data": msg["text"]})
                     elif msg.get("bytes") is not None:
-                        await agent_ws.send_text(json.dumps({"type": "ws_data", "id": bridge_id,
-                            "kind": "bytes", "data": base64.b64encode(msg["bytes"]).decode()}))
+                        await self.send_to_device(agent_ws, {"type": "ws_data", "id": bridge_id,
+                            "kind": "bytes", "data": base64.b64encode(msg["bytes"]).decode()})
             except Exception:
                 pass
             finally:
                 try:
-                    await agent_ws.send_text(json.dumps({"type": "ws_close", "id": bridge_id}))
+                    await self.send_to_device(agent_ws, {"type": "ws_close", "id": bridge_id})
                 except Exception:
                     pass
                 self.browser_ws.pop(bridge_id, None)
                 self.owners.pop(bridge_id, None)
+                self.browser_send_locks.pop(bridge_id, None)
                 try:
                     await client.close()
                 except Exception:
@@ -236,10 +310,18 @@ class Gateway:
 
         @app.post("/_mesh/register")
         async def register(req: Request):
+            client_ip = req.client.host if req.client else "unknown"
+            if not self.allow_rate(self.register_attempts, f"register:{client_ip}", 20):
+                return JSONResponse({"error": "too many registration attempts"}, status_code=429)
             data = await req.json()
-            if not hmac.compare_digest(str(data.get("enroll_token", "")), str(self.cfg.get("enroll_token", ""))):
+            if not self.cfg.get("enroll_token") or not hmac.compare_digest(str(data.get("enroll_token", "")).encode(), str(self.cfg.get("enroll_token", "")).encode()):
                 return JSONResponse({"error": "invalid enrollment token"}, status_code=403)
             device_id = str(data.get("device_id") or make_id())
+            if not re.fullmatch(r'[A-Za-z0-9_-]{4,64}', device_id):
+                return JSONResponse({"error": "Invalid device ID"}, status_code=400)
+            existing = self.registry.devices.get(device_id)
+            if existing and not hmac.compare_digest(str(data.get('agent_token', '')).encode(), str(existing.get('auth_token', '')).encode()):
+                return JSONResponse({"error": "Device ownership proof required"}, status_code=403)
             d = self.registry.devices.setdefault(device_id, {"device_id": device_id})
             d.update({"name": data.get("name") or "Unnamed device", "platform": data.get("platform", "unknown"),
                       "service": "opencode", "updated_at": int(time.time())})
@@ -249,10 +331,12 @@ class Gateway:
 
         @app.delete("/_mesh/deregister/{device_id}")
         async def deregister(req: Request, device_id: str):
-            token = str(req.query_params.get("token", ""))
+            token = req.headers.get("x-mesh-agent-token", "")
             d = self.registry.devices.get(device_id)
-            if not d or not hmac.compare_digest(token, str(d.get("auth_token", ""))):
+            if not d or not token or not hmac.compare_digest(token.encode(), str(d.get("auth_token", "")).encode()):
                 return JSONResponse({"error": "unauthorized"}, status_code=403)
+            if d.get("ws"):
+                return JSONResponse({"error": "Stop the Agent before deregistration"}, status_code=409)
             self.registry.devices.pop(device_id, None)
             self.registry.save()
             return {"ok": True}
@@ -260,7 +344,7 @@ class Gateway:
         @app.websocket("/_mesh/agent/{device_id}")
         async def agent(ws: WebSocket, device_id: str):
             d = self.registry.devices.get(device_id)
-            if not d or not hmac.compare_digest(ws.query_params.get("token", ""), d.get("auth_token", "")):
+            if not d or not hmac.compare_digest(ws.headers.get("x-mesh-agent-token", "").encode(), d.get("auth_token", "").encode()):
                 await ws.close(code=4403)
                 return
             await ws.accept()
@@ -282,19 +366,15 @@ class Gateway:
                         bridge_id = item.get("id")
                         bridge = self.browser_ws.get(bridge_id)
                         if bridge:
-                            try:
-                                if item.get("type") == "ws_data":
-                                    if item.get("kind") == "bytes":
-                                        await bridge.send_bytes(base64.b64decode(item.get("data", "")))
-                                    else:
-                                        await bridge.send_text(item.get("data", ""))
-                                elif item.get("type") == "ws_closed":
-                                    await bridge.close(code=item.get("code", 1000))
-                                elif item.get("type") == "ws_error":
-                                    await bridge.close(code=1011)
-                            except Exception:
-                                # A single terminal disconnect must not take the whole device offline.
-                                self.browser_ws.pop(bridge_id, None)
+                            # Never await a slow browser from the shared device receive loop.
+                            if item.get("type") == "ws_data":
+                                binary = item.get("kind") == "bytes"
+                                payload = base64.b64decode(item.get("data", "")) if binary else item.get("data", "")
+                                asyncio.create_task(self.send_browser(bridge_id, payload, binary))
+                            elif item.get("type") == "ws_closed":
+                                asyncio.create_task(self.close_browser(bridge_id, item.get("code", 1000)))
+                            elif item.get("type") == "ws_error":
+                                asyncio.create_task(self.close_browser(bridge_id, 1011))
                     elif item.get("type") == "response":
                         future = self.pending.pop(item.get("id", ""), None)
                         if future and not future.done():
@@ -306,7 +386,7 @@ class Gateway:
                     elif item.get("type") in {"stream_end", "stream_error"}:
                         q = self.streams.get(item.get("id", ""))
                         if q:
-                            await q.put(item)
+                            self.enqueue_stream(q, item)
                     elif item.get("type") == "p2p_answer":
                         future = self.p2p_answers.get(item.get("id", ""))
                         if future and not future.done():
@@ -314,6 +394,7 @@ class Gateway:
             except (WebSocketDisconnect, Exception):
                 pass
             finally:
+                self.device_send_locks.pop(id(ws), None)
                 if d.get("ws") is ws:
                     d.pop("ws", None)
                 for request_id, owner in list(self.owners.items()):
@@ -369,7 +450,7 @@ class Gateway:
                 return await self.stream_proxy(req, d, ws, path, request_id, body)
 
             item = {"type": "request", "id": request_id, "method": req.method, "path": "/" + path,
-                    "query": req.url.query, "headers": dict(req.headers),
+                    "query": req.url.query, "headers": forwarding_headers(req.headers),
                     "body": base64.b64encode(body).decode()}
             loop = asyncio.get_running_loop()
             future = loop.create_future()
@@ -378,18 +459,18 @@ class Gateway:
             completed = False
             try:
                 print(f"proxy request id={request_id} path=/{path}", flush=True)
-                await asyncio.wait_for(ws.send_text(json.dumps(item)), timeout=10)
-                result = await asyncio.wait_for(future, timeout=float(self.cfg.get("request_timeout", 30)))
+                await asyncio.wait_for(self.send_to_device(ws, item), timeout=10)
+                result = await asyncio.wait_for(future, timeout=float(self.cfg.get("request_timeout", 120)))
                 completed = True
-            except Exception as exc:
+            except Exception:
                 self.pending.pop(request_id, None)
-                return JSONResponse({"error": f"Device connection failed: {exc}"}, status_code=502)
+                return JSONResponse({"error": "Device connection failed"}, status_code=502)
             finally:
                 self.pending.pop(request_id, None)
                 self.owners.pop(request_id, None)
                 if not completed:
                     with contextlib.suppress(Exception):
-                        await asyncio.wait_for(ws.send_text(json.dumps({"type": "cancel", "id": request_id})), 2)
+                        await asyncio.wait_for(self.send_to_device(ws, {"type": "cancel", "id": request_id}), 2)
             headers = {k: v for k, v in result.get("headers", {}).items()
                        if k.lower() not in {"content-length", "transfer-encoding", "connection", "content-security-policy", "x-frame-options"}}
             body = base64.b64decode(result.get("body", ""))
@@ -408,10 +489,10 @@ class Gateway:
         self.streams[request_id] = q
         self.owners[request_id] = ws
         item = {"type": "stream_request", "id": request_id, "method": req.method,
-                "path": "/" + path, "query": req.url.query, "headers": dict(req.headers),
+                "path": "/" + path, "query": req.url.query, "headers": forwarding_headers(req.headers),
                 "body": base64.b64encode(body).decode()}
         try:
-            await ws.send_text(json.dumps(item))
+            await self.send_to_device(ws, item)
             first = await asyncio.wait_for(q.get(), timeout=30)
             if first.get("type") == "stream_error":
                 self.streams.pop(request_id, None)
@@ -436,25 +517,45 @@ class Gateway:
                     self.owners.pop(request_id, None)
                     if not ended:
                         with contextlib.suppress(Exception):
-                            await asyncio.wait_for(ws.send_text(json.dumps({"type": "cancel", "id": request_id})), 2)
+                            await asyncio.wait_for(self.send_to_device(ws, {"type": "cancel", "id": request_id}), 2)
             return StreamingResponse(body_iter(), status_code=status, headers=headers)
-        except Exception as exc:
+        except Exception:
             self.streams.pop(request_id, None)
             self.owners.pop(request_id, None)
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(ws.send_text(json.dumps({"type": "cancel", "id": request_id})), 2)
-            return JSONResponse({"error": f"Event stream connection failed: {exc}"}, status_code=502)
+                await asyncio.wait_for(self.send_to_device(ws, {"type": "cancel", "id": request_id}), 2)
+            return JSONResponse({"error": "Event stream connection failed"}, status_code=502)
 
     @staticmethod
     def enqueue_stream(queue: asyncio.Queue, item: dict[str, Any]) -> None:
-        """Drop the oldest event when the browser consumes slowly, to avoid blocking the control-plane receive loop."""
+        """Drop the oldest non-status event when the browser consumes slowly.
+
+        Never evict the first frame: it carries the upstream status and headers, so
+        losing it would make the gateway synthesize a wrong response.
+        """
         try:
             queue.put_nowait(item)
+            return
         except asyncio.QueueFull:
-            with contextlib.suppress(asyncio.QueueEmpty):
-                queue.get_nowait()
+            pass
+        kept: list[Any] = []
+        dropped = False
+        while True:
+            try:
+                pending = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not dropped and not (isinstance(pending, dict) and "status" in pending):
+                dropped = True
+                continue
+            kept.append(pending)
+        if not dropped and kept:
+            kept.pop(0)
+        for pending in kept:
             with contextlib.suppress(asyncio.QueueFull):
-                queue.put_nowait(item)
+                queue.put_nowait(pending)
+        with contextlib.suppress(asyncio.QueueFull):
+            queue.put_nowait(item)
 
 
 class Agent:
@@ -496,7 +597,8 @@ class Agent:
                     while True:
                         msg = await queue.get()
                         if msg.get("type") == "ws_close":
-                            await target.close(); return
+                            await target.close(code=int(msg.get("code", 1000)), reason=str(msg.get("reason", "")) or None)
+                            return
                         if msg.get("type") == "ws_data":
                             data = base64.b64decode(msg["data"]) if msg.get("kind") == "bytes" else msg.get("data", "")
                             await target.send(data)
@@ -570,6 +672,15 @@ class Agent:
         if item.get("type") not in {"request", "stream_request", "ws_open"}:
             return
 
+        encoded_body = item.get("body")
+        if isinstance(encoded_body, str):
+            limit = int(self.cfg.get("max_request_bytes", 64 * 1024 * 1024))
+            if len(encoded_body) > limit * 4 // 3 + 4:
+                await self.p2p_send(channel, {"type": "response", "id": item.get("id", ""), "status": 413,
+                                              "headers": {},
+                                              "body": base64.b64encode(json.dumps({"error": "Request body too large"}).encode()).decode()})
+                return
+
         class ChannelWriter:
             async def send(self, payload: str):
                 await self_outer.p2p_send(channel, json.loads(payload))
@@ -637,6 +748,12 @@ class Agent:
         channel.send(payload)
 
     async def handle_p2p_offer(self, item: dict[str, Any], control) -> None:
+        limit = int(self.cfg.get("max_p2p_peers", 4))
+        if len(self.p2p_peers) >= limit:
+            with contextlib.suppress(Exception):
+                await self.send_control(control, {"type": "p2p_answer", "id": item["id"],
+                                                  "answer": {"error": "too many P2P sessions"}})
+            return
         peer_holder: dict[str, Any] = {}
         channels: set[int] = set()
         async def receive(channel, message):
@@ -656,11 +773,11 @@ class Agent:
             )
             peer_holder["peer"] = peer
             self.p2p_peers.add(peer)
-            await control.send(json.dumps({"type": "p2p_answer", "id": item["id"], "answer": answer}))
-        except (P2PUnavailable, Exception) as exc:
+            await self.send_control(control, {"type": "p2p_answer", "id": item["id"], "answer": answer})
+        except (P2PUnavailable, Exception):
             with contextlib.suppress(Exception):
-                await control.send(json.dumps({"type": "p2p_answer", "id": item["id"],
-                                                "answer": {"error": str(exc)}}))
+                await self.send_control(control, {"type": "p2p_answer", "id": item["id"],
+                                                  "answer": {"error": "P2P negotiation failed"}})
 
     async def handle_request(self, item: dict[str, Any], ws):
         try:
@@ -708,23 +825,30 @@ class Agent:
             await ws.send(json.dumps(message))
 
     async def run(self):
+        gateway_url = str(self.cfg.get("gateway_url", "")).rstrip("/")
+        scheme = urlparse(gateway_url).scheme
+        if scheme not in {"https", "wss"} and not self.cfg.get("allow_insecure_gateway"):
+            raise SystemExit("gateway_url must use https:// (set allow_insecure_gateway for local testing)")
         state = Path(self.cfg.get("state_file", "./data/agent-state.json"))
         state.parent.mkdir(parents=True, exist_ok=True)
+        if state.exists():
+            harden_permissions(state)
         data = json.loads(state.read_text()) if state.exists() else {"device_id": make_id()}
-        state.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-        ws_url = self.cfg["gateway_url"].replace("https://", "wss://").replace("http://", "ws://").rstrip("/")
+        private_json(state, data)
+        ws_url = gateway_url.replace("https://", "wss://").replace("http://", "ws://").rstrip("/")
         reconnect = float(self.cfg.get("reconnect_seconds", 5))
         while True:
             try:
                 async with httpx.AsyncClient(timeout=20) as client:
-                    r = await client.post(self.cfg["gateway_url"].rstrip("/") + "/_mesh/register", json={
+                    r = await client.post(gateway_url + "/_mesh/register", json={
                         "device_id": data["device_id"], "name": hostname(), "platform": platform.platform(),
-                        "enroll_token": self.cfg["enroll_token"]})
+                         "enroll_token": self.cfg["enroll_token"], "agent_token": data.get("agent_token", "")})
                     r.raise_for_status()
                     data.update(r.json())
-                    state.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+                    private_json(state, data)
                 async with websockets.connect(
-                    f"{ws_url}/_mesh/agent/{data['device_id']}?token={quote(data['agent_token'])}",
+                    f"{ws_url}/_mesh/agent/{data['device_id']}",
+                    additional_headers={"X-Mesh-Agent-Token": data['agent_token']},
                     max_size=None, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
                     tasks = {}
                     heartbeat = asyncio.create_task(self.control_heartbeat(ws))
@@ -750,7 +874,17 @@ class Agent:
                                 task = tasks.get(item.get("id"))
                                 if task: task.cancel()
                             elif item.get("type") == "p2p_offer":
-                                asyncio.create_task(self.handle_p2p_offer(item, ws))
+                                p2p_key = f"p2p:{item.get('id')}"
+                                previous = tasks.get(p2p_key)
+                                if previous: previous.cancel()
+                                task = asyncio.create_task(self.handle_p2p_offer(item, ws))
+                                tasks[p2p_key] = task
+                                def finish_p2p(completed, key=p2p_key):
+                                    if tasks.get(key) is completed:
+                                        tasks.pop(key, None)
+                                    if not completed.cancelled():
+                                        completed.exception()
+                                task.add_done_callback(finish_p2p)
                             elif item.get("type") == "ping":
                                 await ws.send(json.dumps({"type": "pong"}))
                             elif item.get("type") in {"ws_data", "ws_close"}:

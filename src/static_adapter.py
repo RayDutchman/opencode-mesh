@@ -13,7 +13,7 @@ TRANSPORT_ADAPTER = r"""
   const unb64 = text => Uint8Array.from(atob(text || ''), c => c.charCodeAt(0));
   const timeout = (promise, ms) => Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))]);
 
-  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), closed: false, deviceId: null };
+  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000 };
 
   const requestPath = input => {
     const url = new URL(typeof input === 'string' ? input : input.url, location.href);
@@ -155,7 +155,22 @@ TRANSPORT_ADAPTER = r"""
     }
   }
 
+  function scheduleReconnect() {
+    if (state.reconnectTimer) return;
+    const generation = state.generation;
+    failTransport(new Error('P2P disconnected; request outcome may be unknown'));
+    state.pc = null; state.channel = null; state.closed = true;
+    state.reconnectTimer = setTimeout(() => {
+      state.reconnectTimer = null;
+      if (generation !== state.generation) return;
+      state.ready = connectP2P(state.deviceId)
+        .then(() => { state.reconnectDelay = 1000; })
+        .catch(() => { state.reconnectDelay = Math.min(state.reconnectDelay * 2, 30000); scheduleReconnect(); });
+    }, state.reconnectDelay);
+  }
+
   async function connectP2P(deviceId) {
+    state.closed = false;
     const manifestUrl = deviceId ? `/_mesh/transport-manifest?device=${encodeURIComponent(deviceId)}` : '/_mesh/transport-manifest';
     const manifestResponse = await nativeFetch(manifestUrl, { credentials: 'same-origin' });
     if (!manifestResponse.ok) throw new Error('transport manifest unavailable');
@@ -164,8 +179,8 @@ TRANSPORT_ADAPTER = r"""
     if (!state.manifest.p2p || !state.manifest.p2p.enabled || !window.RTCPeerConnection) throw new Error('p2p unavailable');
     const pc = new RTCPeerConnection({ iceServers: (state.manifest.stun_servers || []).map(urls => ({ urls })) });
     const channel = pc.createDataChannel('opencode-mesh', { ordered: true });
-    channel.onclose = () => failTransport(new Error('P2P disconnected; request outcome may be unknown'));
-    channel.onerror = () => failTransport(new Error('P2P data channel error'));
+    channel.onclose = () => scheduleReconnect();
+    channel.onerror = () => scheduleReconnect();
     channel.onmessage = event => { try { settle(JSON.parse(typeof event.data === 'string' ? event.data : dec.decode(event.data))); } catch (_) {} };
     state.pc = pc; state.channel = channel;
     const offer = await pc.createOffer();
@@ -180,12 +195,15 @@ TRANSPORT_ADAPTER = r"""
 
   async function reconnectForDevice() {
     const deviceId = currentDeviceId();
-    if (deviceId === state.deviceId) return;
+    if (deviceId === state.routeDeviceId) return;
+    state.generation += 1;
+    if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
     if (state.pc) { try { state.pc.close(); } catch (_) {} }
     state.pc = null; state.channel = null; state.manifest = null;
     failTransport(new Error('device switched'));
     state.closed = false;
-    state.ready = connectP2P(deviceId).catch(() => null);
+    state.routeDeviceId = deviceId;
+    state.ready = connectP2P(deviceId).catch(() => { scheduleReconnect(); return null; });
   }
 
   for (const name of ['pushState', 'replaceState']) {
