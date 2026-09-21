@@ -2,7 +2,7 @@
 
 基线：通过当前真实 OpenCode Web 会话访问 `GET /doc`，返回 **162 个路径、188 个操作**；运行版本为 `1.18.30`。完整机器可读路由目录由 `GET /doc` 生成，禁止凭猜测删减 API。
 
-当前实现证据（2026-09-21）：Relay HTTP/HTML、6 MB Provider 响应、P2P HTTP、P2P SSE 首帧、P2P EventSource、P2P WebSocket 错误关闭均已在真实浏览器验证；P2P 成功 candidate pair 使用 Agent 的 `10.0.0.101` host candidate，业务数据未走 VPS。PTY 正常创建、输入、cursor 重连仍需真实交互验收；LAN 独立入口尚未启用（当前设备通过 P2P 优先，Relay 兜底）。
+当前实现证据（2026-09-21）：Relay HTTP/HTML、6 MB Provider 响应、P2P HTTP、P2P SSE 首帧、P2P EventSource、P2P WebSocket 错误关闭均已在真实浏览器验证。两台设备均已实测：WSL Agent 使用 `10.0.0.101` host candidate，第二台 ARM64 Agent 使用 `10.0.0.149` host candidate，业务数据未走 VPS。PTY 正常创建、输入、cursor 重连仍需真实交互验收；LAN 独立入口尚未启用（当前设备通过 P2P 优先，Relay 兜底）。
 
 ## 路径类别
 
