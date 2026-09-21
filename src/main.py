@@ -8,7 +8,7 @@ import httpx
 import uvicorn
 import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from .p2p import P2PUnavailable, answer_offer
 from .static_adapter import TRANSPORT_ADAPTER
 
@@ -47,6 +47,64 @@ def forwarding_headers(headers) -> dict[str, str]:
 
 
 DEFAULT_STUN_SERVERS = ["stun:stun.l.google.com:19302"]
+
+OFFLINE_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenCode Mesh</title>
+<style>
+:root{color-scheme:light dark}
+body{margin:0;font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#fafafa;color:#111;display:flex;min-height:100vh;align-items:center;justify-content:center}
+@media (prefers-color-scheme:dark){body{background:#080808;color:#fafafa}}
+.card{width:min(520px,calc(100vw - 48px));padding:24px 28px;border:1px solid rgba(127,127,127,.3);border-radius:12px}
+h1{font-size:15px;margin:0 0 6px}
+p{margin:0 0 14px;opacity:.7}
+ul{list-style:none;margin:0;padding:0}
+li{display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid rgba(127,127,127,.2)}
+.dot{width:8px;height:8px;border-radius:50%;background:#9ca3af}
+.dot.on{background:#22c55e}
+.name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.state{opacity:.6;font-size:12px}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>OpenCode Mesh</h1>
+<p id="msg">No device is online. This page refreshes automatically.</p>
+<ul id="list"></ul>
+</div>
+<script>
+var target = __TARGET__;
+var msg = document.getElementById('msg');
+var list = document.getElementById('list');
+function render(devices){
+  list.textContent = '';
+  devices.forEach(function(d){
+    var li = document.createElement('li');
+    var dot = document.createElement('span'); dot.className = 'dot' + (d.online ? ' on' : '');
+    var name = document.createElement('span'); name.className = 'name'; name.textContent = d.name || d.device_id;
+    var state = document.createElement('span'); state.className = 'state'; state.textContent = d.online ? 'online' : 'offline';
+    li.append(dot, name, state); list.append(li);
+  });
+  var ready = target ? devices.some(function(d){ return d.device_id === target && d.online; }) : devices.some(function(d){ return d.online; });
+  if (ready) location.reload();
+}
+function tick(){
+  fetch('/_mesh/devices', {credentials:'same-origin', cache:'no-store'}).then(function(r){ return r.ok ? r.json() : null; }).then(function(data){
+    if (!data) return;
+    var devices = Array.isArray(data.devices) ? data.devices : [];
+    msg.textContent = target ? 'Device is offline. This page refreshes automatically.' : 'No device is online. This page refreshes automatically.';
+    render(devices);
+  }).catch(function(){});
+}
+tick();
+setInterval(tick, 3000);
+</script>
+</body>
+</html>
+"""
 
 
 def hostname() -> str:
@@ -106,6 +164,14 @@ class Gateway:
         expected = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
         return hmac.compare_digest(req.headers.get("authorization", "").encode(), expected.encode())
 
+    @staticmethod
+    def is_online(device: dict[str, Any] | None, stale_after: float = 45) -> bool:
+        """A device counts as online only while its control connection is fresh."""
+        if not device or not device.get("ws"):
+            return False
+        last_seen = device.get("last_seen")
+        return not last_seen or (time.time() - float(last_seen)) <= stale_after
+
     def choose_device(self) -> tuple[str, dict[str, Any]] | None:
         preferred = str(self.cfg.get("default_device") or "")
         candidates = []
@@ -113,7 +179,7 @@ class Gateway:
             candidates.append((preferred, self.registry.devices[preferred]))
         candidates.extend((k, v) for k, v in self.registry.devices.items() if k != preferred)
         for device_id, device in candidates:
-            if device.get("ws"):
+            if self.is_online(device):
                 return device_id, device
         return None
 
@@ -158,10 +224,27 @@ class Gateway:
             async with lock:
                 await bridge.close(code=code)
 
+    @staticmethod
+    def wants_html(req: Request) -> bool:
+        return "text/html" in req.headers.get("accept", "")
+
+    def offline_response(self, req: Request, device_id: str | None, known: bool = False):
+        """Browsers get a friendly page; API clients keep getting JSON."""
+        if self.wants_html(req):
+            return HTMLResponse(self.offline_page(device_id), headers={"Cache-Control": "no-store"})
+        if device_id:
+            return JSONResponse({"error": "Specified device offline or not found", "device_id": device_id},
+                                status_code=503 if known else 404)
+        return JSONResponse({"error": "Device offline or no device selected"}, status_code=503)
+
+    @staticmethod
+    def offline_page(device_id: str | None) -> str:
+        return OFFLINE_PAGE.replace("__TARGET__", json.dumps(device_id))
+
     def resolve_default_device(self) -> str | None:
         """Resolve the default device: the configured default_device first, otherwise the first online device."""
         preferred = str(self.cfg.get("default_device") or "")
-        if preferred and self.registry.devices.get(preferred, {}).get("ws"):
+        if preferred and self.is_online(self.registry.devices.get(preferred)):
             return preferred
         selected = self.choose_device()
         return selected[0] if selected else None
@@ -426,25 +509,24 @@ class Gateway:
                 path = routed_path.lstrip("/")
             elif path.startswith("_mesh/"):
                 return JSONResponse({"error": "not found"}, status_code=404)
-            device_id = explicit_device or self.cfg.get("default_device")
-            d = self.registry.devices.get(str(device_id)) if device_id else None
-            ws = d.get("ws") if d else None
-            if ws and d.get("last_seen", 0) and time.time() - float(d.get("last_seen", 0)) > 45:
-                try:
-                    await ws.close(code=1011)
-                except Exception:
-                    pass
-                ws = None
-            if not ws:
-                # An explicitly specified device must never be substituted by another online device.
-                if device_id:
-                    return JSONResponse({"error": "Specified device offline or not found", "device_id": device_id}, status_code=503 if d else 404)
+
+            if explicit_device:
+                # An explicitly routed device must never be substituted by another one.
+                d = self.registry.devices.get(explicit_device)
+                if d and d.get("ws") and not self.is_online(d):
+                    with contextlib.suppress(Exception):
+                        await d["ws"].close(code=1011)
+                if not self.is_online(d):
+                    return self.offline_response(req, explicit_device, known=bool(d))
+                device_id, ws = explicit_device, d["ws"]
+            else:
+                # The configured default is a preference, not a hard requirement:
+                # fall back to any other online device, and show a friendly page when none is online.
                 selected = self.choose_device()
-                if selected:
-                    device_id, d = selected
-                    ws = d.get("ws")
-                else:
-                    return JSONResponse({"error": "Device offline or no device selected"}, status_code=503)
+                if not selected:
+                    return self.offline_response(req, None)
+                device_id, d = selected
+                ws = d["ws"]
             request_id = secrets.token_urlsafe(12)
             body = await req.body()
             if len(body) > int(self.cfg.get("max_request_bytes", 64 * 1024 * 1024)):
