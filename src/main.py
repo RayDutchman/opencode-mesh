@@ -8,7 +8,7 @@ import httpx
 import uvicorn
 import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from .p2p import P2PUnavailable, answer_offer
 from .static_adapter import TRANSPORT_ADAPTER
 
@@ -59,7 +59,6 @@ class Gateway:
     def __init__(self, cfg: dict[str, Any]):
         self.cfg = cfg
         self.registry = Registry(cfg)
-        self.sessions: dict[str, str] = {}
         self.pending: dict[str, asyncio.Future] = {}
         self.streams: dict[str, asyncio.Queue] = {}
         self.browser_ws: dict[str, WebSocket] = {}
@@ -68,9 +67,14 @@ class Gateway:
         self.app = FastAPI(title="OpenCode Mesh Gateway")
         self.routes()
 
-    def logged(self, req: Request) -> bool:
-        sid = req.cookies.get("ocm_session")
-        return bool(sid and sid in self.sessions)
+    def check_auth(self, req: Request) -> bool:
+        auth = self.cfg.get("auth", {})
+        username = str(auth.get("username") or "")
+        if not username:
+            return True
+        password = str(auth.get("password") or "")
+        expected = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
+        return hmac.compare_digest(req.headers.get("authorization", ""), expected)
 
     def choose_device(self) -> tuple[str, dict[str, Any]] | None:
         preferred = str(self.cfg.get("default_device") or "")
@@ -83,8 +87,38 @@ class Gateway:
                 return device_id, device
         return None
 
+    def resolve_default_device(self) -> str | None:
+        """解析默认设备：优先配置的 default_device，否则第一个在线设备。"""
+        preferred = str(self.cfg.get("default_device") or "")
+        if preferred and self.registry.devices.get(preferred, {}).get("ws"):
+            return preferred
+        selected = self.choose_device()
+        return selected[0] if selected else None
+
+    @staticmethod
+    def parse_device_route(path: str) -> tuple[str | None, str]:
+        """解析设备虚拟 Server URL，并保留 OpenCode 原始路径。"""
+        prefix = "/_mesh/device/"
+        if not path.startswith(prefix):
+            return None, path
+        remainder = path[len(prefix):]
+        device_id, separator, upstream = remainder.partition("/")
+        if not device_id or any(char in device_id for char in "/\\."):
+            raise ValueError("无效的设备路由")
+        return device_id, "/" + upstream
+
     def routes(self):
         app = self.app
+
+        @app.middleware("http")
+        async def basic_auth_middleware(req: Request, call_next):
+            path = req.url.path
+            if path == "/_mesh/register" or path.startswith("/_mesh/agent/"):
+                return await call_next(req)
+            if not self.check_auth(req):
+                return JSONResponse({"error": "unauthorized"}, status_code=401,
+                                    headers={"WWW-Authenticate": 'Basic realm="OpenCode Mesh"'})
+            return await call_next(req)
 
         @app.on_event("shutdown")
         async def shutdown_bridges():
@@ -94,60 +128,22 @@ class Gateway:
                 with contextlib.suppress(Exception):
                     await bridge.close(code=1001)
 
-        @app.get("/_mesh", response_class=HTMLResponse)
-        async def mesh_home(req: Request):
-            if not self.logged(req):
-                return RedirectResponse("/_mesh/login")
-            return HTMLResponse(SHELL)
-
-        @app.get("/_mesh/login", response_class=HTMLResponse)
-        async def login_page():
-            return HTMLResponse(LOGIN)
-
-        @app.post("/_mesh/login")
-        async def login(req: Request):
-            try:
-                data = await req.json()
-            except Exception:
-                data = {}
-            auth = self.cfg.get("auth", {})
-            if not (hmac.compare_digest(str(data.get("username", "")).encode(), str(auth.get("username", "")).encode()) and
-                    hmac.compare_digest(str(data.get("password", "")).encode(), str(auth.get("password", "")).encode())):
-                return JSONResponse({"error": "账号或密码错误"}, status_code=401)
-            sid = secrets.token_urlsafe(32)
-            self.sessions[sid] = str(auth.get("username"))
-            out = JSONResponse({"ok": True})
-            secure = bool(self.cfg.get("secure_cookie", True))
-            out.set_cookie("ocm_session", sid, httponly=True, secure=secure, samesite="lax")
-            selected = self.choose_device()
-            if selected:
-                out.set_cookie("ocm_device", selected[0], httponly=True, secure=secure, samesite="lax")
-                out.body = json.dumps({"ok": True, "device_id": selected[0]}).encode()
-                out.headers["content-length"] = str(len(out.body))
-            return out
-
-        @app.post("/_mesh/logout")
-        async def logout(req: Request):
-            self.sessions.pop(req.cookies.get("ocm_session", ""), None)
-            out = JSONResponse({"ok": True})
-            out.delete_cookie("ocm_session")
-            return out
-
         @app.get("/_mesh/devices")
         async def devices(req: Request):
-            if not self.logged(req):
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
-            return {"devices": self.registry.public()}
+            return {"devices": self.registry.public(), "default_device": self.resolve_default_device()}
 
         @app.get("/_mesh/transport-manifest")
         async def transport_manifest(req: Request):
-            if not self.logged(req):
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
-            device_id = req.cookies.get("ocm_device") or self.cfg.get("default_device")
+            device_id = req.query_params.get("device") or self.cfg.get("default_device") or ""
             device = self.registry.devices.get(str(device_id)) if device_id else None
+            if not device:
+                selected = self.choose_device()
+                if selected:
+                    device_id, device = selected
             return {
                 "version": 1,
-                "device_id": device_id,
+                "device_id": device_id or None,
+                "server_url": f"{str(req.base_url).rstrip('/')}/_mesh/device/{quote(str(device_id), safe='')}" if device_id else None,
                 "relay": str(req.base_url).rstrip("/"),
                 "lan": self.cfg.get("lan_base_url"),
                 "p2p": {"enabled": bool(device and device.get("ws")), "offer": "/_mesh/p2p/offer"},
@@ -157,14 +153,12 @@ class Gateway:
 
         @app.post("/_mesh/p2p/offer")
         async def p2p_offer(req: Request):
-            if not self.logged(req):
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
-            device_id = req.cookies.get("ocm_device") or self.cfg.get("default_device")
-            device = self.registry.devices.get(str(device_id)) if device_id else None
+            data = await req.json()
+            device_id = str(data.get("device_id") or self.cfg.get("default_device") or "")
+            device = self.registry.devices.get(device_id) if device_id else None
             agent_ws = device.get("ws") if device else None
             if not agent_ws:
                 return JSONResponse({"error": "设备离线"}, status_code=503)
-            data = await req.json()
             if len(json.dumps(data)) > int(self.cfg.get("max_p2p_offer_bytes", 1024 * 1024)):
                 return JSONResponse({"error": "P2P 信令过大"}, status_code=413)
             session_id = secrets.token_urlsafe(18)
@@ -179,23 +173,23 @@ class Gateway:
             finally:
                 self.p2p_answers.pop(session_id, None)
 
-        @app.post("/_mesh/switch/{device_id}")
-        async def switch(req: Request, device_id: str):
-            if not self.logged(req) or device_id not in self.registry.devices:
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
-            out = JSONResponse({"ok": True, "device_id": device_id})
-            out.set_cookie("ocm_device", device_id, httponly=True, secure=bool(self.cfg.get("secure_cookie", True)), samesite="lax")
-            return out
-
         @app.websocket("/_mesh/ws/{path:path}")
+        @app.websocket("/_mesh/device/{path:path}")
         @app.websocket("/api/pty/{path:path}")
         @app.websocket("/pty/{path:path}")
         async def browser_ws(client: WebSocket, path: str):
-            sid = client.cookies.get("ocm_session")
-            if not (sid and sid in self.sessions):
+            if not self.check_auth(client):
                 await client.close(code=4401)
                 return
-            device_id = client.cookies.get("ocm_device") or self.cfg.get("default_device")
+            explicit_device = None
+            if client.url.path.startswith("/_mesh/device/"):
+                try:
+                    explicit_device, path = self.parse_device_route(client.url.path)
+                    path = path.lstrip("/")
+                except ValueError:
+                    await client.close(code=4404)
+                    return
+            device_id = explicit_device or self.cfg.get("default_device")
             d = self.registry.devices.get(str(device_id))
             agent_ws = d.get("ws") if d else None
             if not agent_ws:
@@ -208,6 +202,8 @@ class Gateway:
             query = client.query_params
             upstream_path = client.url.path
             if upstream_path.startswith("/_mesh/ws/"):
+                upstream_path = "/" + path
+            elif explicit_device:
                 upstream_path = "/" + path
             open_item = {"type": "ws_open", "id": bridge_id, "path": upstream_path,
                          "query": str(query), "headers": {k: v for k, v in client.headers.items()
@@ -327,11 +323,16 @@ class Gateway:
 
         @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
         async def proxy(req: Request, path: str):
-            if path.startswith("_mesh/"):
+            explicit_device = None
+            try:
+                explicit_device, routed_path = self.parse_device_route("/" + path)
+            except ValueError:
+                return JSONResponse({"error": "无效的设备路由"}, status_code=404)
+            if explicit_device:
+                path = routed_path.lstrip("/")
+            elif path.startswith("_mesh/"):
                 return JSONResponse({"error": "not found"}, status_code=404)
-            if not self.logged(req):
-                return RedirectResponse("/_mesh/login")
-            device_id = req.cookies.get("ocm_device") or self.cfg.get("default_device")
+            device_id = explicit_device or self.cfg.get("default_device")
             d = self.registry.devices.get(str(device_id)) if device_id else None
             ws = d.get("ws") if d else None
             if ws and d.get("last_seen", 0) and time.time() - float(d.get("last_seen", 0)) > 45:
@@ -341,6 +342,9 @@ class Gateway:
                     pass
                 ws = None
             if not ws:
+                # 明确指定的设备绝不能被另一台在线设备替代。
+                if device_id:
+                    return JSONResponse({"error": "指定设备离线或不存在", "device_id": device_id}, status_code=503 if d else 404)
                 selected = self.choose_device()
                 if selected:
                     device_id, d = selected
@@ -513,7 +517,7 @@ class Agent:
     async def local_stream(self, item: dict[str, Any], ws):
         url = self.target + item["path"]
         if item.get("query"): url += "?" + item["query"]
-        headers = {k: v for k, v in item.get("headers", {}).items() if k.lower() not in {"host", "content-length"}}
+        headers = {k: v for k, v in item.get("headers", {}).items() if k.lower() not in {"host", "content-length", "authorization", "cookie"}}
         basic = self.cfg.get("opencode_basic_auth")
         auth = httpx.BasicAuth(str(basic["username"]), str(basic.get("password", ""))) if isinstance(basic, dict) else None
         try:
@@ -664,7 +668,7 @@ class Agent:
         url = self.target + item["path"]
         if item.get("query"):
             url += "?" + item["query"]
-        headers = {k: v for k, v in item.get("headers", {}).items() if k.lower() not in {"host", "content-length"}}
+        headers = {k: v for k, v in item.get("headers", {}).items() if k.lower() not in {"host", "content-length", "authorization", "cookie"}}
         auth = None
         basic = self.cfg.get("opencode_basic_auth")
         if isinstance(basic, dict) and basic.get("username") is not None:
@@ -757,16 +761,13 @@ class Agent:
 
 
 def inject_mesh_bar(body: bytes) -> bytes:
-    """Inject a small device bar; OpenCode static resources remain cacheable."""
-    tag = b"</body>"
-    addon = """<style id='ocm-style'>#ocm-bar{position:fixed;z-index:2147483647;top:0;left:0;right:0;height:36px;display:flex;align-items:center;gap:6px;padding:0 10px;background:#15181dcc;color:#fff;font:13px system-ui;backdrop-filter:blur(8px)}#ocm-bar button{border:0;border-radius:5px;padding:4px 8px;cursor:pointer}body{padding-top:36px!important}</style><div id='ocm-bar'><b>OpenCode Mesh</b><span id='ocm-devices'>加载设备…</span></div><script id='ocm-script'>(async()=>{const h=document.getElementById('ocm-devices');try{const r=await fetch('/_mesh/devices'),x=await r.json();h.innerHTML=x.devices.map(v=>`<button data-id=\"${v.device_id}\">${v.name}${v.online?' ●':' ○'}</button>`).join('');h.querySelectorAll('button').forEach(b=>b.onclick=async()=>{await fetch('/_mesh/switch/'+b.dataset.id,{method:'POST'});location.reload()})}catch(e){h.textContent='设备列表不可用'}})()</script>""".encode("utf-8")
+    """只注入传输适配器，设备列表交给 OpenCode 原生 Server UI。"""
     adapter = TRANSPORT_ADAPTER.encode("utf-8")
     if b"</head>" in body and b"ocm-transport-adapter" not in body:
         body = body.replace(b"</head>", adapter + b"</head>", 1)
-    return body.replace(tag, addon + tag, 1) if tag in body else body
+    return body
 
-LOGIN = '''<!doctype html><meta name="viewport" content="width=device-width"><title>OpenCode Mesh 登录</title><style>body{font:16px system-ui;max-width:360px;margin:15vh auto;padding:24px}input,button{box-sizing:border-box;width:100%;padding:12px;margin:6px 0}</style><h2>OpenCode Mesh</h2><input id=u placeholder="账号"><input id=p type=password placeholder="密码"><button onclick="go()">登录</button><p id=e></p><script>async function go(){let r=await fetch('/_mesh/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:u.value,password:p.value})});if(r.ok)location='/';else e.textContent=(await r.json()).error}</script>'''
-SHELL = '''<!doctype html><meta name="viewport" content="width=device-width"><title>OpenCode Mesh</title><style>body{margin:0;font:14px system-ui}header{min-height:48px;display:flex;gap:8px;align-items:center;padding:0 12px;background:#202124;color:white;flex-wrap:wrap}button{padding:7px 12px}#app{height:calc(100vh - 60px);overflow:auto}</style><header><b>OpenCode</b><span id=d>正在加载设备…</span><button onclick="logout()">退出</button></header><main id=app>设备切换层已启动，OpenCode 数据面将在当前设备连接后显示。</main><script>async function init(){let r=await fetch('/_mesh/devices');if(!r.ok)return;let x=await r.json();d.innerHTML=x.devices.map(v=>`<button onclick="sw('${v.device_id}')">${v.name}${v.online?' ●':' ○'}</button>`).join('')}async function sw(id){await fetch('/_mesh/switch/'+id,{method:'POST'});location.reload()}async function logout(){await fetch('/_mesh/logout',{method:'POST'});location='/_mesh/login'}init()</script>'''
+
 
 
 def main():
