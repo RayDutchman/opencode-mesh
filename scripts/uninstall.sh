@@ -13,10 +13,15 @@ info() { printf '\033[1;34m[mesh]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[mesh]\033[0m %s\n' "$*"; }
 err()  { printf '\033[1;31m[mesh]\033[0m %s\n' "$*" >&2; }
 
+TTY_AVAILABLE=""
+if { : >/dev/tty; } 2>/dev/null; then
+  TTY_AVAILABLE="/dev/tty"
+fi
+
 ask() {
   local prompt="$1" default="$2" value=""
-  if [ -t 1 ]; then
-    read -rp "${prompt} [${default}]: " value < /dev/tty 2>/dev/null || true
+  if [ -n "$TTY_AVAILABLE" ]; then
+    read -rp "${prompt} [${default}]: " value < "$TTY_AVAILABLE" 2>/dev/null || value=""
   fi
   printf '%s' "${value:-$default}"
 }
@@ -42,9 +47,9 @@ else
 fi
 
 for svc in "${SERVICES[@]}"; do
-  if $SC_CMD list-unit-files 2>/dev/null | grep -q "^${svc}\."; then
+  if [ -f "${UNIT_DIR}/${svc}.service" ]; then
     info "停止并禁用 ${svc} ..."
-    $SC_CMD stop "${svc}.service" 2>/dev/null || true
+    $SC_CMD stop "${svc}.service"
     $SC_CMD disable "${svc}.service" 2>/dev/null || true
     rm -f "${UNIT_DIR}/${svc}.service"
   fi
@@ -58,7 +63,7 @@ if [ "$MODE" = "agent" ] && [ -f "$INSTALL_DIR/config/agent.json" ] && [ -f "$IN
   TOKEN="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("agent_token",""))' "$INSTALL_DIR/data/agent-state.json" 2>/dev/null || true)"
   if [ -n "$GATEWAY_URL" ] && [ -n "$DEVICE_ID" ] && [ -n "$TOKEN" ]; then
     info "注销设备 ${DEVICE_ID} ..."
-    curl -fsSL -X DELETE "${GATEWAY_URL}/_mesh/deregister/${DEVICE_ID}?token=${TOKEN}" >/dev/null 2>&1 || warn "注销失败（Gateway 不可达或已移除）"
+    curl -fsSL --max-time 15 -H "X-Mesh-Agent-Token: ${TOKEN}" -X DELETE "${GATEWAY_URL}/_mesh/deregister/${DEVICE_ID}" >/dev/null 2>&1 || warn "Device deregistration failed; gateway registration may remain"
   fi
 fi
 

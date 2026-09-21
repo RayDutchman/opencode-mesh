@@ -31,6 +31,21 @@
 
 LAN / WebRTC host candidate → STUN / 外部候选 → VPS Relay。P2P 直连按当前设备上下文建立，切换设备时自动重建连接。
 
+### 身份与互联模型
+
+Agent 不会“自动发现”或“自动连接”任何服务器：它只连接配置里明确写入的 `gateway_url`。一次互联由两组东西决定：
+
+- **属于 Gateway（整台服务器共享）**：`gateway_url`（公网地址）+ `enroll_token`（加入密钥）。同一 Gateway 上的所有设备共用同一个 `enroll_token`。
+- **属于每台设备（唯一）**：`device_id`（Agent 首次启动随机生成并持久化）+ `agent_token`（注册时由 Gateway 签发，绑定该 `device_id`，用于控制连接和注销）。
+
+因此：
+
+- 只给源码、不告诉对方你的 `gateway_url` 和 `enroll_token`，对方**不会**连到你的服务器；对方会部署自己的 Gateway，用自己生成的 `enroll_token`。
+- 如果你把带自己 `gateway_url` + `enroll_token` 的一键命令发给别人，对方就会注册进**你的** Gateway。`enroll_token` 是共享加入密钥，拿到它的人可以注册任意设备，因此**不要公开分发**。
+- 当前模型是**单运营者/自托管**：一个 Gateway 由一个人运维，设备都属于同一个人。它**不是**多租户系统——没有“每用户独立账号”的概念。若需要多用户共用一台 Gateway，需要额外设计（每用户签发独立 enroll 凭据、设备归属与访问控制），目前未实现。
+
+Gateway 的浏览器登录账号（HTTP Basic Auth）在安装时自定义，通过 `MESH_USERNAME` 指定，没有写死默认值。
+
 ## 安装
 
 在目标设备上执行（交互式，会询问配置）：
@@ -50,16 +65,24 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 通过环境变量预填，跳过提问：
 
 ```bash
+# Agent
 MESH_GATEWAY_URL=https://网关地址 \
 MESH_ENROLL_TOKEN='网关 enroll_token' \
 OPENCODE_URL=http://127.0.0.1:40960 \
 OPENCODE_USERNAME=opencode \
 OPENCODE_PASSWORD='本机 OpenCode 密码' \
 bash -c 'curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | bash -s -- agent'
+
+# Gateway（登录账号自定义，不再默认 opencode）
+MESH_USERNAME='你的登录名' \
+MESH_PASSWORD='你的登录密码' \
+MESH_LISTEN_PORT=18080 \
+bash -c 'curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | bash -s -- gateway'
 ```
 
 ### 配置说明
 
+- `MESH_USERNAME` / `MESH_PASSWORD`：Gateway 浏览器登录账号，安装时必须显式提供，不写死默认值。
 - `OPENCODE_URL` 必须按本机实际地址填写（含端口），不固定为 `40960`。
 - `OPENCODE_PASSWORD` 可选：本机 OpenCode 未启用认证（未设置 `OPENCODE_SERVER_PASSWORD`）时留空即可，Agent 将以无认证方式访问。
 - 运行身份决定 systemd 级别：`root` 安装到 `/opt/opencode-mesh` + 系统级服务；普通用户安装到 `~/.local/share/opencode-mesh` + 用户级服务（自动启用 linger）。
@@ -81,10 +104,11 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 
 ## 配置参考
 
-复制 `config/gateway.example.json` 为 `gateway.json`，复制 `config/agent.example.json` 为 `agent.json`，两端使用相同的 `enroll_token`。真实配置和 `data/` 已在 `.gitignore` 中排除。
+复制 `config/gateway.example.json` 为 `gateway.json`，复制 `config/agent.example.json` 为 `agent.json`，两端使用相同的 `enroll_token`（Gateway 侧即“加入密钥”）。`auth.username`/`auth.password` 可自定义任意值，示例中的 `CHANGE_ME` 必须替换。真实配置和 `data/` 已在 `.gitignore` 中排除。
 
 不要把 OpenCode 账号密码写入仓库；Agent 访问本机 OpenCode 时沿用其本地认证配置。
 
 ## 待办
 
-- [ ] 设备注销机制：Agent 卸载后 Gateway 侧仍残留离线设备记录（当前需手动清理 `gateway-state.json`），卸载脚本应主动通知 Gateway 注销。
+- [ ] 多租户：单 Gateway 服务多个互不信任的用户（每用户独立 enroll 凭据、设备归属与访问控制）。
+- [ ] P2P DataChannel 应用层鉴权与会话绑定。

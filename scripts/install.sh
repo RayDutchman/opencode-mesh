@@ -13,17 +13,44 @@ set -euo pipefail
 #   MESH_MODE=agent MESH_GATEWAY_URL=... MESH_ENROLL_TOKEN=... \
 #   OPENCODE_URL=... OPENCODE_USERNAME=... OPENCODE_PASSWORD=... \
 #   bash install.sh
+#
+# 从本地源码目录安装（跳过 GitHub 下载，便于测试未发布改动）：
+#   MESH_SOURCE_DIR=/path/to/opencode-mesh MESH_MODE=agent ... bash install.sh
 
 info() { printf '\033[1;34m[mesh]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[mesh]\033[0m %s\n' "$*"; }
 err()  { printf '\033[1;31m[mesh]\033[0m %s\n' "$*" >&2; }
 
+# Read prompts from the controlling terminal when one exists, so `curl | bash`
+# still works even though stdin is the pipe.
+TTY_AVAILABLE=""
+if { : >/dev/tty; } 2>/dev/null; then
+  TTY_AVAILABLE="/dev/tty"
+fi
+
 ask() {
   local prompt="$1" default="$2" value=""
-  if [ -t 1 ]; then
-    read -rp "${prompt} [${default}]: " value < /dev/tty 2>/dev/null || true
+  if [ -n "$TTY_AVAILABLE" ]; then
+    read -rp "${prompt} [${default}]: " value < "$TTY_AVAILABLE" 2>/dev/null || value=""
   fi
   printf '%s' "${value:-$default}"
+}
+
+ask_secret() {
+  local prompt="$1" default="$2" value=""
+  if [ -n "$TTY_AVAILABLE" ]; then
+    read -rsp "${prompt}: " value < "$TTY_AVAILABLE" 2>/dev/null || value=""
+    printf '\n' > "$TTY_AVAILABLE" 2>/dev/null || true
+  fi
+  printf '%s' "${value:-$default}"
+}
+
+require_value() {
+  local name="$1" value="$2"
+  if [ -z "$value" ]; then
+    err "${name} 不能为空；非交互安装请通过环境变量提供后重试"
+    exit 1
+  fi
 }
 
 MODE="${1:-${MESH_MODE:-}}"
@@ -40,8 +67,10 @@ else
 fi
 
 command -v python3 >/dev/null 2>&1 || { err "缺少 python3，请先安装"; exit 1; }
-command -v curl   >/dev/null 2>&1 || { err "缺少 curl，请先安装"; exit 1; }
-command -v tar    >/dev/null 2>&1 || { err "缺少 tar，请先安装"; exit 1; }
+if [ -z "${MESH_SOURCE_DIR:-}" ]; then
+  command -v curl >/dev/null 2>&1 || { err "缺少 curl，请先安装"; exit 1; }
+  command -v tar  >/dev/null 2>&1 || { err "缺少 tar，请先安装"; exit 1; }
+fi
 
 if [ -z "$MODE" ]; then
   printf '请选择安装模式：\n'
@@ -51,7 +80,7 @@ if [ -z "$MODE" ]; then
   case "$MODE" in
     1|agent) MODE="agent" ;;
     2|gateway) MODE="gateway" ;;
-    *) err "无效选择"; exit 1 ;;
+    *) err "无效选择；非交互安装请用 MESH_MODE=agent|gateway 或 bash install.sh agent"; exit 1 ;;
   esac
 fi
 
@@ -65,20 +94,31 @@ TARBALL="https://github.com/RayDutchman/opencode-mesh/archive/refs/heads/${VERSI
 
 info "安装目录：${INSTALL_DIR}"
 info "systemd 级别：${SYSTEMD_KIND}"
-info "下载 opencode-mesh 源码（${VERSION}）..."
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-curl -fsSL "$TARBALL" -o "$tmp/mesh.tar.gz"
-tar -xzf "$tmp/mesh.tar.gz" -C "$tmp"
-SRC="$(find "$tmp" -maxdepth 1 -type d -name 'opencode-mesh-*' | head -n 1)"
+if [ -n "${MESH_SOURCE_DIR:-}" ]; then
+  SRC="${MESH_SOURCE_DIR%/}"
+  info "使用本地源码目录：${SRC}"
+  if [ ! -d "$SRC/src" ]; then
+    err "MESH_SOURCE_DIR 中缺少 src/ 目录"; exit 1
+  fi
+else
+  info "下载 opencode-mesh 源码（${VERSION}）..."
+  curl -fsSL "$TARBALL" -o "$tmp/mesh.tar.gz"
+  tar -xzf "$tmp/mesh.tar.gz" -C "$tmp"
+  SRC="$(find "$tmp" -maxdepth 1 -type d -name 'opencode-mesh-*' | head -n 1)"
+  if [ -z "$SRC" ] || [ ! -d "$SRC/src" ]; then
+    err "解压后未找到源码目录，安装包可能损坏"; exit 1
+  fi
+fi
 
 mkdir -p "$INSTALL_DIR"
 if [ -d "$INSTALL_DIR/src" ]; then
   warn "检测到已有安装，覆盖源码与脚本（保留 config 与 data）"
   rm -rf "$INSTALL_DIR/src" "$INSTALL_DIR/scripts" "$INSTALL_DIR/pyproject.toml"
 fi
-cp -r "$SRC"/src "$SRC"/pyproject.toml "$SRC"/scripts "$INSTALL_DIR"/ 2>/dev/null || true
+cp -r "$SRC"/src "$SRC"/pyproject.toml "$SRC"/scripts "$INSTALL_DIR"/
 
 if [ ! -d "$INSTALL_DIR/.venv" ]; then
   info "创建 Python 虚拟环境..."
@@ -90,14 +130,27 @@ info "安装依赖（首次可能较慢，aiortc 需要编译或下载 wheel）.
 "$INSTALL_DIR/.venv/bin/python" -m pip install -e "$INSTALL_DIR" -q
 
 mkdir -p "$INSTALL_DIR/config" "$INSTALL_DIR/data"
+chmod 700 "$INSTALL_DIR/config" "$INSTALL_DIR/data"
+chmod 600 "$INSTALL_DIR"/config/*.json 2>/dev/null || true
+chmod 600 "$INSTALL_DIR"/data/*.json 2>/dev/null || true
 
 info "配置 ${MODE} ..."
 if [ "$MODE" = "agent" ]; then
   GATEWAY_URL="$(ask "Gateway 公网地址（必填）" "${MESH_GATEWAY_URL:-}")"
-  ENROLL_TOKEN="$(ask "enroll_token（必填）" "${MESH_ENROLL_TOKEN:-}")"
+  require_value "Gateway 地址" "$GATEWAY_URL"
+  case "$GATEWAY_URL" in
+    https://*|http://*) ;;
+    *) err "Gateway 地址必须以 https:// 或 http:// 开头"; exit 1 ;;
+  esac
+  case "$GATEWAY_URL" in
+    https://*) ;;
+    *) warn "Gateway 未使用 HTTPS，注册令牌与代理数据将以明文传输" ;;
+  esac
+  ENROLL_TOKEN="$(ask_secret "enroll_token（必填）" "${MESH_ENROLL_TOKEN:-}")"
+  require_value "enroll_token" "$ENROLL_TOKEN"
   OPENCODE_URL="$(ask "本机 OpenCode 地址（含端口）" "${OPENCODE_URL:-http://127.0.0.1:40960}")"
   OPENCODE_USERNAME="$(ask "OpenCode 用户名（未启用认证则留空）" "${OPENCODE_USERNAME:-}")"
-  OPENCODE_PASSWORD="$(ask "OpenCode 密码（未启用认证则留空）" "${OPENCODE_PASSWORD:-}")"
+  OPENCODE_PASSWORD="$(ask_secret "OpenCode 密码（未启用认证则留空）" "${OPENCODE_PASSWORD:-}")"
   CONFIG_FILE="$INSTALL_DIR/config/agent.json"
   INSTALL_DIR="$INSTALL_DIR" GATEWAY_URL="$GATEWAY_URL" ENROLL_TOKEN="$ENROLL_TOKEN" \
     OPENCODE_URL="$OPENCODE_URL" OPENCODE_USERNAME="$OPENCODE_USERNAME" OPENCODE_PASSWORD="$OPENCODE_PASSWORD" \
@@ -120,12 +173,18 @@ if os.environ.get("OPENCODE_PASSWORD"):
 with open(sys.argv[1], "w", encoding="utf-8") as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)
     f.write("\n")
+os.chmod(sys.argv[1], 0o600)
 PY
-  EXEC="$INSTALL_DIR/.venv/bin/python -m src.main --mode agent --config $CONFIG_FILE"
+  EXEC="\"$INSTALL_DIR/.venv/bin/python\" -m src.main --mode agent --config \"$CONFIG_FILE\""
 else
   LISTEN_PORT="$(ask "监听端口" "${MESH_LISTEN_PORT:-18080}")"
-  USERNAME="$(ask "登录用户名" "${MESH_USERNAME:-opencode}")"
-  PASSWORD="$(ask "登录密码（必填）" "${MESH_PASSWORD:-}")"
+  case "$LISTEN_PORT" in
+    ''|*[!0-9]*) err "监听端口必须是数字"; exit 1 ;;
+  esac
+  USERNAME="$(ask "网关登录用户名（必填，可自定义）" "${MESH_USERNAME:-}")"
+  require_value "网关登录用户名（可用 MESH_USERNAME 指定）" "$USERNAME"
+  PASSWORD="$(ask_secret "登录密码（必填）" "${MESH_PASSWORD:-}")"
+  require_value "登录密码" "$PASSWORD"
   ENROLL_TOKEN="$(ask "enroll_token（留空自动生成）" "${MESH_ENROLL_TOKEN:-}")"
   if [ -z "$ENROLL_TOKEN" ]; then
     ENROLL_TOKEN="$("$INSTALL_DIR/.venv/bin/python" -c 'import secrets;print(secrets.token_urlsafe(32))')"
@@ -138,7 +197,6 @@ import json, os, sys
 cfg = {
     "listen_host": "127.0.0.1",
     "listen_port": int(os.environ["LISTEN_PORT"]),
-    "secure_cookie": False,
     "state_file": os.path.join(os.environ["INSTALL_DIR"], "data", "gateway-state.json"),
     "enroll_token": os.environ["ENROLL_TOKEN"],
     "default_device": "",
@@ -147,8 +205,9 @@ cfg = {
 with open(sys.argv[1], "w", encoding="utf-8") as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)
     f.write("\n")
+os.chmod(sys.argv[1], 0o600)
 PY
-  EXEC="$INSTALL_DIR/.venv/bin/python -m src.main --mode gateway --config $CONFIG_FILE"
+  EXEC="\"$INSTALL_DIR/.venv/bin/python\" -m src.main --mode gateway --config \"$CONFIG_FILE\""
 fi
 
 info "写入 systemd unit ..."
