@@ -165,8 +165,6 @@ if [ "$MODE" = "agent" ]; then
     python3 - "$CONFIG_FILE" <<'PY'
 import json, os, sys
 cfg = {
-    "listen_host": "127.0.0.1",
-    "listen_port": 18090,
     "gateway_url": os.environ["GATEWAY_URL"].rstrip("/"),
     "enroll_token": os.environ["ENROLL_TOKEN"],
     "opencode_url": os.environ["OPENCODE_URL"].rstrip("/"),

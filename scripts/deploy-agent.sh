@@ -50,8 +50,6 @@ import os
 import sys
 
 config = {
-    "listen_host": "127.0.0.1",
-    "listen_port": 18090,
     "gateway_url": os.environ["MESH_GATEWAY_URL"].rstrip("/"),
     "enroll_token": os.environ["MESH_ENROLL_TOKEN"],
     "opencode_url": os.environ["OPENCODE_URL"].rstrip("/"),

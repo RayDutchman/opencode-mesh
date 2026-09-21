@@ -1,98 +1,99 @@
 # OpenCode Mesh
 
-一套程序分为 `gateway` 和 `agent` 两种运行模式：
+把运行在多台设备上的 [OpenCode](https://opencode.ai) 通过一个公网 Gateway 暴露给浏览器：用 OpenCode 原生 Web UI 访问任意一台设备，数据优先走 WebRTC 直连，打不通时自动回退到 Gateway 中继。
 
-- Gateway：运行在公网（VPS 或任意有公网地址的机器），负责 HTTP Basic Auth、设备注册、设备列表和 Relay 控制面。
-- Agent：运行在 OpenCode 所在设备，自动读取 hostname，主动连接 Gateway，并代理本机 OpenCode。
+## 架构
 
-## 当前状态
+```
+浏览器 ──HTTPS──> Gateway（公网服务器）
+                    │  ① WebRTC 直连（LAN / STUN 打洞，最优）
+                    │  ② Relay 中继（WebSocket 控制通道，兜底）
+                    ▼
+                  Agent（每台 OpenCode 设备）──> 本机 OpenCode
+```
 
-已完成并通过真实公网浏览器验证：
+- **Gateway**：部署在有公网地址的服务器上，负责浏览器 HTTP Basic Auth、设备注册与路由、以及 Relay 中继。
+- **Agent**：部署在每台运行 OpenCode 的设备上，主动连接 Gateway，并代理本机 OpenCode。它只对外连接，不监听任何端口。
 
-- 自动生成并持久化设备 ID；
-- 自动读取设备 hostname 作为显示名；
-- Gateway HTTP Basic Auth（浏览器原生认证，无自建登录页）；
-- Agent 自动注册（`enroll_token` + 设备 `agent_token`）；
-- 设备列表和在线状态；
-- Gateway↔Agent 单 WebSocket 控制通道；
-- HTTP / SSE / WebSocket / PTY 通过隧道转发到 Agent 本地 OpenCode；
-- 浏览器到 Agent 的 WebRTC DataChannel 直连，失败时自动回退 Relay；
-- 多设备：每台设备注册为 OpenCode 原生 Server，各设备项目/会话/tabs 独立；
-- 大响应分片、请求取消、超时、断线清理和控制面写入串行化；
-- `curl | bash` 一键安装 / 卸载脚本。
+## 快速开始
 
-### 设备与路由模型
+### 第 1 步：部署 Gateway（公网服务器）
 
-- 默认设备（`default_device` 或第一个在线设备）使用 `location.origin` 作为 Server URL；
-- 其他在线设备使用 `/_mesh/device/<device_id>` 作为 Server URL，Gateway 去掉前缀后透明转发；
-- 设备切换交给 OpenCode 原生多 Server UI，Mesh 不注入自定义设备栏，也不维护独立会话索引。
-
-### 数据路径
-
-LAN / WebRTC host candidate → STUN / 外部候选 → VPS Relay。P2P 直连按当前设备上下文建立，切换设备时自动重建连接。
-
-## 安装
-
-在目标设备上执行（交互式，会询问配置）：
+在公网服务器上执行：
 
 ```bash
-# Agent（OpenCode 所在设备）
-curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | bash
-
-# Gateway（公网服务器）
 curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | bash -s -- gateway
 ```
 
-脚本会自动：下载源码、创建 Python 虚拟环境、安装依赖、生成配置、写入并启用 systemd 服务。
+按提示填写：
 
-### 非交互安装（脚本化 / CI）
+- **登录用户名 / 密码**：之后浏览器访问 Gateway 时使用，可自定义。
+- **enroll_token**：**留空即自动生成并打印**。
 
-通过环境变量预填，跳过提问：
+> ⚠️ **enroll_token 是 Gateway 的“加入密钥”，请把它保存下来**。下一步在每台设备上安装 Agent 时都要填这个值。它相当于整个 Mesh 的准入凭据，不要外泄。
+
+Gateway 默认只监听 `127.0.0.1:18080`，请用反向代理为它提供 HTTPS（可参考 `deploy/Caddyfile.example`）。**务必使用 HTTPS**：Agent 默认拒绝连接非 `https://` 的 Gateway（内网测试可在 Agent 配置中设置 `allow_insecure_gateway`）。
+
+### 第 2 步：部署 Agent（每台 OpenCode 设备）
+
+在每台运行 OpenCode 的设备上执行，填入上一步的 Gateway 地址和 **enroll_token**：
 
 ```bash
-# Agent
-MESH_GATEWAY_URL=https://网关地址 \
-MESH_ENROLL_TOKEN='网关 enroll_token' \
+curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | bash -s -- agent
+```
+
+按提示填写：
+
+- **Gateway public URL**：Gateway 的公网地址，例如 `https://oc.example.com`。
+- **enroll_token**：第 1 步保存下来的值。
+- **Local OpenCode URL**：本机 OpenCode 地址，默认 `http://127.0.0.1:4096`，按实际端口修改。
+- **OpenCode 用户名 / 密码**：本机 OpenCode 若启用了认证则填写，否则留空。
+
+### 第 3 步：浏览器访问
+
+打开 Gateway 的公网地址，输入第 1 步设置的登录用户名/密码即可。每台已注册的设备会作为 OpenCode 原生 Server 出现在界面里，可分别访问其项目、会话与终端。
+
+## 非交互安装
+
+通过环境变量预填，适合脚本化部署：
+
+```bash
+# Gateway（登录账号必填；enroll_token 留空自动生成并打印，请保存）
+MESH_USERNAME='你的登录名' \
+MESH_PASSWORD='你的登录密码' \
+bash -c 'curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | bash -s -- gateway'
+
+# Agent（把 <enroll_token> 换成 Gateway 打印出来的值）
+MESH_GATEWAY_URL=https://oc.example.com \
+MESH_ENROLL_TOKEN='<enroll_token>' \
 OPENCODE_URL=http://127.0.0.1:4096 \
 OPENCODE_USERNAME=opencode \
 OPENCODE_PASSWORD='本机 OpenCode 密码' \
 bash -c 'curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | bash -s -- agent'
-
-# Gateway
-MESH_USERNAME='你的登录名' \
-MESH_PASSWORD='你的登录密码' \
-MESH_LISTEN_PORT=18080 \
-bash -c 'curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | bash -s -- gateway'
 ```
-
-### 配置说明
-
-- `MESH_USERNAME` / `MESH_PASSWORD`：Gateway 浏览器登录账号，安装时必须显式提供，不写死默认值。
-- `OPENCODE_URL` 必须按本机实际地址填写（含端口），不固定为 `4096`。
-- `OPENCODE_PASSWORD` 可选：本机 OpenCode 未启用认证（未设置 `OPENCODE_SERVER_PASSWORD`）时留空即可，Agent 将以无认证方式访问。
-- 运行身份决定 systemd 级别：`root` 安装到 `/opt/opencode-mesh` + 系统级服务；普通用户安装到 `~/.local/share/opencode-mesh` + 用户级服务（自动启用 linger）。
 
 ## 卸载
 
 ```bash
+# 只卸载 Agent
 curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/uninstall.sh | bash -s -- agent
+
+# 只卸载 Gateway
 curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/uninstall.sh | bash -s -- gateway
 ```
 
-停止并禁用服务、删除 systemd unit 和安装目录；交互时可选备份 `data/`（含设备身份）。
+卸载会停止并删除 systemd 服务与安装目录；Agent 卸载时还会通知 Gateway 注销设备。若想保留设备身份（`data/` 目录），可在提示时选择 `y`，或用 `MESH_KEEP_DATA=y` 跳过交互。
 
-## 平台支持
+## 安装位置与平台支持
 
-- Linux（含 WSL、ARM64/RK3588）已实测。
-- Windows 原生（非 WSL）暂未适配；如需支持请反馈，工作量大可另行评估。
-- iOS 暂不考虑。
+- **root** 安装：`/opt/opencode-mesh` + 系统级 systemd 服务。
+- **普通用户** 安装：`~/.local/share/opencode-mesh` + 用户级 systemd 服务（自动启用 linger）。
+
+已实测：Linux（含 WSL、ARM64 / RK3588）。Windows 原生（非 WSL）与 iOS 暂不支持。
 
 ## 配置参考
 
-复制 `config/gateway.example.json` 为 `gateway.json`，复制 `config/agent.example.json` 为 `agent.json`，两端使用相同的 `enroll_token`。真实配置和 `data/` 已在 `.gitignore` 中排除。
+- `gateway.json`：`auth.username` / `auth.password`（浏览器登录）、`enroll_token`（加入密钥）、`default_device`。
+- `agent.json`：`gateway_url`、`enroll_token`、`opencode_url`、可选的 `opencode_basic_auth`。
 
-不要把 OpenCode 账号密码写入仓库；Agent 访问本机 OpenCode 时沿用其本地认证配置。
-
-## 待办
-
-- [ ] P2P DataChannel 应用层鉴权与会话绑定。
+`enroll_token` 属于 Gateway，同一 Gateway 上的所有 Agent 共用同一个值。`device_id` 与 `agent_token` 由系统自动生成/签发，无需手工配置。
