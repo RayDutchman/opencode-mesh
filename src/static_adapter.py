@@ -13,19 +13,17 @@ TRANSPORT_ADAPTER = r"""
   const unb64 = text => Uint8Array.from(atob(text || ''), c => c.charCodeAt(0));
   const timeout = (promise, ms) => Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))]);
 
-  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, devices: [], defaultDevice: null, rtt: null, pingSent: null, pingTimer: null };
+  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, devices: [], defaultDevice: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null };
 
   const BAR_CSS = `
-  #ocm-mesh-bar{display:flex;align-items:center;gap:8px;height:28px;padding:0 10px;font-size:12px;line-height:1;flex:0 0 auto;border-bottom:1px solid var(--v2-border-border-base);background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-muted);-webkit-user-select:none;user-select:none}
+  #ocm-mesh-bar{display:flex;align-items:center;gap:8px;height:32px;padding:0 10px;font-size:13px;line-height:20px;flex:0 0 auto;border-bottom:1px solid var(--v2-border-border-base);background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-muted);-webkit-user-select:none;user-select:none}
   #ocm-mesh-bar .ocm-title{font-weight:600;color:var(--v2-text-text-base)}
   #ocm-mesh-bar .ocm-device{border:1px solid var(--v2-border-border-base);border-radius:6px;padding:2px 8px;background:var(--v2-background-bg-layer-02);color:var(--v2-text-text-base);max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #ocm-mesh-bar .ocm-device[data-offline="true"]{color:var(--v2-text-text-faint)}
-  #ocm-mesh-bar .ocm-transport{margin-left:auto;display:flex;align-items:center;gap:6px}
-  #ocm-mesh-bar .ocm-dot{width:8px;height:8px;border-radius:9999px;background:var(--v2-text-text-faint)}
-  #ocm-mesh-bar .ocm-dot[data-kind="p2p"]{background:#22c55e}
-  #ocm-mesh-bar .ocm-dot[data-kind="relay"]{background:var(--v2-text-text-muted)}
-  #ocm-mesh-bar .ocm-dot[data-kind="reconnect"]{background:#f59e0b}
-  #root{height:calc(100dvh - 28px)}
+  #ocm-mesh-bar .ocm-transport{margin-left:auto;display:flex;align-items:center;gap:6px;color:var(--v2-text-text-base)}
+  #ocm-mesh-bar .ocm-dot{width:8px;height:8px;border-radius:9999px;background:#22c55e}
+  #ocm-mesh-bar .ocm-dot[data-kind="relay"]{background:#3b82f6}
+  #root{height:calc(100dvh - 32px)}
   `;
 
   function ensureBarStyle() {
@@ -65,8 +63,18 @@ TRANSPORT_ADAPTER = r"""
     if (state.channel && state.channel.readyState === 'open') {
       return { kind: 'p2p', label: state.rtt != null ? 'P2P ' + state.rtt + 'ms' : 'P2P' };
     }
-    if (state.reconnectTimer) return { kind: 'reconnect', label: 'Reconnecting…' };
-    return { kind: 'relay', label: 'Relay' };
+    return { kind: 'relay', label: state.relayRtt != null ? 'Relay ' + state.relayRtt + 'ms' : 'Relay' };
+  }
+
+  async function measureRelayRtt() {
+    if (state.channel && state.channel.readyState === 'open') return;
+    const deviceId = currentDeviceId();
+    const base = deviceId ? '/_mesh/device/' + encodeURIComponent(deviceId) : '';
+    const started = Date.now();
+    try {
+      const response = await nativeFetch(base + '/global/health', { credentials: 'same-origin', cache: 'no-store' });
+      if (response.ok) { state.relayRtt = Date.now() - started; renderBar(); }
+    } catch (_) {}
   }
 
   function renderBar() {
@@ -385,14 +393,20 @@ TRANSPORT_ADAPTER = r"""
   window.__ocmTransport = state;
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', renderBar, { once: true });
   else renderBar();
-  setInterval(renderBar, 2000);
+  let relayTick = 0;
+  setInterval(() => { renderBar(); if (++relayTick % 5 === 0) measureRelayRtt(); }, 2000);
+  setTimeout(measureRelayRtt, 1500);
   syncNativeServers();
 
   window.fetch = async (input, init) => {
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);
     if (url.origin !== location.origin || (url.pathname.startsWith('/_mesh/') && !url.pathname.startsWith('/_mesh/device/')) || (virtualDeviceId(url.pathname) && virtualDeviceId(url.pathname) !== state.manifest?.device_id)) return nativeFetch(input, init);
-    await Promise.race([state.ready, new Promise(resolve => setTimeout(resolve, 1200))]);
     if (state.channel && state.channel.readyState === 'open') return p2pFetch(input, init);
+    // Only wait for the initial P2P attempt; never add latency while running on Relay.
+    if (state.pc && !state.closed && !state.reconnectTimer) {
+      await Promise.race([state.ready, new Promise(resolve => setTimeout(resolve, 1200))]);
+      if (state.channel && state.channel.readyState === 'open') return p2pFetch(input, init);
+    }
     return nativeFetch(input, init);
   };
   window.WebSocket = class extends MeshWebSocket {

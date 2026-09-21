@@ -46,6 +46,9 @@ def forwarding_headers(headers) -> dict[str, str]:
     return {k: v for k, v in headers.items() if k.lower() not in blocked}
 
 
+DEFAULT_STUN_SERVERS = ["stun:stun.l.google.com:19302"]
+
+
 def hostname() -> str:
     return socket.gethostname() or platform.node() or "Unnamed device"
 
@@ -218,7 +221,7 @@ class Gateway:
                 "relay": str(req.base_url).rstrip("/"),
                 "lan": self.cfg.get("lan_base_url"),
                 "p2p": {"enabled": bool(device and device.get("ws")), "offer": "/_mesh/p2p/offer"},
-                "stun_servers": self.cfg.get("stun_servers", ["stun:stun.l.google.com:19302"]),
+                "stun_servers": self.cfg.get("stun_servers") or DEFAULT_STUN_SERVERS,
                 "capabilities": {"http": True, "sse": True, "websocket": True, "pty": True},
             }
 
@@ -240,7 +243,7 @@ class Gateway:
             self.p2p_answers[session_id] = future
             try:
                 await self.send_to_device(agent_ws, {"type": "p2p_offer", "id": session_id,
-                                                     "offer": data, "stun_servers": self.cfg.get("stun_servers", [])})
+                                                     "offer": data, "stun_servers": self.cfg.get("stun_servers") or DEFAULT_STUN_SERVERS})
                 return JSONResponse(await asyncio.wait_for(future, 20))
             except Exception:
                 return JSONResponse({"error": "P2P connection failed"}, status_code=502)
