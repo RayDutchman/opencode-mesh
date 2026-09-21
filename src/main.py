@@ -669,6 +669,9 @@ class Agent:
             if task:
                 task.cancel()
             return
+        if item.get("type") == "ping":
+            await self.p2p_send(channel, {"type": "pong", "t": item.get("t")})
+            return
         if item.get("type") not in {"request", "stream_request", "ws_open"}:
             return
 

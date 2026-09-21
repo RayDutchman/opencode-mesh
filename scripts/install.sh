@@ -14,6 +14,8 @@ set -euo pipefail
 #   OPENCODE_URL=... OPENCODE_USERNAME=... OPENCODE_PASSWORD=... \
 #   bash install.sh
 #
+# Gateway only: MESH_PUBLIC_URL prints a ready-to-paste Agent install command.
+#
 # Install from a local source directory (skips the GitHub download):
 #   MESH_SOURCE_DIR=/path/to/opencode-mesh MESH_MODE=agent ... bash install.sh
 
@@ -196,8 +198,8 @@ else
   ENROLL_TOKEN="$(ask "enroll_token (empty to generate)" "${MESH_ENROLL_TOKEN:-}")"
   if [ -z "$ENROLL_TOKEN" ]; then
     ENROLL_TOKEN="$("$INSTALL_DIR/.venv/bin/python" -c 'import secrets;print(secrets.token_urlsafe(32))')"
-    info "generated enroll_token: ${ENROLL_TOKEN}"
   fi
+  PUBLIC_URL="$(ask "Gateway public URL (used to print the agent command, optional)" "${MESH_PUBLIC_URL:-}")"
   CONFIG_FILE="$INSTALL_DIR/config/gateway.json"
   INSTALL_DIR="$INSTALL_DIR" LISTEN_PORT="$LISTEN_PORT" USERNAME="$USERNAME" PASSWORD="$PASSWORD" ENROLL_TOKEN="$ENROLL_TOKEN" \
     python3 - "$CONFIG_FILE" <<'PY'
@@ -274,4 +276,26 @@ else
 fi
 
 info "install complete."
+
+if [ "$MODE" = "gateway" ]; then
+  SHOWN_URL="${PUBLIC_URL:-<your-gateway-url>}"
+  cat <<INFO
+
+========================================================================
+Gateway is ready.
+
+  Public URL  : ${SHOWN_URL}
+  Login user  : ${USERNAME}
+  enroll_token: ${ENROLL_TOKEN}
+
+  Save the enroll_token. Every Agent needs it to join this Gateway.
+
+  Install an Agent on each OpenCode device:
+
+    curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | MESH_GATEWAY_URL=${SHOWN_URL} MESH_ENROLL_TOKEN=${ENROLL_TOKEN} bash -s -- agent
+
+========================================================================
+INFO
+fi
+
 info "uninstall: curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/uninstall.sh | bash -s -- ${MODE}"

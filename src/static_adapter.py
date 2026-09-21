@@ -13,7 +13,73 @@ TRANSPORT_ADAPTER = r"""
   const unb64 = text => Uint8Array.from(atob(text || ''), c => c.charCodeAt(0));
   const timeout = (promise, ms) => Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))]);
 
-  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000 };
+  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, devices: [], defaultDevice: null, rtt: null, pingSent: null, pingTimer: null };
+
+  const BAR_CSS = `
+  #ocm-mesh-bar{display:flex;align-items:center;gap:8px;height:28px;padding:0 10px;font-size:12px;line-height:1;flex:0 0 auto;border-bottom:1px solid var(--v2-border-border-base);background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-muted);-webkit-user-select:none;user-select:none}
+  #ocm-mesh-bar .ocm-title{font-weight:600;color:var(--v2-text-text-base)}
+  #ocm-mesh-bar .ocm-device{border:1px solid var(--v2-border-border-base);border-radius:6px;padding:2px 8px;background:var(--v2-background-bg-layer-02);color:var(--v2-text-text-base);max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #ocm-mesh-bar .ocm-device[data-offline="true"]{color:var(--v2-text-text-faint)}
+  #ocm-mesh-bar .ocm-transport{margin-left:auto;display:flex;align-items:center;gap:6px}
+  #ocm-mesh-bar .ocm-dot{width:8px;height:8px;border-radius:9999px;background:var(--v2-text-text-faint)}
+  #ocm-mesh-bar .ocm-dot[data-kind="p2p"]{background:#22c55e}
+  #ocm-mesh-bar .ocm-dot[data-kind="relay"]{background:var(--v2-text-text-muted)}
+  #ocm-mesh-bar .ocm-dot[data-kind="reconnect"]{background:#f59e0b}
+  #root{height:calc(100dvh - 28px)}
+  `;
+
+  function ensureBarStyle() {
+    if (document.getElementById('ocm-mesh-bar-style')) return;
+    const style = document.createElement('style');
+    style.id = 'ocm-mesh-bar-style';
+    style.textContent = BAR_CSS;
+    document.head.appendChild(style);
+  }
+
+  function ensureBar() {
+    let bar = document.getElementById('ocm-mesh-bar');
+    if (bar || !document.body) return bar;
+    ensureBarStyle();
+    bar = document.createElement('div');
+    bar.id = 'ocm-mesh-bar';
+    const title = document.createElement('span');
+    title.className = 'ocm-title';
+    title.textContent = 'OpenCode Mesh';
+    const device = document.createElement('span');
+    device.className = 'ocm-device';
+    const transport = document.createElement('span');
+    transport.className = 'ocm-transport';
+    bar.append(title, device, transport);
+    document.body.insertBefore(bar, document.body.firstChild);
+    return bar;
+  }
+
+  function currentDeviceInfo() {
+    const routeId = currentDeviceId();
+    const id = routeId || (state.manifest && state.manifest.device_id) || state.defaultDevice;
+    const device = state.devices.find(item => item.device_id === id);
+    return { name: (device && device.name) || id || 'no device', online: device ? !!device.online : undefined };
+  }
+
+  function transportInfo() {
+    if (state.channel && state.channel.readyState === 'open') {
+      return { kind: 'p2p', label: state.rtt != null ? 'P2P ' + state.rtt + 'ms' : 'P2P' };
+    }
+    if (state.reconnectTimer) return { kind: 'reconnect', label: 'Reconnecting…' };
+    return { kind: 'relay', label: 'Relay' };
+  }
+
+  function renderBar() {
+    const bar = ensureBar();
+    if (!bar) return;
+    const info = currentDeviceInfo();
+    const transport = transportInfo();
+    const device = bar.querySelector('.ocm-device');
+    device.textContent = info.name;
+    device.dataset.offline = String(info.online === false);
+    bar.querySelector('.ocm-transport').innerHTML =
+      '<span class="ocm-dot" data-kind="' + transport.kind + '"></span><span>' + transport.label + '</span>';
+  }
 
   const requestPath = input => {
     const url = new URL(typeof input === 'string' ? input : input.url, location.href);
@@ -32,7 +98,7 @@ TRANSPORT_ADAPTER = r"""
   const serverTabUrl = deviceId => `${location.origin}/_mesh/device/${encodeURIComponent(deviceId)}`;
   const currentDeviceId = () => {
     const match = location.pathname.match(/^\/server\/([^/]+)\//);
-    if (!match) return null;
+    if (!match) return virtualDeviceId(location.pathname);
     try {
       const server = new URL(decodeServer(match[1]));
       if (server.origin !== location.origin) return null;
@@ -58,7 +124,10 @@ TRANSPORT_ADAPTER = r"""
       const response = await nativeFetch('/_mesh/devices', { credentials: 'same-origin' });
       if (!response.ok) return;
       const payload = await response.json();
-      const devices = (Array.isArray(payload.devices) ? payload.devices : []).filter(device => device.online);
+      state.devices = Array.isArray(payload.devices) ? payload.devices : [];
+      state.defaultDevice = payload.default_device || null;
+      renderBar();
+      const devices = state.devices.filter(device => device.online);
       const primaryId = payload.default_device || (devices[0] && devices[0].device_id);
       const signature = devices.map(device => `${device.device_id}:${device.name}`).sort().join('|') + '#' + primaryId;
       if (localStorage.getItem('ocm.native-servers.signature') === signature) return;
@@ -82,6 +151,9 @@ TRANSPORT_ADAPTER = r"""
 
   function failTransport(error) {
     state.closed = true;
+    if (state.pingTimer) { clearInterval(state.pingTimer); state.pingTimer = null; }
+    state.rtt = null; state.pingSent = null;
+    renderBar();
     for (const [id, entry] of state.pending) {
       if (entry.timer) clearTimeout(entry.timer);
       entry.reject(error);
@@ -98,6 +170,14 @@ TRANSPORT_ADAPTER = r"""
   }
 
   function settle(message) {
+    if (message.type === 'pong') {
+      if (state.pingSent != null) {
+        state.rtt = Math.max(0, Date.now() - state.pingSent);
+        state.pingSent = null;
+        renderBar();
+      }
+      return;
+    }
     const socket = state.sockets.get(message.id);
     if (socket) {
       if (message.type === 'ws_opened') {
@@ -191,6 +271,17 @@ TRANSPORT_ADAPTER = r"""
     if (!answerResponse.ok || answer.error) throw new Error(answer.error || 'p2p answer failed');
     await pc.setRemoteDescription(answer);
     await timeout(new Promise((resolve, reject) => { if (channel.readyState === 'open') resolve(); else { channel.onopen = resolve; channel.onerror = reject; } }), 10000).catch(() => { throw new Error('p2p channel timeout'); });
+    startPing();
+    renderBar();
+  }
+
+  function startPing() {
+    if (state.pingTimer) clearInterval(state.pingTimer);
+    state.pingTimer = setInterval(() => {
+      if (!state.channel || state.channel.readyState !== 'open') return;
+      state.pingSent = Date.now();
+      send({ type: 'ping', t: state.pingSent }).catch(() => {});
+    }, 5000);
   }
 
   async function reconnectForDevice() {
@@ -292,6 +383,9 @@ TRANSPORT_ADAPTER = r"""
 
   state.ready = connectP2P(currentDeviceId()).catch(() => null);
   window.__ocmTransport = state;
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', renderBar, { once: true });
+  else renderBar();
+  setInterval(renderBar, 2000);
   syncNativeServers();
 
   window.fetch = async (input, init) => {

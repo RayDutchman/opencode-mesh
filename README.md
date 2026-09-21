@@ -32,6 +32,8 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 
 > ⚠️ **enroll_token 是 Gateway 的“加入密钥”，请把它保存下来**。下一步在每台设备上安装 Agent 时都要填这个值。它相当于整个 Mesh 的准入凭据，不要外泄。
 
+安装完成后脚本会直接打印一段**可粘贴到设备执行的 Agent 安装命令**（已包含 Gateway 地址和 enroll_token），照抄即可。若安装时填写了 Gateway 公网地址（或设置 `MESH_PUBLIC_URL`），命令里就是真实地址，否则是占位符。
+
 Gateway 默认只监听 `127.0.0.1:18080`，请用反向代理为它提供 HTTPS（可参考 `deploy/Caddyfile.example`）。**务必使用 HTTPS**：Agent 默认拒绝连接非 `https://` 的 Gateway（内网测试可在 Agent 配置中设置 `allow_insecure_gateway`）。
 
 ### 第 2 步：部署 Agent（每台 OpenCode 设备）
