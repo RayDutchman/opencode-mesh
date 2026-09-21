@@ -31,7 +31,8 @@ fi
 ask() {
   local prompt="$1" default="$2" value=""
   if [ -n "$TTY_AVAILABLE" ]; then
-    read -rp "${prompt} [${default}]: " value < "$TTY_AVAILABLE" 2>/dev/null || value=""
+    printf '%s [%s]: ' "$prompt" "$default" >&2
+    read -r value < "$TTY_AVAILABLE" 2>/dev/null || value=""
   fi
   printf '%s' "${value:-$default}"
 }
@@ -39,8 +40,9 @@ ask() {
 ask_secret() {
   local prompt="$1" default="$2" value=""
   if [ -n "$TTY_AVAILABLE" ]; then
-    read -rsp "${prompt}: " value < "$TTY_AVAILABLE" 2>/dev/null || value=""
-    printf '\n' > "$TTY_AVAILABLE" 2>/dev/null || true
+    printf '%s: ' "$prompt" >&2
+    read -rs value < "$TTY_AVAILABLE" 2>/dev/null || value=""
+    printf '\n' >&2
   fi
   printf '%s' "${value:-$default}"
 }

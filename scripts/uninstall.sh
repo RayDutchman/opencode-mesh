@@ -21,7 +21,8 @@ fi
 ask() {
   local prompt="$1" default="$2" value=""
   if [ -n "$TTY_AVAILABLE" ]; then
-    read -rp "${prompt} [${default}]: " value < "$TTY_AVAILABLE" 2>/dev/null || value=""
+    printf '%s [%s]: ' "$prompt" "$default" >&2
+    read -r value < "$TTY_AVAILABLE" 2>/dev/null || value=""
   fi
   printf '%s' "${value:-$default}"
 }
@@ -56,8 +57,8 @@ for svc in "${SERVICES[@]}"; do
 done
 $SC_CMD daemon-reload 2>/dev/null || true
 
-# Agent mode: tell the Gateway to drop the registration so no offline device remains.
-if [ "$MODE" = "agent" ] && [ -f "$INSTALL_DIR/config/agent.json" ] && [ -f "$INSTALL_DIR/data/agent-state.json" ]; then
+# Tell the Gateway to drop the agent registration so no offline device remains.
+if [ -f "$INSTALL_DIR/config/agent.json" ] && [ -f "$INSTALL_DIR/data/agent-state.json" ]; then
   GATEWAY_URL="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("gateway_url",""))' "$INSTALL_DIR/config/agent.json" 2>/dev/null || true)"
   DEVICE_ID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("device_id",""))' "$INSTALL_DIR/data/agent-state.json" 2>/dev/null || true)"
   TOKEN="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("agent_token",""))' "$INSTALL_DIR/data/agent-state.json" 2>/dev/null || true)"
@@ -68,7 +69,10 @@ if [ "$MODE" = "agent" ] && [ -f "$INSTALL_DIR/config/agent.json" ] && [ -f "$IN
 fi
 
 if [ -d "$INSTALL_DIR" ]; then
-  KEEP="$(ask "Keep the data/ directory (device identity and state)? (y/N)" "N")"
+  KEEP="${MESH_KEEP_DATA:-}"
+  if [ -z "$KEEP" ]; then
+    KEEP="$(ask "Keep the data/ directory (device identity and state)? (y/N)" "N")"
+  fi
   if [ "$KEEP" = "y" ] || [ "$KEEP" = "Y" ]; then
     BACKUP="$(mktemp -d)/opencode-mesh-data"
     mkdir -p "$BACKUP"
