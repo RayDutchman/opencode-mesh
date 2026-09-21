@@ -1,43 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 一键把 Mesh Agent 部署到一台已经运行 OpenCode 的 Linux 设备。
-# 凭据只通过环境变量传入，不写入仓库；远端配置写入 config/agent.local.json。
+# Deploy the Mesh Agent to a Linux host that already runs OpenCode.
+# Credentials are passed only through environment variables and never written to the repo;
+# the remote config is written to config/agent.local.json.
 
 usage() {
   cat <<'EOF'
-用法：
+Usage:
   MESH_GATEWAY_URL=https://oc.example.com \
   MESH_ENROLL_TOKEN=... \
   OPENCODE_URL=http://127.0.0.1:40960 \
   OPENCODE_USERNAME=opencode \
   OPENCODE_PASSWORD=... \
-  scripts/deploy-agent.sh user@device [安装目录]
+  scripts/deploy-agent.sh user@device [install_dir]
 
-可选环境变量：
-  MESH_DEVICE_NAME      设备显示名，默认使用远端 hostname
-  MESH_INSTALL_DIR      默认 /opt/opencode-mesh
-  MESH_PYTHON            默认 python3
-  MESH_GATEWAY_URL      Gateway 公网地址，必填
-  MESH_ENROLL_TOKEN     Gateway 注册令牌，必填
-  OPENCODE_URL          本机 OpenCode 地址，必填
-  OPENCODE_USERNAME     OpenCode Basic Auth 用户名，默认 opencode
-  OPENCODE_PASSWORD     OpenCode Basic Auth 密码，可为空
+Optional environment variables:
+  MESH_DEVICE_NAME      device display name, defaults to the remote hostname
+  MESH_INSTALL_DIR      defaults to /opt/opencode-mesh
+  MESH_PYTHON           defaults to python3
+  MESH_GATEWAY_URL      Gateway public URL, required
+  MESH_ENROLL_TOKEN     Gateway enrollment token, required
+  OPENCODE_URL          local OpenCode URL, required
+  OPENCODE_USERNAME     OpenCode Basic Auth username, defaults to opencode
+  OPENCODE_PASSWORD     OpenCode Basic Auth password, may be empty
 EOF
 }
 
 [[ $# -ge 1 && $# -le 2 ]] || { usage >&2; exit 2; }
 REMOTE=$1
 INSTALL_DIR=${2:-${MESH_INSTALL_DIR:-/opt/opencode-mesh}}
-: "${MESH_GATEWAY_URL:?必须设置 MESH_GATEWAY_URL}"
-: "${MESH_ENROLL_TOKEN:?必须设置 MESH_ENROLL_TOKEN}"
-: "${OPENCODE_URL:?必须设置 OPENCODE_URL}"
+: "${MESH_GATEWAY_URL:?MESH_GATEWAY_URL is required}"
+: "${MESH_ENROLL_TOKEN:?MESH_ENROLL_TOKEN is required}"
+: "${OPENCODE_URL:?OPENCODE_URL is required}"
 OPENCODE_USERNAME=${OPENCODE_USERNAME:-opencode}
 MESH_DEVICE_NAME=${MESH_DEVICE_NAME:-}
 MESH_PYTHON=${MESH_PYTHON:-python3}
 
-command -v ssh >/dev/null || { echo '缺少 ssh' >&2; exit 1; }
-command -v tar >/dev/null || { echo '缺少 tar' >&2; exit 1; }
+command -v ssh >/dev/null || { echo 'ssh is required' >&2; exit 1; }
+command -v tar >/dev/null || { echo 'tar is required' >&2; exit 1; }
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -69,7 +70,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as f:
     f.write("\n")
 PY
 
-echo "部署 OpenCode Mesh Agent 到 ${REMOTE}:${INSTALL_DIR}"
+echo "deploying OpenCode Mesh Agent to ${REMOTE}:${INSTALL_DIR}"
 ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$REMOTE" \
   "mkdir -p '$INSTALL_DIR'"
 tar -czf - --exclude='./.git' --exclude='./.venv' --exclude='./data' \
@@ -100,4 +101,4 @@ ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$REMOTE" \
   "cat > '$INSTALL_DIR/config/agent.local.json'" < "$tmp/config/agent.local.json"
 ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$REMOTE" \
   "systemctl --user restart opencode-mesh-agent.service"
-echo "部署完成：${REMOTE}:${INSTALL_DIR}"
+echo "deployment complete: ${REMOTE}:${INSTALL_DIR}"

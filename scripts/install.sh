@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# OpenCode Mesh 一键安装（在目标设备本机执行）
+# OpenCode Mesh installer (run on the target device)
 #
-# 用法：
+# Usage:
 #   curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | bash
-#   或指定模式：
+#   or with an explicit mode:
 #   curl -fsSL .../install.sh | bash -s -- agent
 #   curl -fsSL .../install.sh | bash -s -- gateway
 #
-# 支持环境变量预填（非交互）：
+# Non-interactive install via environment variables:
 #   MESH_MODE=agent MESH_GATEWAY_URL=... MESH_ENROLL_TOKEN=... \
 #   OPENCODE_URL=... OPENCODE_USERNAME=... OPENCODE_PASSWORD=... \
 #   bash install.sh
 #
-# 从本地源码目录安装（跳过 GitHub 下载，便于测试未发布改动）：
+# Install from a local source directory (skips the GitHub download):
 #   MESH_SOURCE_DIR=/path/to/opencode-mesh MESH_MODE=agent ... bash install.sh
 
 info() { printf '\033[1;34m[mesh]\033[0m %s\n' "$*"; }
@@ -48,14 +48,14 @@ ask_secret() {
 require_value() {
   local name="$1" value="$2"
   if [ -z "$value" ]; then
-    err "${name} 不能为空；非交互安装请通过环境变量提供后重试"
+    err "${name} is required; provide it via an environment variable for non-interactive installs"
     exit 1
   fi
 }
 
 MODE="${1:-${MESH_MODE:-}}"
 
-# 检测运行身份，决定 systemd 级别和安装目录
+# Pick the systemd scope and install directory based on the running user.
 if [ "$(id -u)" -eq 0 ]; then
   INSTALL_DIR="${MESH_INSTALL_DIR:-/opt/opencode-mesh}"
   SYSTEMD_KIND="system"
@@ -66,66 +66,66 @@ else
   UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 fi
 
-command -v python3 >/dev/null 2>&1 || { err "缺少 python3，请先安装"; exit 1; }
+command -v python3 >/dev/null 2>&1 || { err "python3 is required"; exit 1; }
 if [ -z "${MESH_SOURCE_DIR:-}" ]; then
-  command -v curl >/dev/null 2>&1 || { err "缺少 curl，请先安装"; exit 1; }
-  command -v tar  >/dev/null 2>&1 || { err "缺少 tar，请先安装"; exit 1; }
+  command -v curl >/dev/null 2>&1 || { err "curl is required"; exit 1; }
+  command -v tar  >/dev/null 2>&1 || { err "tar is required"; exit 1; }
 fi
 
 if [ -z "$MODE" ]; then
-  printf '请选择安装模式：\n'
-  printf '  1) agent   运行在 OpenCode 所在设备，代理本机 OpenCode\n'
-  printf '  2) gateway 运行在公网服务器，负责认证与设备路由\n'
-  MODE="$(ask "输入 1 或 2" "")"
+  printf 'Select install mode:\n'
+  printf '  1) agent   runs on the OpenCode host and proxies the local OpenCode\n'
+  printf '  2) gateway runs on a public server and handles auth and device routing\n'
+  MODE="$(ask "Enter 1 or 2" "")"
   case "$MODE" in
     1|agent) MODE="agent" ;;
     2|gateway) MODE="gateway" ;;
-    *) err "无效选择；非交互安装请用 MESH_MODE=agent|gateway 或 bash install.sh agent"; exit 1 ;;
+    *) err "invalid choice; use MESH_MODE=agent|gateway or 'bash install.sh agent'"; exit 1 ;;
   esac
 fi
 
 if [ "$MODE" != "agent" ] && [ "$MODE" != "gateway" ]; then
-  err "模式必须是 agent 或 gateway"; exit 1
+  err "mode must be agent or gateway"; exit 1
 fi
 
 SERVICE_NAME="opencode-mesh-${MODE}"
 VERSION="main"
 TARBALL="https://github.com/RayDutchman/opencode-mesh/archive/refs/heads/${VERSION}.tar.gz"
 
-info "安装目录：${INSTALL_DIR}"
-info "systemd 级别：${SYSTEMD_KIND}"
+info "install directory: ${INSTALL_DIR}"
+info "systemd scope: ${SYSTEMD_KIND}"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 if [ -n "${MESH_SOURCE_DIR:-}" ]; then
   SRC="${MESH_SOURCE_DIR%/}"
-  info "使用本地源码目录：${SRC}"
+  info "using local source directory: ${SRC}"
   if [ ! -d "$SRC/src" ]; then
-    err "MESH_SOURCE_DIR 中缺少 src/ 目录"; exit 1
+    err "MESH_SOURCE_DIR does not contain a src/ directory"; exit 1
   fi
 else
-  info "下载 opencode-mesh 源码（${VERSION}）..."
+  info "downloading opencode-mesh source (${VERSION})..."
   curl -fsSL "$TARBALL" -o "$tmp/mesh.tar.gz"
   tar -xzf "$tmp/mesh.tar.gz" -C "$tmp"
   SRC="$(find "$tmp" -maxdepth 1 -type d -name 'opencode-mesh-*' | head -n 1)"
   if [ -z "$SRC" ] || [ ! -d "$SRC/src" ]; then
-    err "解压后未找到源码目录，安装包可能损坏"; exit 1
+    err "source directory not found after extraction; the archive may be corrupt"; exit 1
   fi
 fi
 
 mkdir -p "$INSTALL_DIR"
 if [ -d "$INSTALL_DIR/src" ]; then
-  warn "检测到已有安装，覆盖源码与脚本（保留 config 与 data）"
+  warn "existing install detected; overwriting source and scripts (config and data are kept)"
   rm -rf "$INSTALL_DIR/src" "$INSTALL_DIR/scripts" "$INSTALL_DIR/pyproject.toml"
 fi
 cp -r "$SRC"/src "$SRC"/pyproject.toml "$SRC"/scripts "$INSTALL_DIR"/
 
 if [ ! -d "$INSTALL_DIR/.venv" ]; then
-  info "创建 Python 虚拟环境..."
+  info "creating Python virtual environment..."
   python3 -m venv "$INSTALL_DIR/.venv" 2>/dev/null || python3 -m venv --system-site-packages "$INSTALL_DIR/.venv"
 fi
 
-info "安装依赖（首次可能较慢，aiortc 需要编译或下载 wheel）..."
+info "installing dependencies (first run may take a while; aiortc needs a wheel or build)..."
 "$INSTALL_DIR/.venv/bin/python" -m pip install --upgrade pip -q
 "$INSTALL_DIR/.venv/bin/python" -m pip install -e "$INSTALL_DIR" -q
 
@@ -134,23 +134,23 @@ chmod 700 "$INSTALL_DIR/config" "$INSTALL_DIR/data"
 chmod 600 "$INSTALL_DIR"/config/*.json 2>/dev/null || true
 chmod 600 "$INSTALL_DIR"/data/*.json 2>/dev/null || true
 
-info "配置 ${MODE} ..."
+info "configuring ${MODE} ..."
 if [ "$MODE" = "agent" ]; then
-  GATEWAY_URL="$(ask "Gateway 公网地址（必填）" "${MESH_GATEWAY_URL:-}")"
-  require_value "Gateway 地址" "$GATEWAY_URL"
+  GATEWAY_URL="$(ask "Gateway public URL (required)" "${MESH_GATEWAY_URL:-}")"
+  require_value "Gateway URL" "$GATEWAY_URL"
   case "$GATEWAY_URL" in
     https://*|http://*) ;;
-    *) err "Gateway 地址必须以 https:// 或 http:// 开头"; exit 1 ;;
+    *) err "Gateway URL must start with https:// or http://"; exit 1 ;;
   esac
   case "$GATEWAY_URL" in
     https://*) ;;
-    *) warn "Gateway 未使用 HTTPS，注册令牌与代理数据将以明文传输" ;;
+    *) warn "Gateway is not using HTTPS; enrollment token and proxied data will be sent in clear text" ;;
   esac
-  ENROLL_TOKEN="$(ask_secret "enroll_token（必填）" "${MESH_ENROLL_TOKEN:-}")"
+  ENROLL_TOKEN="$(ask_secret "enroll_token (required)" "${MESH_ENROLL_TOKEN:-}")"
   require_value "enroll_token" "$ENROLL_TOKEN"
-  OPENCODE_URL="$(ask "本机 OpenCode 地址（含端口）" "${OPENCODE_URL:-http://127.0.0.1:40960}")"
-  OPENCODE_USERNAME="$(ask "OpenCode 用户名（未启用认证则留空）" "${OPENCODE_USERNAME:-}")"
-  OPENCODE_PASSWORD="$(ask_secret "OpenCode 密码（未启用认证则留空）" "${OPENCODE_PASSWORD:-}")"
+  OPENCODE_URL="$(ask "Local OpenCode URL (with port)" "${OPENCODE_URL:-http://127.0.0.1:40960}")"
+  OPENCODE_USERNAME="$(ask "OpenCode username (leave empty if auth is disabled)" "${OPENCODE_USERNAME:-}")"
+  OPENCODE_PASSWORD="$(ask_secret "OpenCode password (leave empty if auth is disabled)" "${OPENCODE_PASSWORD:-}")"
   CONFIG_FILE="$INSTALL_DIR/config/agent.json"
   INSTALL_DIR="$INSTALL_DIR" GATEWAY_URL="$GATEWAY_URL" ENROLL_TOKEN="$ENROLL_TOKEN" \
     OPENCODE_URL="$OPENCODE_URL" OPENCODE_USERNAME="$OPENCODE_USERNAME" OPENCODE_PASSWORD="$OPENCODE_PASSWORD" \
@@ -177,18 +177,18 @@ os.chmod(sys.argv[1], 0o600)
 PY
   EXEC="\"$INSTALL_DIR/.venv/bin/python\" -m src.main --mode agent --config \"$CONFIG_FILE\""
 else
-  LISTEN_PORT="$(ask "监听端口" "${MESH_LISTEN_PORT:-18080}")"
+  LISTEN_PORT="$(ask "Listen port" "${MESH_LISTEN_PORT:-18080}")"
   case "$LISTEN_PORT" in
-    ''|*[!0-9]*) err "监听端口必须是数字"; exit 1 ;;
+    ''|*[!0-9]*) err "listen port must be a number"; exit 1 ;;
   esac
-  USERNAME="$(ask "网关登录用户名（必填，可自定义）" "${MESH_USERNAME:-}")"
-  require_value "网关登录用户名（可用 MESH_USERNAME 指定）" "$USERNAME"
-  PASSWORD="$(ask_secret "登录密码（必填）" "${MESH_PASSWORD:-}")"
-  require_value "登录密码" "$PASSWORD"
-  ENROLL_TOKEN="$(ask "enroll_token（留空自动生成）" "${MESH_ENROLL_TOKEN:-}")"
+  USERNAME="$(ask "Gateway login username (required)" "${MESH_USERNAME:-}")"
+  require_value "Gateway login username (set MESH_USERNAME)" "$USERNAME"
+  PASSWORD="$(ask_secret "Login password (required)" "${MESH_PASSWORD:-}")"
+  require_value "Login password" "$PASSWORD"
+  ENROLL_TOKEN="$(ask "enroll_token (empty to generate)" "${MESH_ENROLL_TOKEN:-}")"
   if [ -z "$ENROLL_TOKEN" ]; then
     ENROLL_TOKEN="$("$INSTALL_DIR/.venv/bin/python" -c 'import secrets;print(secrets.token_urlsafe(32))')"
-    info "已生成 enroll_token：${ENROLL_TOKEN}"
+    info "generated enroll_token: ${ENROLL_TOKEN}"
   fi
   CONFIG_FILE="$INSTALL_DIR/config/gateway.json"
   INSTALL_DIR="$INSTALL_DIR" LISTEN_PORT="$LISTEN_PORT" USERNAME="$USERNAME" PASSWORD="$PASSWORD" ENROLL_TOKEN="$ENROLL_TOKEN" \
@@ -210,7 +210,7 @@ PY
   EXEC="\"$INSTALL_DIR/.venv/bin/python\" -m src.main --mode gateway --config \"$CONFIG_FILE\""
 fi
 
-info "写入 systemd unit ..."
+info "writing systemd unit ..."
 mkdir -p "$UNIT_DIR"
 if [ "$SYSTEMD_KIND" = "user" ]; then
   UNIT_FILE="$UNIT_DIR/${SERVICE_NAME}.service"
@@ -232,8 +232,8 @@ WantedBy=default.target
 UNIT
   systemctl --user daemon-reload
   systemctl --user enable --now "${SERVICE_NAME}.service"
-  info "启用用户级 linger（保证未登录时也运行）..."
-  loginctl enable-linger "$(id -un)" 2>/dev/null || warn "无法启用 linger（无 loginctl），需保持登录会话"
+  info "enabling user linger (keeps the service running while logged out)..."
+  loginctl enable-linger "$(id -un)" 2>/dev/null || warn "could not enable linger (no loginctl); the session must stay logged in"
 else
   UNIT_FILE="$UNIT_DIR/${SERVICE_NAME}.service"
   cat > "$UNIT_FILE" <<UNIT
@@ -256,7 +256,7 @@ UNIT
   systemctl enable --now "${SERVICE_NAME}.service"
 fi
 
-info "启动服务..."
+info "starting service..."
 if [ "$SYSTEMD_KIND" = "user" ]; then
   systemctl --user restart "${SERVICE_NAME}.service"
   systemctl --user --no-pager --full status "${SERVICE_NAME}.service" || true
@@ -265,5 +265,5 @@ else
   systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
 fi
 
-info "安装完成。"
-info "卸载：curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/uninstall.sh | bash -s -- ${MODE}"
+info "install complete."
+info "uninstall: curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/uninstall.sh | bash -s -- ${MODE}"

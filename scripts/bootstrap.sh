@@ -4,4 +4,4 @@ cd "$(dirname "$0")/.."
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e .
-printf '请复制 config/*.example.json 为 *.local.json 并填写配置\n'
+printf 'Copy config/*.example.json to *.local.json and fill in your configuration\n'
