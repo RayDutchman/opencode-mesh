@@ -113,7 +113,7 @@ class Gateway:
         @app.middleware("http")
         async def basic_auth_middleware(req: Request, call_next):
             path = req.url.path
-            if path == "/_mesh/register" or path.startswith("/_mesh/agent/"):
+            if path == "/_mesh/register" or path.startswith("/_mesh/agent/") or path.startswith("/_mesh/deregister/"):
                 return await call_next(req)
             if not self.check_auth(req):
                 return JSONResponse({"error": "unauthorized"}, status_code=401,
@@ -246,6 +246,16 @@ class Gateway:
             d.setdefault("auth_token", secrets.token_urlsafe(32))
             self.registry.save()
             return {"device_id": device_id, "agent_token": d["auth_token"], "name": d["name"]}
+
+        @app.delete("/_mesh/deregister/{device_id}")
+        async def deregister(req: Request, device_id: str):
+            token = str(req.query_params.get("token", ""))
+            d = self.registry.devices.get(device_id)
+            if not d or not hmac.compare_digest(token, str(d.get("auth_token", ""))):
+                return JSONResponse({"error": "unauthorized"}, status_code=403)
+            self.registry.devices.pop(device_id, None)
+            self.registry.save()
+            return {"ok": True}
 
         @app.websocket("/_mesh/agent/{device_id}")
         async def agent(ws: WebSocket, device_id: str):

@@ -51,6 +51,17 @@ for svc in "${SERVICES[@]}"; do
 done
 $SC_CMD daemon-reload 2>/dev/null || true
 
+# 注销设备（agent 模式）：通知 Gateway 移除注册，避免残留离线设备
+if [ "$MODE" = "agent" ] && [ -f "$INSTALL_DIR/config/agent.json" ] && [ -f "$INSTALL_DIR/data/agent-state.json" ]; then
+  GATEWAY_URL="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("gateway_url",""))' "$INSTALL_DIR/config/agent.json" 2>/dev/null || true)"
+  DEVICE_ID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("device_id",""))' "$INSTALL_DIR/data/agent-state.json" 2>/dev/null || true)"
+  TOKEN="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("agent_token",""))' "$INSTALL_DIR/data/agent-state.json" 2>/dev/null || true)"
+  if [ -n "$GATEWAY_URL" ] && [ -n "$DEVICE_ID" ] && [ -n "$TOKEN" ]; then
+    info "注销设备 ${DEVICE_ID} ..."
+    curl -fsSL -X DELETE "${GATEWAY_URL}/_mesh/deregister/${DEVICE_ID}?token=${TOKEN}" >/dev/null 2>&1 || warn "注销失败（Gateway 不可达或已移除）"
+  fi
+fi
+
 if [ -d "$INSTALL_DIR" ]; then
   KEEP="$(ask "是否保留 data/ 目录（含设备身份/状态）？(y/N)" "N")"
   if [ "$KEEP" = "y" ] || [ "$KEEP" = "Y" ]; then
