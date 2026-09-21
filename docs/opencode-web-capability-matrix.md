@@ -2,7 +2,15 @@
 
 基线：通过当前真实 OpenCode Web 会话访问 `GET /doc`，返回 **162 个路径、188 个操作**；运行版本为 `1.18.30`。完整机器可读路由目录由 `GET /doc` 生成，禁止凭猜测删减 API。
 
-当前实现证据（2026-09-21）：Relay HTTP/HTML、6 MB Provider 响应、P2P HTTP、P2P SSE 首帧、P2P EventSource、P2P WebSocket 错误关闭均已在真实浏览器验证。两台设备均已实测：WSL Agent 使用 `10.0.0.101` host candidate，第二台 ARM64 Agent 使用 `10.0.0.149` host candidate，业务数据未走 VPS。PTY 正常创建、输入、cursor 重连仍需真实交互验收；LAN 独立入口尚未启用（当前设备通过 P2P 优先，Relay 兜底）。
+当前实现证据（2026-09-21）：
+
+- 认证：Gateway 使用 HTTP Basic Auth（浏览器原生弹框），Agent 注册用 `enroll_token` + 设备 `agent_token`，无自建登录页/session cookie。
+- 设备模型：每台设备注册为 OpenCode 原生 Server；默认设备用 `location.origin`，其余设备用 `/_mesh/device/<device_id>`，Gateway 去掉前缀后透明转发。设备切换交给 OpenCode 原生多 Server UI。
+- 数据面：Relay HTTP/HTML、6 MB Provider 响应、P2P HTTP、P2P SSE 首帧、P2P EventSource、P2P WebSocket 错误关闭均已在真实浏览器验证；多设备 P2P 按设备上下文重建连接。
+- 两台设备实测：WSL Agent 用 `10.0.0.101` host candidate，ARM64 Agent 用 `10.0.0.149` host candidate，业务数据未走 VPS。
+- 已知原生限制（非 Mesh 缺陷）：OpenCode 前端会把不同设备的 sessions 并列显示且不标注来源设备，desktop 版同样如此。
+
+待验收：PTY 真实创建/输入/resize/cursor 重连、长时稳定性（SSE 断线重连、P2P 断线恢复）、正式密码切换、`curl | bash` 一键安装入口。
 
 ## 路径类别
 

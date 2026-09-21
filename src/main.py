@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, asyncio, base64, contextlib, hashlib, hmac, json, platform, secrets, socket, time
+import argparse, asyncio, base64, contextlib, hmac, json, platform, secrets, socket, time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
