@@ -10,7 +10,7 @@ usage() {
 Usage:
   MESH_GATEWAY_URL=https://oc.example.com \
   MESH_ENROLL_TOKEN=... \
-  OPENCODE_URL=http://127.0.0.1:40960 \
+  OPENCODE_URL=http://127.0.0.1:4096 \
   OPENCODE_USERNAME=opencode \
   OPENCODE_PASSWORD=... \
   scripts/deploy-agent.sh user@device [install_dir]

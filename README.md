@@ -53,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 # Agent
 MESH_GATEWAY_URL=https://网关地址 \
 MESH_ENROLL_TOKEN='网关 enroll_token' \
-OPENCODE_URL=http://127.0.0.1:40960 \
+OPENCODE_URL=http://127.0.0.1:4096 \
 OPENCODE_USERNAME=opencode \
 OPENCODE_PASSWORD='本机 OpenCode 密码' \
 bash -c 'curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | bash -s -- agent'
@@ -68,7 +68,7 @@ bash -c 'curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/
 ### 配置说明
 
 - `MESH_USERNAME` / `MESH_PASSWORD`：Gateway 浏览器登录账号，安装时必须显式提供，不写死默认值。
-- `OPENCODE_URL` 必须按本机实际地址填写（含端口），不固定为 `40960`。
+- `OPENCODE_URL` 必须按本机实际地址填写（含端口），不固定为 `4096`。
 - `OPENCODE_PASSWORD` 可选：本机 OpenCode 未启用认证（未设置 `OPENCODE_SERVER_PASSWORD`）时留空即可，Agent 将以无认证方式访问。
 - 运行身份决定 systemd 级别：`root` 安装到 `/opt/opencode-mesh` + 系统级服务；普通用户安装到 `~/.local/share/opencode-mesh` + 用户级服务（自动启用 linger）。
 

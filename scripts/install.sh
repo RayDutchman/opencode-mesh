@@ -31,7 +31,11 @@ fi
 ask() {
   local prompt="$1" default="$2" value=""
   if [ -n "$TTY_AVAILABLE" ]; then
-    printf '%s [%s]: ' "$prompt" "$default" >&2
+    if [ -n "$default" ]; then
+      printf '%s [%s]: ' "$prompt" "$default" >&2
+    else
+      printf '%s: ' "$prompt" >&2
+    fi
     read -r value < "$TTY_AVAILABLE" 2>/dev/null || value=""
   fi
   printf '%s' "${value:-$default}"
@@ -140,22 +144,24 @@ info "configuring ${MODE} ..."
 if [ "$MODE" = "agent" ]; then
   GATEWAY_URL="$(ask "Gateway public URL (required)" "${MESH_GATEWAY_URL:-}")"
   require_value "Gateway URL" "$GATEWAY_URL"
-  case "$GATEWAY_URL" in
-    https://*|http://*) ;;
-    *) err "Gateway URL must start with https:// or http://"; exit 1 ;;
-  esac
+  ALLOW_INSECURE=""
   case "$GATEWAY_URL" in
     https://*) ;;
-    *) warn "Gateway is not using HTTPS; enrollment token and proxied data will be sent in clear text" ;;
+    http://*)
+      warn "Gateway is not using HTTPS; enrollment token and proxied data will be sent in clear text"
+      ALLOW_INSECURE="1"
+      ;;
+    *) err "Gateway URL must start with https:// or http://"; exit 1 ;;
   esac
   ENROLL_TOKEN="$(ask_secret "enroll_token (required)" "${MESH_ENROLL_TOKEN:-}")"
   require_value "enroll_token" "$ENROLL_TOKEN"
-  OPENCODE_URL="$(ask "Local OpenCode URL (with port)" "${OPENCODE_URL:-http://127.0.0.1:40960}")"
+  OPENCODE_URL="$(ask "Local OpenCode URL (with port)" "${OPENCODE_URL:-http://127.0.0.1:4096}")"
   OPENCODE_USERNAME="$(ask "OpenCode username (leave empty if auth is disabled)" "${OPENCODE_USERNAME:-}")"
   OPENCODE_PASSWORD="$(ask_secret "OpenCode password (leave empty if auth is disabled)" "${OPENCODE_PASSWORD:-}")"
   CONFIG_FILE="$INSTALL_DIR/config/agent.json"
   INSTALL_DIR="$INSTALL_DIR" GATEWAY_URL="$GATEWAY_URL" ENROLL_TOKEN="$ENROLL_TOKEN" \
     OPENCODE_URL="$OPENCODE_URL" OPENCODE_USERNAME="$OPENCODE_USERNAME" OPENCODE_PASSWORD="$OPENCODE_PASSWORD" \
+    ALLOW_INSECURE="$ALLOW_INSECURE" \
     python3 - "$CONFIG_FILE" <<'PY'
 import json, os, sys
 cfg = {
@@ -167,6 +173,8 @@ cfg = {
     "state_file": os.path.join(os.environ["INSTALL_DIR"], "data", "agent-state.json"),
     "reconnect_seconds": 5,
 }
+if os.environ.get("ALLOW_INSECURE"):
+    cfg["allow_insecure_gateway"] = True
 if os.environ.get("OPENCODE_PASSWORD"):
     cfg["opencode_basic_auth"] = {
         "username": os.environ.get("OPENCODE_USERNAME") or "opencode",
