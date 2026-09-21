@@ -8,14 +8,14 @@ from typing import Any, Awaitable, Callable
 
 
 class P2PUnavailable(RuntimeError):
-    """当前环境没有安装 WebRTC 实现。"""
+    """WebRTC implementation is not installed in this environment."""
 
 
 def load_aiortc():
     try:
         from aiortc import RTCPeerConnection, RTCSessionDescription
     except ImportError as exc:
-        raise P2PUnavailable("aiortc 未安装，暂时使用 Relay") from exc
+        raise P2PUnavailable("aiortc is not installed, falling back to Relay") from exc
     return RTCPeerConnection, RTCSessionDescription
 
 
@@ -40,7 +40,7 @@ async def answer_offer(
     on_close: Callable[[], Awaitable[None]],
     stun_servers: list[str] | None = None,
 ) -> tuple[Any, dict[str, str]]:
-    """在 Agent 侧接收浏览器 offer，并返回包含 ICE candidate 的 answer。"""
+    """Receive a browser offer on the Agent side and return an answer with ICE candidates."""
     RTCPeerConnection, RTCSessionDescription = load_aiortc()
     configuration = None
     if stun_servers:

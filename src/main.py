@@ -23,7 +23,7 @@ def make_id() -> str:
 
 
 def hostname() -> str:
-    return socket.gethostname() or platform.node() or "未命名设备"
+    return socket.gethostname() or platform.node() or "Unnamed device"
 
 
 class Registry:
@@ -88,7 +88,7 @@ class Gateway:
         return None
 
     def resolve_default_device(self) -> str | None:
-        """解析默认设备：优先配置的 default_device，否则第一个在线设备。"""
+        """Resolve the default device: the configured default_device first, otherwise the first online device."""
         preferred = str(self.cfg.get("default_device") or "")
         if preferred and self.registry.devices.get(preferred, {}).get("ws"):
             return preferred
@@ -97,14 +97,14 @@ class Gateway:
 
     @staticmethod
     def parse_device_route(path: str) -> tuple[str | None, str]:
-        """解析设备虚拟 Server URL，并保留 OpenCode 原始路径。"""
+        """Parse a device virtual Server URL and preserve the original OpenCode path."""
         prefix = "/_mesh/device/"
         if not path.startswith(prefix):
             return None, path
         remainder = path[len(prefix):]
         device_id, separator, upstream = remainder.partition("/")
         if not device_id or any(char in device_id for char in "/\\."):
-            raise ValueError("无效的设备路由")
+            raise ValueError("Invalid device route")
         return device_id, "/" + upstream
 
     def routes(self):
@@ -123,7 +123,7 @@ class Gateway:
         @app.on_event("shutdown")
         async def shutdown_bridges():
             for queue in self.streams.values():
-                queue.put_nowait({"type": "stream_error", "error": "Gateway 正在关闭"})
+                queue.put_nowait({"type": "stream_error", "error": "Gateway is shutting down"})
             for bridge in list(self.browser_ws.values()):
                 with contextlib.suppress(Exception):
                     await bridge.close(code=1001)
@@ -158,9 +158,9 @@ class Gateway:
             device = self.registry.devices.get(device_id) if device_id else None
             agent_ws = device.get("ws") if device else None
             if not agent_ws:
-                return JSONResponse({"error": "设备离线"}, status_code=503)
+                return JSONResponse({"error": "Device offline"}, status_code=503)
             if len(json.dumps(data)) > int(self.cfg.get("max_p2p_offer_bytes", 1024 * 1024)):
-                return JSONResponse({"error": "P2P 信令过大"}, status_code=413)
+                return JSONResponse({"error": "P2P signaling too large"}, status_code=413)
             session_id = secrets.token_urlsafe(18)
             future = asyncio.get_running_loop().create_future()
             self.p2p_answers[session_id] = future
@@ -169,7 +169,7 @@ class Gateway:
                                                      "offer": data, "stun_servers": self.cfg.get("stun_servers", [])}))
                 return JSONResponse(await asyncio.wait_for(future, 20))
             except Exception as exc:
-                return JSONResponse({"error": f"P2P 建链失败: {exc}"}, status_code=502)
+                return JSONResponse({"error": f"P2P connection failed: {exc}"}, status_code=502)
             finally:
                 self.p2p_answers.pop(session_id, None)
 
@@ -241,7 +241,7 @@ class Gateway:
                 return JSONResponse({"error": "invalid enrollment token"}, status_code=403)
             device_id = str(data.get("device_id") or make_id())
             d = self.registry.devices.setdefault(device_id, {"device_id": device_id})
-            d.update({"name": data.get("name") or "未命名设备", "platform": data.get("platform", "unknown"),
+            d.update({"name": data.get("name") or "Unnamed device", "platform": data.get("platform", "unknown"),
                       "service": "opencode", "updated_at": int(time.time())})
             d.setdefault("auth_token", secrets.token_urlsafe(32))
             self.registry.save()
@@ -293,7 +293,7 @@ class Gateway:
                                 elif item.get("type") == "ws_error":
                                     await bridge.close(code=1011)
                             except Exception:
-                                # 单个终端断开不能使整台设备下线。
+                                # A single terminal disconnect must not take the whole device offline.
                                 self.browser_ws.pop(bridge_id, None)
                     elif item.get("type") == "response":
                         future = self.pending.pop(item.get("id", ""), None)
@@ -321,10 +321,10 @@ class Gateway:
                         continue
                     future = self.pending.get(request_id)
                     if future and not future.done():
-                        future.set_exception(ConnectionError("设备控制连接已断开"))
+                        future.set_exception(ConnectionError("Device control connection lost"))
                     queue = self.streams.get(request_id)
                     if queue is not None:
-                        queue.put_nowait({"type": "stream_error", "error": "设备控制连接已断开"})
+                        queue.put_nowait({"type": "stream_error", "error": "Device control connection lost"})
                     bridge = self.browser_ws.get(request_id)
                     if bridge:
                         with contextlib.suppress(Exception):
@@ -337,7 +337,7 @@ class Gateway:
             try:
                 explicit_device, routed_path = self.parse_device_route("/" + path)
             except ValueError:
-                return JSONResponse({"error": "无效的设备路由"}, status_code=404)
+                return JSONResponse({"error": "Invalid device route"}, status_code=404)
             if explicit_device:
                 path = routed_path.lstrip("/")
             elif path.startswith("_mesh/"):
@@ -352,19 +352,19 @@ class Gateway:
                     pass
                 ws = None
             if not ws:
-                # 明确指定的设备绝不能被另一台在线设备替代。
+                # An explicitly specified device must never be substituted by another online device.
                 if device_id:
-                    return JSONResponse({"error": "指定设备离线或不存在", "device_id": device_id}, status_code=503 if d else 404)
+                    return JSONResponse({"error": "Specified device offline or not found", "device_id": device_id}, status_code=503 if d else 404)
                 selected = self.choose_device()
                 if selected:
                     device_id, d = selected
                     ws = d.get("ws")
                 else:
-                    return JSONResponse({"error": "设备离线或未选择设备"}, status_code=503)
+                    return JSONResponse({"error": "Device offline or no device selected"}, status_code=503)
             request_id = secrets.token_urlsafe(12)
             body = await req.body()
             if len(body) > int(self.cfg.get("max_request_bytes", 64 * 1024 * 1024)):
-                return JSONResponse({"error": "请求体过大"}, status_code=413)
+                return JSONResponse({"error": "Request body too large"}, status_code=413)
             if "text/event-stream" in req.headers.get("accept", "") or path in {"event", "global/event", "api/event"} or (path.startswith("api/session/") and path.endswith("/event")):
                 return await self.stream_proxy(req, d, ws, path, request_id, body)
 
@@ -383,7 +383,7 @@ class Gateway:
                 completed = True
             except Exception as exc:
                 self.pending.pop(request_id, None)
-                return JSONResponse({"error": f"设备连接失败: {exc}"}, status_code=502)
+                return JSONResponse({"error": f"Device connection failed: {exc}"}, status_code=502)
             finally:
                 self.pending.pop(request_id, None)
                 self.owners.pop(request_id, None)
@@ -403,7 +403,7 @@ class Gateway:
     async def stream_proxy(self, req: Request, d: dict[str, Any], ws: WebSocket,
                            path: str, request_id: str, body: bytes):
         if len(body) > int(self.cfg.get("max_request_bytes", 64 * 1024 * 1024)):
-            return JSONResponse({"error": "请求体过大"}, status_code=413)
+            return JSONResponse({"error": "Request body too large"}, status_code=413)
         q: asyncio.Queue = asyncio.Queue(maxsize=int(self.cfg.get("stream_queue_size", 2048)))
         self.streams[request_id] = q
         self.owners[request_id] = ws
@@ -428,7 +428,7 @@ class Gateway:
                             ended = True
                             break
                         if msg.get("type") == "stream_error":
-                            raise ConnectionError(msg.get("error", "事件流已断开"))
+                            raise ConnectionError(msg.get("error", "Event stream disconnected"))
                         if msg.get("type") == "stream_chunk":
                             yield base64.b64decode(msg.get("body", ""))
                 finally:
@@ -443,11 +443,11 @@ class Gateway:
             self.owners.pop(request_id, None)
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(ws.send_text(json.dumps({"type": "cancel", "id": request_id})), 2)
-            return JSONResponse({"error": f"事件流连接失败: {exc}"}, status_code=502)
+            return JSONResponse({"error": f"Event stream connection failed: {exc}"}, status_code=502)
 
     @staticmethod
     def enqueue_stream(queue: asyncio.Queue, item: dict[str, Any]) -> None:
-        """浏览器消费慢时丢弃最旧事件，避免阻塞控制面接收循环。"""
+        """Drop the oldest event when the browser consumes slowly, to avoid blocking the control-plane receive loop."""
         try:
             queue.put_nowait(item)
         except asyncio.QueueFull:
@@ -555,7 +555,7 @@ class Agent:
             await control.send(json.dumps(message))
 
     async def p2p_message(self, channel: Any, item: dict[str, Any]) -> None:
-        """处理浏览器通过 WebRTC DataChannel 发来的 HTTP/SSE 请求。"""
+        """Handle HTTP/SSE requests sent by the browser over the WebRTC DataChannel."""
         key = (id(channel), str(item.get("id", "")))
         if item.get("type") in {"ws_data", "ws_close"}:
             queue = self.ws_queues.get(item.get("id", ""))
@@ -605,7 +605,7 @@ class Agent:
             self.p2p_tasks.pop(key, None)
 
     async def p2p_send(self, channel: Any, message: dict[str, Any]) -> None:
-        """按 DataChannel 限制拆分大响应，避免大 Provider/文件响应关闭 P2P。"""
+        """Split large responses to fit the DataChannel limit, avoiding P2P closure from large provider/file responses."""
         body = message.get("body")
         chunk_size = 32768
         if not isinstance(body, str) or len(body) <= chunk_size:
@@ -628,11 +628,11 @@ class Agent:
         await self.p2p_channel_send(channel, message)
 
     async def p2p_channel_send(self, channel: Any, message: dict[str, Any]) -> None:
-        """串行等待 DataChannel 缓冲区，避免大响应压垮浏览器通道。"""
+        """Await the DataChannel buffer serially to avoid overwhelming the browser channel with large responses."""
         payload = json.dumps(message)
         while getattr(channel, "bufferedAmount", 0) > 1024 * 1024:
             if channel.readyState != "open":
-                raise ConnectionError("P2P 通道已关闭")
+                raise ConnectionError("P2P channel closed")
             await asyncio.sleep(0.01)
         channel.send(payload)
 
@@ -703,7 +703,7 @@ class Agent:
             await self.send_control(ws, {"type": "pong"})
 
     async def send_control(self, ws, message: dict[str, Any]) -> None:
-        """所有控制面写入串行化，避免响应、心跳和流帧交错。"""
+        """Serialize all control-plane writes to avoid interleaving responses, heartbeats, and stream frames."""
         async with self.control_send_lock:
             await ws.send(json.dumps(message))
 
@@ -771,7 +771,7 @@ class Agent:
 
 
 def inject_mesh_bar(body: bytes) -> bytes:
-    """只注入传输适配器，设备列表交给 OpenCode 原生 Server UI。"""
+    """Inject only the transport adapter; the device list is handled by the native OpenCode Server UI."""
     adapter = TRANSPORT_ADAPTER.encode("utf-8")
     if b"</head>" in body and b"ocm-transport-adapter" not in body:
         body = body.replace(b"</head>", adapter + b"</head>", 1)
