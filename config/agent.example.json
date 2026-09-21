@@ -1,0 +1,8 @@
+{
+  "listen_host": "127.0.0.1",
+  "listen_port": 18090,
+  "gateway_url": "https://oc.example.com",
+  "enroll_token": "CHANGE_ME_LONG_RANDOM",
+  "opencode_url": "http://127.0.0.1:40960",
+  "state_file": "./data/agent-state.json"
+}

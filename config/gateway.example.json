@@ -1,0 +1,9 @@
+{
+  "listen_host": "127.0.0.1",
+  "listen_port": 8090,
+  "secure_cookie": true,
+  "state_file": "./data/gateway-state.json",
+  "enroll_token": "CHANGE_ME_LONG_RANDOM",
+  "default_device": "",
+  "auth": {"username": "opencode", "password": "CHANGE_ME"}
+}

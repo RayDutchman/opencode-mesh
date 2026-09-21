@@ -1,0 +1,786 @@
+from __future__ import annotations
+import argparse, asyncio, base64, contextlib, hashlib, hmac, json, platform, secrets, socket, time
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+import httpx
+import uvicorn
+import websockets
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from .p2p import P2PUnavailable, answer_offer
+from .static_adapter import TRANSPORT_ADAPTER
+
+
+def load_json(path: str) -> dict[str, Any]:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def make_id() -> str:
+    return secrets.token_hex(8)
+
+
+def hostname() -> str:
+    return socket.gethostname() or platform.node() or "未命名设备"
+
+
+class Registry:
+    def __init__(self, cfg: dict[str, Any]):
+        self.cfg = cfg
+        self.path = Path(cfg.get("state_file", "./data/state.json"))
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.devices: dict[str, dict[str, Any]] = {}
+        self.load()
+
+    def load(self):
+        if self.path.exists():
+            try:
+                self.devices = json.loads(self.path.read_text()).get("devices", {})
+            except Exception:
+                self.devices = {}
+
+    def save(self):
+        tmp = self.path.with_suffix(".tmp")
+        devices = {key: {k: v for k, v in value.items() if k != "ws"}
+                   for key, value in self.devices.items()}
+        tmp.write_text(json.dumps({"devices": devices}, ensure_ascii=False, indent=2))
+        tmp.replace(self.path)
+
+    def public(self):
+        result = []
+        for d in self.devices.values():
+            result.append({k: v for k, v in d.items() if k not in {"auth_token", "ws"}} | {"online": bool(d.get("ws"))})
+        return result
+
+
+class Gateway:
+    def __init__(self, cfg: dict[str, Any]):
+        self.cfg = cfg
+        self.registry = Registry(cfg)
+        self.sessions: dict[str, str] = {}
+        self.pending: dict[str, asyncio.Future] = {}
+        self.streams: dict[str, asyncio.Queue] = {}
+        self.browser_ws: dict[str, WebSocket] = {}
+        self.owners: dict[str, WebSocket] = {}
+        self.p2p_answers: dict[str, asyncio.Future] = {}
+        self.app = FastAPI(title="OpenCode Mesh Gateway")
+        self.routes()
+
+    def logged(self, req: Request) -> bool:
+        sid = req.cookies.get("ocm_session")
+        return bool(sid and sid in self.sessions)
+
+    def choose_device(self) -> tuple[str, dict[str, Any]] | None:
+        preferred = str(self.cfg.get("default_device") or "")
+        candidates = []
+        if preferred and preferred in self.registry.devices:
+            candidates.append((preferred, self.registry.devices[preferred]))
+        candidates.extend((k, v) for k, v in self.registry.devices.items() if k != preferred)
+        for device_id, device in candidates:
+            if device.get("ws"):
+                return device_id, device
+        return None
+
+    def routes(self):
+        app = self.app
+
+        @app.on_event("shutdown")
+        async def shutdown_bridges():
+            for queue in self.streams.values():
+                queue.put_nowait({"type": "stream_error", "error": "Gateway 正在关闭"})
+            for bridge in list(self.browser_ws.values()):
+                with contextlib.suppress(Exception):
+                    await bridge.close(code=1001)
+
+        @app.get("/_mesh", response_class=HTMLResponse)
+        async def mesh_home(req: Request):
+            if not self.logged(req):
+                return RedirectResponse("/_mesh/login")
+            return HTMLResponse(SHELL)
+
+        @app.get("/_mesh/login", response_class=HTMLResponse)
+        async def login_page():
+            return HTMLResponse(LOGIN)
+
+        @app.post("/_mesh/login")
+        async def login(req: Request):
+            try:
+                data = await req.json()
+            except Exception:
+                data = {}
+            auth = self.cfg.get("auth", {})
+            if not (hmac.compare_digest(str(data.get("username", "")).encode(), str(auth.get("username", "")).encode()) and
+                    hmac.compare_digest(str(data.get("password", "")).encode(), str(auth.get("password", "")).encode())):
+                return JSONResponse({"error": "账号或密码错误"}, status_code=401)
+            sid = secrets.token_urlsafe(32)
+            self.sessions[sid] = str(auth.get("username"))
+            out = JSONResponse({"ok": True})
+            secure = bool(self.cfg.get("secure_cookie", True))
+            out.set_cookie("ocm_session", sid, httponly=True, secure=secure, samesite="lax")
+            selected = self.choose_device()
+            if selected:
+                out.set_cookie("ocm_device", selected[0], httponly=True, secure=secure, samesite="lax")
+                out.body = json.dumps({"ok": True, "device_id": selected[0]}).encode()
+                out.headers["content-length"] = str(len(out.body))
+            return out
+
+        @app.post("/_mesh/logout")
+        async def logout(req: Request):
+            self.sessions.pop(req.cookies.get("ocm_session", ""), None)
+            out = JSONResponse({"ok": True})
+            out.delete_cookie("ocm_session")
+            return out
+
+        @app.get("/_mesh/devices")
+        async def devices(req: Request):
+            if not self.logged(req):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+            return {"devices": self.registry.public()}
+
+        @app.get("/_mesh/transport-manifest")
+        async def transport_manifest(req: Request):
+            if not self.logged(req):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+            device_id = req.cookies.get("ocm_device") or self.cfg.get("default_device")
+            device = self.registry.devices.get(str(device_id)) if device_id else None
+            return {
+                "version": 1,
+                "device_id": device_id,
+                "relay": str(req.base_url).rstrip("/"),
+                "lan": self.cfg.get("lan_base_url"),
+                "p2p": {"enabled": bool(device and device.get("ws")), "offer": "/_mesh/p2p/offer"},
+                "stun_servers": self.cfg.get("stun_servers", ["stun:stun.l.google.com:19302"]),
+                "capabilities": {"http": True, "sse": True, "websocket": True, "pty": True},
+            }
+
+        @app.post("/_mesh/p2p/offer")
+        async def p2p_offer(req: Request):
+            if not self.logged(req):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+            device_id = req.cookies.get("ocm_device") or self.cfg.get("default_device")
+            device = self.registry.devices.get(str(device_id)) if device_id else None
+            agent_ws = device.get("ws") if device else None
+            if not agent_ws:
+                return JSONResponse({"error": "设备离线"}, status_code=503)
+            data = await req.json()
+            if len(json.dumps(data)) > int(self.cfg.get("max_p2p_offer_bytes", 1024 * 1024)):
+                return JSONResponse({"error": "P2P 信令过大"}, status_code=413)
+            session_id = secrets.token_urlsafe(18)
+            future = asyncio.get_running_loop().create_future()
+            self.p2p_answers[session_id] = future
+            try:
+                await agent_ws.send_text(json.dumps({"type": "p2p_offer", "id": session_id,
+                                                     "offer": data, "stun_servers": self.cfg.get("stun_servers", [])}))
+                return JSONResponse(await asyncio.wait_for(future, 20))
+            except Exception as exc:
+                return JSONResponse({"error": f"P2P 建链失败: {exc}"}, status_code=502)
+            finally:
+                self.p2p_answers.pop(session_id, None)
+
+        @app.post("/_mesh/switch/{device_id}")
+        async def switch(req: Request, device_id: str):
+            if not self.logged(req) or device_id not in self.registry.devices:
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+            out = JSONResponse({"ok": True, "device_id": device_id})
+            out.set_cookie("ocm_device", device_id, httponly=True, secure=bool(self.cfg.get("secure_cookie", True)), samesite="lax")
+            return out
+
+        @app.websocket("/_mesh/ws/{path:path}")
+        @app.websocket("/api/pty/{path:path}")
+        @app.websocket("/pty/{path:path}")
+        async def browser_ws(client: WebSocket, path: str):
+            sid = client.cookies.get("ocm_session")
+            if not (sid and sid in self.sessions):
+                await client.close(code=4401)
+                return
+            device_id = client.cookies.get("ocm_device") or self.cfg.get("default_device")
+            d = self.registry.devices.get(str(device_id))
+            agent_ws = d.get("ws") if d else None
+            if not agent_ws:
+                await client.close(code=4403)
+                return
+            await client.accept()
+            bridge_id = secrets.token_urlsafe(12)
+            self.browser_ws[bridge_id] = client
+            self.owners[bridge_id] = agent_ws
+            query = client.query_params
+            upstream_path = client.url.path
+            if upstream_path.startswith("/_mesh/ws/"):
+                upstream_path = "/" + path
+            open_item = {"type": "ws_open", "id": bridge_id, "path": upstream_path,
+                         "query": str(query), "headers": {k: v for k, v in client.headers.items()
+                         if k.lower() not in {"host", "content-length"}}}
+            try:
+                await agent_ws.send_text(json.dumps(open_item))
+                while True:
+                    msg = await client.receive()
+                    if msg.get("type") == "websocket.disconnect":
+                        break
+                    if msg.get("text") is not None:
+                        await agent_ws.send_text(json.dumps({"type": "ws_data", "id": bridge_id,
+                            "kind": "text", "data": msg["text"]}))
+                    elif msg.get("bytes") is not None:
+                        await agent_ws.send_text(json.dumps({"type": "ws_data", "id": bridge_id,
+                            "kind": "bytes", "data": base64.b64encode(msg["bytes"]).decode()}))
+            except Exception:
+                pass
+            finally:
+                try:
+                    await agent_ws.send_text(json.dumps({"type": "ws_close", "id": bridge_id}))
+                except Exception:
+                    pass
+                self.browser_ws.pop(bridge_id, None)
+                self.owners.pop(bridge_id, None)
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+
+        @app.post("/_mesh/register")
+        async def register(req: Request):
+            data = await req.json()
+            if not hmac.compare_digest(str(data.get("enroll_token", "")), str(self.cfg.get("enroll_token", ""))):
+                return JSONResponse({"error": "invalid enrollment token"}, status_code=403)
+            device_id = str(data.get("device_id") or make_id())
+            d = self.registry.devices.setdefault(device_id, {"device_id": device_id})
+            d.update({"name": data.get("name") or "未命名设备", "platform": data.get("platform", "unknown"),
+                      "service": "opencode", "updated_at": int(time.time())})
+            d.setdefault("auth_token", secrets.token_urlsafe(32))
+            self.registry.save()
+            return {"device_id": device_id, "agent_token": d["auth_token"], "name": d["name"]}
+
+        @app.websocket("/_mesh/agent/{device_id}")
+        async def agent(ws: WebSocket, device_id: str):
+            d = self.registry.devices.get(device_id)
+            if not d or not hmac.compare_digest(ws.query_params.get("token", ""), d.get("auth_token", "")):
+                await ws.close(code=4403)
+                return
+            await ws.accept()
+            d["ws"] = ws
+            d["last_seen"] = int(time.time())
+            try:
+                while True:
+                    msg = await ws.receive()
+                    if msg.get("type") == "websocket.disconnect":
+                        break
+                    if "text" not in msg:
+                        continue
+                    item = json.loads(msg["text"])
+                    if item.get("type") == "pong":
+                        d["last_seen"] = int(time.time())
+                    elif item.get("type") == "agent_hello":
+                        d["last_seen"] = int(time.time())
+                    elif item.get("type") in {"ws_data", "ws_opened", "ws_closed", "ws_error"}:
+                        bridge_id = item.get("id")
+                        bridge = self.browser_ws.get(bridge_id)
+                        if bridge:
+                            try:
+                                if item.get("type") == "ws_data":
+                                    if item.get("kind") == "bytes":
+                                        await bridge.send_bytes(base64.b64decode(item.get("data", "")))
+                                    else:
+                                        await bridge.send_text(item.get("data", ""))
+                                elif item.get("type") == "ws_closed":
+                                    await bridge.close(code=item.get("code", 1000))
+                                elif item.get("type") == "ws_error":
+                                    await bridge.close(code=1011)
+                            except Exception:
+                                # 单个终端断开不能使整台设备下线。
+                                self.browser_ws.pop(bridge_id, None)
+                    elif item.get("type") == "response":
+                        future = self.pending.pop(item.get("id", ""), None)
+                        if future and not future.done():
+                            future.set_result(item)
+                    elif item.get("type") == "stream_chunk":
+                        q = self.streams.get(item.get("id", ""))
+                        if q:
+                            self.enqueue_stream(q, item)
+                    elif item.get("type") in {"stream_end", "stream_error"}:
+                        q = self.streams.get(item.get("id", ""))
+                        if q:
+                            await q.put(item)
+                    elif item.get("type") == "p2p_answer":
+                        future = self.p2p_answers.get(item.get("id", ""))
+                        if future and not future.done():
+                            future.set_result(item.get("answer", {}))
+            except (WebSocketDisconnect, Exception):
+                pass
+            finally:
+                if d.get("ws") is ws:
+                    d.pop("ws", None)
+                for request_id, owner in list(self.owners.items()):
+                    if owner is not ws:
+                        continue
+                    future = self.pending.get(request_id)
+                    if future and not future.done():
+                        future.set_exception(ConnectionError("设备控制连接已断开"))
+                    queue = self.streams.get(request_id)
+                    if queue is not None:
+                        queue.put_nowait({"type": "stream_error", "error": "设备控制连接已断开"})
+                    bridge = self.browser_ws.get(request_id)
+                    if bridge:
+                        with contextlib.suppress(Exception):
+                            await bridge.close(code=1011)
+                    self.owners.pop(request_id, None)
+
+        @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+        async def proxy(req: Request, path: str):
+            if path.startswith("_mesh/"):
+                return JSONResponse({"error": "not found"}, status_code=404)
+            if not self.logged(req):
+                return RedirectResponse("/_mesh/login")
+            device_id = req.cookies.get("ocm_device") or self.cfg.get("default_device")
+            d = self.registry.devices.get(str(device_id)) if device_id else None
+            ws = d.get("ws") if d else None
+            if ws and d.get("last_seen", 0) and time.time() - float(d.get("last_seen", 0)) > 45:
+                try:
+                    await ws.close(code=1011)
+                except Exception:
+                    pass
+                ws = None
+            if not ws:
+                selected = self.choose_device()
+                if selected:
+                    device_id, d = selected
+                    ws = d.get("ws")
+                else:
+                    return JSONResponse({"error": "设备离线或未选择设备"}, status_code=503)
+            request_id = secrets.token_urlsafe(12)
+            body = await req.body()
+            if len(body) > int(self.cfg.get("max_request_bytes", 64 * 1024 * 1024)):
+                return JSONResponse({"error": "请求体过大"}, status_code=413)
+            if "text/event-stream" in req.headers.get("accept", "") or path in {"event", "global/event", "api/event"} or (path.startswith("api/session/") and path.endswith("/event")):
+                return await self.stream_proxy(req, d, ws, path, request_id, body)
+
+            item = {"type": "request", "id": request_id, "method": req.method, "path": "/" + path,
+                    "query": req.url.query, "headers": dict(req.headers),
+                    "body": base64.b64encode(body).decode()}
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            self.pending[request_id] = future
+            self.owners[request_id] = ws
+            completed = False
+            try:
+                print(f"proxy request id={request_id} path=/{path}", flush=True)
+                await asyncio.wait_for(ws.send_text(json.dumps(item)), timeout=10)
+                result = await asyncio.wait_for(future, timeout=float(self.cfg.get("request_timeout", 30)))
+                completed = True
+            except Exception as exc:
+                self.pending.pop(request_id, None)
+                return JSONResponse({"error": f"设备连接失败: {exc}"}, status_code=502)
+            finally:
+                self.pending.pop(request_id, None)
+                self.owners.pop(request_id, None)
+                if not completed:
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(ws.send_text(json.dumps({"type": "cancel", "id": request_id})), 2)
+            headers = {k: v for k, v in result.get("headers", {}).items()
+                       if k.lower() not in {"content-length", "transfer-encoding", "connection", "content-security-policy", "x-frame-options"}}
+            body = base64.b64decode(result.get("body", ""))
+            print(f"proxy response id={request_id} status={result.get('status')} encoded={len(result.get('body', ''))} decoded={len(body)}", flush=True)
+            content_type = headers.get("content-type", headers.get("Content-Type", ""))
+            if "text/html" in content_type.lower() and int(result.get("status", 502)) == 200:
+                body = inject_mesh_bar(body)
+            headers["content-length"] = str(len(body))
+            return Response(body, status_code=int(result.get("status", 502)), headers=headers)
+
+    async def stream_proxy(self, req: Request, d: dict[str, Any], ws: WebSocket,
+                           path: str, request_id: str, body: bytes):
+        if len(body) > int(self.cfg.get("max_request_bytes", 64 * 1024 * 1024)):
+            return JSONResponse({"error": "请求体过大"}, status_code=413)
+        q: asyncio.Queue = asyncio.Queue(maxsize=int(self.cfg.get("stream_queue_size", 2048)))
+        self.streams[request_id] = q
+        self.owners[request_id] = ws
+        item = {"type": "stream_request", "id": request_id, "method": req.method,
+                "path": "/" + path, "query": req.url.query, "headers": dict(req.headers),
+                "body": base64.b64encode(body).decode()}
+        try:
+            await ws.send_text(json.dumps(item))
+            first = await asyncio.wait_for(q.get(), timeout=30)
+            if first.get("type") == "stream_error":
+                self.streams.pop(request_id, None)
+                return JSONResponse({"error": first.get("error", "stream failed")}, status_code=502)
+            headers = {k: v for k, v in first.get("headers", {}).items()
+                       if k.lower() not in {"content-length", "content-encoding", "transfer-encoding", "connection"}}
+            status = int(first.get("status", 200))
+            async def body_iter():
+                ended = False
+                try:
+                    while True:
+                        msg = await q.get()
+                        if msg.get("type") == "stream_end":
+                            ended = True
+                            break
+                        if msg.get("type") == "stream_error":
+                            raise ConnectionError(msg.get("error", "事件流已断开"))
+                        if msg.get("type") == "stream_chunk":
+                            yield base64.b64decode(msg.get("body", ""))
+                finally:
+                    self.streams.pop(request_id, None)
+                    self.owners.pop(request_id, None)
+                    if not ended:
+                        with contextlib.suppress(Exception):
+                            await asyncio.wait_for(ws.send_text(json.dumps({"type": "cancel", "id": request_id})), 2)
+            return StreamingResponse(body_iter(), status_code=status, headers=headers)
+        except Exception as exc:
+            self.streams.pop(request_id, None)
+            self.owners.pop(request_id, None)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(ws.send_text(json.dumps({"type": "cancel", "id": request_id})), 2)
+            return JSONResponse({"error": f"事件流连接失败: {exc}"}, status_code=502)
+
+    @staticmethod
+    def enqueue_stream(queue: asyncio.Queue, item: dict[str, Any]) -> None:
+        """浏览器消费慢时丢弃最旧事件，避免阻塞控制面接收循环。"""
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(item)
+
+
+class Agent:
+    def __init__(self, cfg: dict[str, Any]):
+        self.cfg = cfg
+        self.app = FastAPI(title="OpenCode Mesh Agent")
+        self.target = cfg["opencode_url"].rstrip("/")
+        self.ws_queues: dict[str, asyncio.Queue] = {}
+        self.p2p_peers: set[Any] = set()
+        self.p2p_tasks: dict[tuple[int, str], asyncio.Task] = {}
+        self.control_send_lock = asyncio.Lock()
+        self.routes()
+
+    def routes(self):
+        @self.app.get("/_mesh/health")
+        async def health():
+            return {"ok": True, "target": self.target}
+
+    async def local_ws(self, item: dict[str, Any], control):
+        bridge_id = item["id"]
+        queue = asyncio.Queue()
+        self.ws_queues[bridge_id] = queue
+        url = self.target.replace("http://", "ws://", 1).replace("https://", "wss://", 1) + item["path"]
+        if item.get("query"):
+            url += "?" + item["query"]
+        headers = {k: v for k, v in item.get("headers", {}).items()
+                    if k.lower() not in {"host", "content-length", "sec-websocket-key", "sec-websocket-version",
+                                        "sec-websocket-extensions", "connection", "upgrade", "origin", "cookie", "authorization", "sec-websocket-protocol"}}
+        basic = self.cfg.get("opencode_basic_auth")
+        auth = None
+        if isinstance(basic, dict):
+            auth = (str(basic.get("username", "")), str(basic.get("password", "")))
+            headers["Authorization"] = "Basic " + base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode()
+        try:
+            async with websockets.connect(url, additional_headers=headers, subprotocols=[],
+                                          max_size=None, origin=self.target) as target:
+                await self.control_message(control, {"type": "ws_opened", "id": item["id"]})
+                async def to_target():
+                    while True:
+                        msg = await queue.get()
+                        if msg.get("type") == "ws_close":
+                            await target.close(); return
+                        if msg.get("type") == "ws_data":
+                            data = base64.b64decode(msg["data"]) if msg.get("kind") == "bytes" else msg.get("data", "")
+                            await target.send(data)
+                async def from_target():
+                    async for raw in target:
+                        if isinstance(raw, bytes):
+                            payload = {"type": "ws_data", "id": item["id"], "kind": "bytes",
+                                       "data": base64.b64encode(raw).decode()}
+                        else:
+                            payload = {"type": "ws_data", "id": item["id"], "kind": "text", "data": raw}
+                        await self.control_message(control, payload)
+                done, pending = await asyncio.wait(
+                    [asyncio.create_task(to_target()), asyncio.create_task(from_target())],
+                    return_when=asyncio.FIRST_COMPLETED)
+                for task in pending: task.cancel()
+                await asyncio.gather(*done, *pending, return_exceptions=True)
+                code = target.close_code or 1000
+                if code in {1005, 1006, 1015}: code = 1011
+                await self.control_message(control, {"type": "ws_closed", "id": item["id"], "code": code})
+        except Exception as exc:
+            try:
+                await self.control_message(control, {"type": "ws_error", "id": item["id"], "error": str(exc)})
+            except Exception:
+                pass
+        finally:
+            self.ws_queues.pop(bridge_id, None)
+
+    async def local_stream(self, item: dict[str, Any], ws):
+        url = self.target + item["path"]
+        if item.get("query"): url += "?" + item["query"]
+        headers = {k: v for k, v in item.get("headers", {}).items() if k.lower() not in {"host", "content-length"}}
+        basic = self.cfg.get("opencode_basic_auth")
+        auth = httpx.BasicAuth(str(basic["username"]), str(basic.get("password", ""))) if isinstance(basic, dict) else None
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10), auth=auth) as client:
+                async with client.stream(item["method"], url, headers=headers, content=base64.b64decode(item.get("body", ""))) as r:
+                    out_headers = {k: v for k, v in r.headers.items() if k.lower() not in {"content-encoding", "content-length", "transfer-encoding", "connection"}}
+                    await self.stream_send(ws, {"type":"stream_chunk","id":item["id"],"status":r.status_code,"headers":out_headers})
+                    async for chunk in r.aiter_bytes():
+                        await self.stream_send(ws, {"type":"stream_chunk","id":item["id"],"body":base64.b64encode(chunk).decode()})
+                    await self.stream_send(ws, {"type":"stream_end","id":item["id"]})
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                await self.stream_send(ws, {"type":"stream_error","id":item["id"],"error":str(exc)})
+
+    async def stream_send(self, ws, message: dict[str, Any]) -> None:
+        if isinstance(ws, WebSocket):
+            await self.send_control(ws, message)
+        else:
+            await ws.send(json.dumps(message))
+
+    async def control_message(self, control, message: dict[str, Any]) -> None:
+        if isinstance(control, WebSocket):
+            await self.send_control(control, message)
+        else:
+            await control.send(json.dumps(message))
+
+    async def p2p_message(self, channel: Any, item: dict[str, Any]) -> None:
+        """处理浏览器通过 WebRTC DataChannel 发来的 HTTP/SSE 请求。"""
+        key = (id(channel), str(item.get("id", "")))
+        if item.get("type") in {"ws_data", "ws_close"}:
+            queue = self.ws_queues.get(item.get("id", ""))
+            if queue:
+                await queue.put(item)
+            return
+        if item.get("type") == "cancel":
+            task = self.p2p_tasks.get(key)
+            if task:
+                task.cancel()
+            return
+        if item.get("type") not in {"request", "stream_request", "ws_open"}:
+            return
+
+        class ChannelWriter:
+            async def send(self, payload: str):
+                await self_outer.p2p_send(channel, json.loads(payload))
+
+        self_outer = self
+
+        class P2PControl:
+            async def send(self, payload: str):
+                await self_outer.p2p_send(channel, json.loads(payload))
+
+        if item["type"] == "request":
+            async def run_request():
+                result = await self.local_request(item, timeout=float(self.cfg.get("request_timeout", 120)))
+                await self.p2p_send(channel, result)
+        elif item["type"] == "stream_request":
+            async def run_request():
+                await self.local_stream(item, ChannelWriter())
+        else:
+            async def run_request():
+                await self.local_ws(item, P2PControl())
+
+        task = asyncio.create_task(run_request())
+        self.p2p_tasks[key] = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await self.p2p_send(channel, {"type": "cancelled", "id": item.get("id", "")})
+        except Exception as exc:
+            await self.p2p_send(channel, {"type": "response", "id": item.get("id", ""), "status": 502,
+                                          "headers": {}, "body": base64.b64encode(json.dumps({"error": str(exc)}).encode()).decode()})
+        finally:
+            self.p2p_tasks.pop(key, None)
+
+    async def p2p_send(self, channel: Any, message: dict[str, Any]) -> None:
+        """按 DataChannel 限制拆分大响应，避免大 Provider/文件响应关闭 P2P。"""
+        body = message.get("body")
+        chunk_size = 32768
+        if not isinstance(body, str) or len(body) <= chunk_size:
+            await self.p2p_channel_send(channel, message)
+            return
+        if message.get("type") == "response":
+            await self.p2p_channel_send(channel, {k: v for k, v in message.items() if k != "body"} | {
+                "type": "response_start", "id": message.get("id", ""),
+            })
+            for offset in range(0, len(body), chunk_size):
+                await self.p2p_channel_send(channel, {"type": "response_chunk", "id": message["id"],
+                                         "body": body[offset:offset + chunk_size]})
+            await self.p2p_channel_send(channel, {"type": "response_end", "id": message["id"]})
+            return
+        if message.get("type") == "stream_chunk":
+            for offset in range(0, len(body), chunk_size):
+                await self.p2p_channel_send(channel, {"type": "stream_chunk", "id": message["id"],
+                                         "body": body[offset:offset + chunk_size]})
+            return
+        await self.p2p_channel_send(channel, message)
+
+    async def p2p_channel_send(self, channel: Any, message: dict[str, Any]) -> None:
+        """串行等待 DataChannel 缓冲区，避免大响应压垮浏览器通道。"""
+        payload = json.dumps(message)
+        while getattr(channel, "bufferedAmount", 0) > 1024 * 1024:
+            if channel.readyState != "open":
+                raise ConnectionError("P2P 通道已关闭")
+            await asyncio.sleep(0.01)
+        channel.send(payload)
+
+    async def handle_p2p_offer(self, item: dict[str, Any], control) -> None:
+        peer_holder: dict[str, Any] = {}
+        channels: set[int] = set()
+        async def receive(channel, message):
+            channels.add(id(channel))
+            await self.p2p_message(channel, message)
+        async def peer_closed():
+            peer = peer_holder.get("peer")
+            if peer:
+                self.p2p_peers.discard(peer)
+            for key, task in list(self.p2p_tasks.items()):
+                if key[0] in channels:
+                    task.cancel()
+        try:
+            peer, answer = await answer_offer(
+                item["offer"], receive, peer_closed,
+                item.get("stun_servers") or [],
+            )
+            peer_holder["peer"] = peer
+            self.p2p_peers.add(peer)
+            await control.send(json.dumps({"type": "p2p_answer", "id": item["id"], "answer": answer}))
+        except (P2PUnavailable, Exception) as exc:
+            with contextlib.suppress(Exception):
+                await control.send(json.dumps({"type": "p2p_answer", "id": item["id"],
+                                                "answer": {"error": str(exc)}}))
+
+    async def handle_request(self, item: dict[str, Any], ws):
+        try:
+            result = await self.local_request(item, timeout=float(self.cfg.get("request_timeout", 120)))
+            await self.send_control(ws, result)
+        except Exception as exc:
+            try:
+                await self.send_control(ws, {"type": "response", "id": item.get("id", ""), "status": 502,
+                                          "headers": {}, "body": base64.b64encode(
+                                              json.dumps({"error": str(exc)}).encode()).decode()})
+            except Exception:
+                pass
+
+    async def local_request(self, item: dict[str, Any], timeout: float = 120) -> dict[str, Any]:
+        url = self.target + item["path"]
+        if item.get("query"):
+            url += "?" + item["query"]
+        headers = {k: v for k, v in item.get("headers", {}).items() if k.lower() not in {"host", "content-length"}}
+        auth = None
+        basic = self.cfg.get("opencode_basic_auth")
+        if isinstance(basic, dict) and basic.get("username") is not None:
+            auth = httpx.BasicAuth(str(basic["username"]), str(basic.get("password", "")))
+        async with httpx.AsyncClient(timeout=timeout, auth=auth) as client:
+            try:
+                r = await client.request(item["method"], url, headers=headers, content=base64.b64decode(item.get("body", "")))
+                encoded = base64.b64encode(r.content).decode()
+                print(f"agent response id={item['id']} status={r.status_code} bytes={len(r.content)} encoded={len(encoded)}", flush=True)
+                return {"type": "response", "id": item["id"], "status": r.status_code,
+                        "headers": {k: v for k, v in r.headers.items()
+                                    if k.lower() not in {"content-encoding", "content-length", "transfer-encoding", "connection"}},
+                        "body": encoded}
+            except Exception as exc:
+                return {"type": "response", "id": item["id"], "status": 502, "headers": {},
+                        "body": base64.b64encode(json.dumps({"error": str(exc)}).encode()).decode()}
+
+    async def control_heartbeat(self, ws):
+        interval = float(self.cfg.get("heartbeat_seconds", 15))
+        while True:
+            await asyncio.sleep(interval)
+            await self.send_control(ws, {"type": "pong"})
+
+    async def send_control(self, ws, message: dict[str, Any]) -> None:
+        """所有控制面写入串行化，避免响应、心跳和流帧交错。"""
+        async with self.control_send_lock:
+            await ws.send(json.dumps(message))
+
+    async def run(self):
+        state = Path(self.cfg.get("state_file", "./data/agent-state.json"))
+        state.parent.mkdir(parents=True, exist_ok=True)
+        data = json.loads(state.read_text()) if state.exists() else {"device_id": make_id()}
+        state.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        ws_url = self.cfg["gateway_url"].replace("https://", "wss://").replace("http://", "ws://").rstrip("/")
+        reconnect = float(self.cfg.get("reconnect_seconds", 5))
+        while True:
+            try:
+                async with httpx.AsyncClient(timeout=20) as client:
+                    r = await client.post(self.cfg["gateway_url"].rstrip("/") + "/_mesh/register", json={
+                        "device_id": data["device_id"], "name": hostname(), "platform": platform.platform(),
+                        "enroll_token": self.cfg["enroll_token"]})
+                    r.raise_for_status()
+                    data.update(r.json())
+                    state.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+                async with websockets.connect(
+                    f"{ws_url}/_mesh/agent/{data['device_id']}?token={quote(data['agent_token'])}",
+                    max_size=None, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
+                    tasks = {}
+                    heartbeat = asyncio.create_task(self.control_heartbeat(ws))
+                    await ws.send(json.dumps({"type": "agent_hello"}))
+                    try:
+                        async for raw in ws:
+                            item = json.loads(raw)
+                            handler = {"request": self.handle_request, "stream_request": self.local_stream,
+                                       "ws_open": self.local_ws}.get(item.get("type"))
+                            if handler:
+                                request_id = item["id"]
+                                previous = tasks.get(request_id)
+                                if previous: previous.cancel()
+                                task = asyncio.create_task(handler(item, ws))
+                                tasks[request_id] = task
+                                def finish(completed, key=request_id):
+                                    if tasks.get(key) is completed:
+                                        tasks.pop(key, None)
+                                    if not completed.cancelled():
+                                        completed.exception()
+                                task.add_done_callback(finish)
+                            elif item.get("type") == "cancel":
+                                task = tasks.get(item.get("id"))
+                                if task: task.cancel()
+                            elif item.get("type") == "p2p_offer":
+                                asyncio.create_task(self.handle_p2p_offer(item, ws))
+                            elif item.get("type") == "ping":
+                                await ws.send(json.dumps({"type": "pong"}))
+                            elif item.get("type") in {"ws_data", "ws_close"}:
+                                q = self.ws_queues.get(item.get("id", ""))
+                                if q:
+                                    await q.put(item)
+                    finally:
+                        heartbeat.cancel()
+                        remaining = list(tasks.values())
+                        for task in remaining: task.cancel()
+                        await asyncio.gather(*remaining, return_exceptions=True)
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await heartbeat
+            except Exception as exc:
+                print(f"agent connection/register retry: {type(exc).__name__}: {exc}", flush=True)
+                await asyncio.sleep(reconnect)
+
+
+
+def inject_mesh_bar(body: bytes) -> bytes:
+    """Inject a small device bar; OpenCode static resources remain cacheable."""
+    tag = b"</body>"
+    addon = """<style id='ocm-style'>#ocm-bar{position:fixed;z-index:2147483647;top:0;left:0;right:0;height:36px;display:flex;align-items:center;gap:6px;padding:0 10px;background:#15181dcc;color:#fff;font:13px system-ui;backdrop-filter:blur(8px)}#ocm-bar button{border:0;border-radius:5px;padding:4px 8px;cursor:pointer}body{padding-top:36px!important}</style><div id='ocm-bar'><b>OpenCode Mesh</b><span id='ocm-devices'>加载设备…</span></div><script id='ocm-script'>(async()=>{const h=document.getElementById('ocm-devices');try{const r=await fetch('/_mesh/devices'),x=await r.json();h.innerHTML=x.devices.map(v=>`<button data-id=\"${v.device_id}\">${v.name}${v.online?' ●':' ○'}</button>`).join('');h.querySelectorAll('button').forEach(b=>b.onclick=async()=>{await fetch('/_mesh/switch/'+b.dataset.id,{method:'POST'});location.reload()})}catch(e){h.textContent='设备列表不可用'}})()</script>""".encode("utf-8")
+    adapter = TRANSPORT_ADAPTER.encode("utf-8")
+    if b"</head>" in body and b"ocm-transport-adapter" not in body:
+        body = body.replace(b"</head>", adapter + b"</head>", 1)
+    return body.replace(tag, addon + tag, 1) if tag in body else body
+
+LOGIN = '''<!doctype html><meta name="viewport" content="width=device-width"><title>OpenCode Mesh 登录</title><style>body{font:16px system-ui;max-width:360px;margin:15vh auto;padding:24px}input,button{box-sizing:border-box;width:100%;padding:12px;margin:6px 0}</style><h2>OpenCode Mesh</h2><input id=u placeholder="账号"><input id=p type=password placeholder="密码"><button onclick="go()">登录</button><p id=e></p><script>async function go(){let r=await fetch('/_mesh/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username:u.value,password:p.value})});if(r.ok)location='/';else e.textContent=(await r.json()).error}</script>'''
+SHELL = '''<!doctype html><meta name="viewport" content="width=device-width"><title>OpenCode Mesh</title><style>body{margin:0;font:14px system-ui}header{min-height:48px;display:flex;gap:8px;align-items:center;padding:0 12px;background:#202124;color:white;flex-wrap:wrap}button{padding:7px 12px}#app{height:calc(100vh - 60px);overflow:auto}</style><header><b>OpenCode</b><span id=d>正在加载设备…</span><button onclick="logout()">退出</button></header><main id=app>设备切换层已启动，OpenCode 数据面将在当前设备连接后显示。</main><script>async function init(){let r=await fetch('/_mesh/devices');if(!r.ok)return;let x=await r.json();d.innerHTML=x.devices.map(v=>`<button onclick="sw('${v.device_id}')">${v.name}${v.online?' ●':' ○'}</button>`).join('')}async function sw(id){await fetch('/_mesh/switch/'+id,{method:'POST'});location.reload()}async function logout(){await fetch('/_mesh/logout',{method:'POST'});location='/_mesh/login'}init()</script>'''
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--mode", choices=["gateway", "agent"], required=True)
+    args = parser.parse_args()
+    cfg = load_json(args.config)
+    if args.mode == "gateway":
+        uvicorn.run(Gateway(cfg).app, host=cfg.get("listen_host", "127.0.0.1"), port=int(cfg.get("listen_port", 8090)), log_level="info", timeout_graceful_shutdown=5)
+    else:
+        agent = Agent(cfg)
+        asyncio.run(agent.run())
+
+
+if __name__ == "__main__":
+    main()

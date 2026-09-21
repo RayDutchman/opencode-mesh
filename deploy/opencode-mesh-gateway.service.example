@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenCode Mesh Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/opencode-mesh
+ExecStart=/opt/opencode-mesh/.venv/bin/python -m src.main --mode gateway --config /opt/opencode-mesh/config/gateway.json
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/opencode-mesh/data
+
+[Install]
+WantedBy=multi-user.target

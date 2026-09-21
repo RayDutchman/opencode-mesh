@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+*.local.json
+.cache-opencode.js
+交接给WSL-OpenCode.md
