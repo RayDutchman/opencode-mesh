@@ -15,10 +15,8 @@ err()  { printf '\033[1;31m[mesh]\033[0m %s\n' "$*" >&2; }
 
 ask() {
   local prompt="$1" default="$2" value=""
-  if [ -t 0 ]; then
-    read -rp "${prompt} [${default}]: " value || true
-  elif [ -e /dev/tty ]; then
-    read -rp "${prompt} [${default}]: " value < /dev/tty || true
+  if [ -t 1 ]; then
+    read -rp "${prompt} [${default}]: " value < /dev/tty 2>/dev/null || true
   fi
   printf '%s' "${value:-$default}"
 }
