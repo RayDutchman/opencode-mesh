@@ -320,6 +320,35 @@ def load_aiortc():
     return RTCPeerConnection, RTCSessionDescription
 
 
+def enable_loopback_candidate() -> None:
+    """让 aiortc/aioice 把 127.0.0.1 作为 host candidate 发布。
+
+    aioice 的 get_host_addresses 默认排除 loopback（ip.ip != "127.0.0.1"）。
+    但在 WSL mirrored 等场景下，宿主机浏览器只能通过共享 loopback 到达本机
+    Agent，其余 host candidate（LAN/Docker/链路本地）对宿主机都不可达，
+    导致 ICE 永远失败、只能走 Relay。这里在进程内幂等地补充 127.0.0.1。
+
+    对远程浏览器无害：远端浏览器的 127.0.0.1 指向它自己，该候选只是
+    多一个必然失败的 candidate pair，其余候选不受影响。
+    """
+    try:
+        import aioice.ice as ice
+    except ImportError:
+        return
+    original = ice.get_host_addresses
+    if getattr(original, "_ocm_loopback_patched", False):
+        return
+
+    def patched(use_ipv4: bool, use_ipv6: bool) -> list[str]:
+        addresses = list(original(use_ipv4, use_ipv6))
+        if use_ipv4 and "127.0.0.1" not in addresses:
+            addresses.append("127.0.0.1")
+        return addresses
+
+    patched._ocm_loopback_patched = True
+    ice.get_host_addresses = patched
+
+
 async def wait_ice_complete(peer: Any, timeout: float = 15) -> None:
     async def wait():
         while peer.iceGatheringState != "complete":
@@ -340,8 +369,11 @@ async def answer_offer(
     on_message: Callable[[Any, dict[str, Any]], Awaitable[None]],
     on_close: Callable[[], Awaitable[None]],
     stun_servers: list[str] | None = None,
+    loopback_candidate: bool = True,
 ) -> tuple[Any, dict[str, str]]:
     """Receive a browser offer on the Agent side and return an answer with ICE candidates."""
+    if loopback_candidate:
+        enable_loopback_candidate()
     RTCPeerConnection, RTCSessionDescription = load_aiortc()
     configuration = None
     if stun_servers:

@@ -1174,6 +1174,7 @@ class Agent:
             peer, answer = await answer_offer(
                 item["offer"], receive, peer_closed,
                 item.get("stun_servers") or [],
+                loopback_candidate=bool(self.cfg.get("p2p_loopback_candidate", True)),
             )
             peer_holder["peer"] = peer
             self.p2p_peers.add(peer)

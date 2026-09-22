@@ -2,5 +2,6 @@
   "gateway_url": "https://oc.example.com",
   "enroll_token": "CHANGE_ME_LONG_RANDOM",
   "opencode_url": "http://127.0.0.1:4096",
-  "state_file": "./data/agent-state.json"
+  "state_file": "./data/agent-state.json",
+  "p2p_loopback_candidate": true
 }

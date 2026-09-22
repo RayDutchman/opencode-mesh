@@ -28,7 +28,8 @@ from src.p2p import (ASSEMBLY_BUDGET_REASON, CONNECTION_FAILED_REASON,
                      PAYLOAD_TOO_LARGE_REASON, REQUEST_TOO_LARGE_REASON,
                      RESPONSE_TOO_LARGE_REASON, STREAM_OVERFLOW_REASON,
                      UPSTREAM_ERROR_REASON, ChunkAssembler, FrameError,
-                     ResponseSizeGuard, decoded_size, frame, iter_frames,
+                     ResponseSizeGuard, decoded_size, enable_loopback_candidate,
+                     frame, iter_frames,
                      p2p_message_limit, p2p_total_budget, read_bounded,
                      request_limit, response_limit, ws_frame_limit)
 
@@ -1482,3 +1483,36 @@ def test_p2p_channel_send_drains_then_sends_within_timeout():
                                                          "data": "", "final": True})
     asyncio.run(scenario())
     assert sent == [{"message_id": "x", "sequence": 0, "data": "", "final": True}]
+
+
+def test_enable_loopback_candidate_adds_loopback_and_is_idempotent():
+    """开启 loopback candidate 后 127.0.0.1 进入 host 候选，且 patch 幂等。"""
+    import aioice.ice as ice
+    original = ice.get_host_addresses
+    try:
+        enable_loopback_candidate()
+        patched = ice.get_host_addresses
+        assert patched is not original  # 已替换为补丁函数
+        addresses = patched(True, False)
+        assert "127.0.0.1" in addresses
+        # 幂等：再次开启不重复 patch，也不重复叠加 loopback
+        enable_loopback_candidate()
+        assert ice.get_host_addresses is patched
+        assert patched(True, False).count("127.0.0.1") == 1
+    finally:
+        ice.get_host_addresses = original
+
+
+def test_enable_loopback_candidate_preserves_ipv6_and_other_hosts():
+    """patch 只补充 IPv4 loopback，保留原有 host 地址与 IPv6 行为。"""
+    import aioice.ice as ice
+    original = ice.get_host_addresses
+    try:
+        before = set(original(True, False))
+        enable_loopback_candidate()
+        after = set(ice.get_host_addresses(True, False))
+        assert "127.0.0.1" in after
+        assert before <= after  # 原有地址全部保留
+        assert after - before == {"127.0.0.1"}
+    finally:
+        ice.get_host_addresses = original
