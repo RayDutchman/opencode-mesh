@@ -61,7 +61,7 @@ def test_agent_preserves_body_and_reframes_headers(monkeypatch, stream, body):
 
 
 def test_browser_scopes_websocket_and_preserves_explicit_server():
-    """原生 V2 PTY 使用根绝对 WSS URL，仍须绑定页面 Server。"""
+    """裸 origin 保持默认 Server，显式入口不受页面切换影响。"""
     helpers = TRANSPORT_ADAPTER.split('  const requestPath =', 1)[1].split('  function rejectEntry', 1)[0]
     script = """
     const assert=require('node:assert/strict');
@@ -72,7 +72,9 @@ def test_browser_scopes_websocket_and_preserves_explicit_server():
     const localStorage={getItem:()=>null};
     """ + 'const requestPath =' + helpers + """
     assert.equal(scopeNativeRequest('wss://mesh.test/api/pty/p/connect')[0],
-      'wss://mesh.test/_mesh/device/ehang/api/pty/p/connect');
+      'wss://mesh.test/_mesh/device/gti/api/pty/p/connect');
+    assert.equal(scopeNativeRequest('https://mesh.test/api/session/original/form')[0],
+      'https://mesh.test/_mesh/device/gti/api/session/original/form');
     assert.equal(scopeNativeRequest('wss://other.test/api/pty/p/connect')[0],
       'wss://other.test/api/pty/p/connect');
     assert.equal(scopeNativeRequest('https://mesh.test/_mesh/device/gti/api/info')[0],

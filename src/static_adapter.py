@@ -178,7 +178,8 @@ TRANSPORT_ADAPTER = r"""
     } catch (_) { return null; }
   };
   const scopeNativeRequest = (input, init) => {
-    const deviceId = activeDeviceId();
+    // 裸 origin 是默认 Server；切换页面不能改变它的后台请求归属。
+    const deviceId = state.defaultDevice;
     if (!deviceId) return [input, init];
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);
     const httpOrigin = url.origin.replace(/^ws:/, 'http:').replace(/^wss:/, 'https:');

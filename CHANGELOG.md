@@ -11,6 +11,7 @@
 - 修复 Relay 重新编码后仍转发 Transfer-Encoding 导致空 400 和 UnsupportedContentType。
 - 删除空 JSON/模型字段改写、V1 页面跳转及 XMLHttpRequest/EventSource 模拟。
 - 修复 WSS 设备前缀、设备切换期间的通道绑定、取消与大 Request 回退。
+- 在 V2 SDK 构造绝对 API URL 时保留明确 Server 基址，裸 origin 固定属于默认 Server，避免首页切换污染后台请求。
 - 增加实际 Node 浏览器接口行为测试和 Agent HTTP 请求字节透传测试。
 
 ## [0.1.0] - 2026-09-22
