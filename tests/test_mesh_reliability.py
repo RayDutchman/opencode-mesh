@@ -21,7 +21,8 @@ import random
 
 import httpx
 
-from src.main import Agent, Gateway, StreamState, backoff_delay, parse_retry_after
+from src.main import (Agent, Gateway, StreamState, backoff_delay,
+                      filter_response_headers, parse_retry_after)
 from src.p2p import (ASSEMBLY_BUDGET_REASON, CONNECTION_FAILED_REASON,
                      INVALID_ENCODING_REASON, INVALID_SEQUENCE_REASON,
                      MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
@@ -77,6 +78,23 @@ class BrowserState:
         self.settled: list[tuple[str, object]] = []
 
 
+class FakeSocket:
+    """Observable state machine mirroring the browser MeshWebSocket."""
+
+    CONNECTING = 0
+    OPEN = 1
+    CLOSING = 2
+    CLOSED = 3
+
+    def __init__(self):
+        self.readyState = FakeSocket.CONNECTING
+        self.protocol = ""
+        self.events: list[tuple[str, object]] = []
+
+    def dispatch(self, type_: str, event: object) -> None:
+        self.events.append((type_, event))
+
+
 def open_stream(state: BrowserState, stream_id: str) -> Controller:
     """模拟 p2pFetch 的 SSE 分支：先建立 pending 入口，再登记 stream controller。"""
     state.pending[stream_id] = {"response": None}
@@ -89,7 +107,20 @@ def browser_settle(state: BrowserState, message: dict) -> None:
     """模拟修复后的浏览器流状态机，验证状态帧不会夺走流的所有权。"""
     if message.get("type") == "pong":
         return
-    if state.sockets.get(message.get("id")):
+    socket = state.sockets.get(message.get("id"))
+    if socket is not None:
+        mtype = message.get("type")
+        if mtype == "ws_opened":
+            # Only CONNECTING can transition to OPEN; late opens are ignored.
+            if socket.readyState == FakeSocket.CONNECTING:
+                socket.readyState = FakeSocket.OPEN
+                # An unnegotiated protocol clears the constructor's requested value.
+                if "protocol" in message:
+                    socket.protocol = message.get("protocol") or ""
+                socket.dispatch("open", {})
+        elif mtype in ("ws_closed", "ws_error"):
+            socket.readyState = FakeSocket.CLOSED
+            socket.dispatch("close", {})
         return
     entry = state.pending.get(message.get("id"))
     if entry is None:
@@ -115,7 +146,19 @@ def browser_settle(state: BrowserState, message: dict) -> None:
                                           "headers": entry["response"]["headers"],
                                           "body": "".join(entry["response"]["chunks"])}))
         return
-    if mtype in ("response", "cancelled"):
+    if mtype == "response":
+        state.pending.pop(mid, None)
+        state.settled.append(("resolve", message))
+        return
+    if mtype == "cancelled":
+        stream = state.streams.get(mid)
+        if stream is not None:
+            # A pre-header cancellation must error and clean up, not become an empty 200 stream.
+            state.streams.pop(mid, None)
+            state.pending.pop(mid, None)
+            state.settled.append(("reject", "AbortError"))
+            stream["controller"].error("AbortError")
+            return
         state.pending.pop(mid, None)
         state.settled.append(("resolve", message))
         return
@@ -1367,6 +1410,46 @@ def test_transient_connection_failure_uses_connection_failed_reason():
     assert _decode_error_body(result).get("reason") == CONNECTION_FAILED_REASON
 
 
+def test_local_request_follows_redirects():
+    """Agent 代理必须跟随重定向（与原生 fetch 默认 redirect:'follow' 一致）。"""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/start":
+                self.send_response(302)
+                self.send_header("Location", "/final")
+                self.end_headers()
+            else:
+                body = b"redirected-ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        async def scenario():
+            agent = Agent({"opencode_url": f"http://127.0.0.1:{port}",
+                           "max_request_bytes": str(LIMIT_BYTES),
+                           "request_timeout": "5"})
+            return await agent.local_request({"type": "request", "id": "r-redirect",
+                                              "method": "GET", "path": "/start", "headers": {},
+                                              "body": b64(b"")}, timeout=5.0)
+
+        result = asyncio.run(scenario())
+    finally:
+        server.shutdown()
+    assert result["status"] == 200
+    assert unb64(result["body"]) == b"redirected-ok"
+
+
 def test_p2p_message_502_carries_stable_reason():
     """run_request 抛出的连接级错误必须映射为带稳定 reason 的 502。"""
     sent = []
@@ -1516,3 +1599,81 @@ def test_enable_loopback_candidate_preserves_ipv6_and_other_hosts():
         assert after - before == {"127.0.0.1"}
     finally:
         ice.get_host_addresses = original
+
+
+# ================================================================
+# 前端适配层健壮性修订：响应头过滤（set-cookie 跨信任边界）
+# ================================================================
+
+def test_filter_response_headers_strips_set_cookie_and_hop_headers():
+    """Response headers strip set-cookie and hop-by-hop fields."""
+    headers = {
+        "content-type": "application/json",
+        "set-cookie": "session=abc; Path=/",
+        "set-cookie2": "csrf=xyz; Path=/",
+        "content-length": "123",
+        "content-encoding": "gzip",
+        "transfer-encoding": "chunked",
+        "connection": "keep-alive",
+        "x-custom": "keep-me",
+    }
+    result = filter_response_headers(headers)
+    assert result == {"content-type": "application/json", "x-custom": "keep-me"}
+
+
+def test_filter_response_headers_is_case_insensitive():
+    """Set-cookie variants are stripped case-insensitively."""
+    result = filter_response_headers({"Set-Cookie": "a=b", "SET-COOKIE": "c=d",
+                                      "Content-Type": "text/html"})
+    assert result == {"Content-Type": "text/html"}
+
+
+# ================================================================
+# 前端适配层健壮性修订：WebSocket 状态机单调性
+# ================================================================
+
+def test_ws_opened_moves_connecting_socket_to_open():
+    """ws_opened moves a CONNECTING socket to OPEN and dispatches open."""
+    state = BrowserState()
+    socket = FakeSocket()
+    state.sockets["ws1"] = socket
+    browser_settle(state, {"type": "ws_opened", "id": "ws1", "protocol": ""})
+    assert socket.readyState == FakeSocket.OPEN
+    assert ("open", {}) in socket.events
+
+
+def test_ws_opened_after_close_does_not_reopen():
+    """A late ws_opened cannot reopen a CLOSING or CLOSED socket."""
+    state = BrowserState()
+    socket = FakeSocket()
+    socket.readyState = FakeSocket.CLOSING
+    state.sockets["ws1"] = socket
+    browser_settle(state, {"type": "ws_opened", "id": "ws1", "protocol": ""})
+    assert socket.readyState == FakeSocket.CLOSING
+    assert not any(event_type == "open" for event_type, _ in socket.events)
+
+
+def test_ws_opened_empty_protocol_clears_requested_protocol():
+    """An empty negotiated protocol clears the requested socket protocol."""
+    state = BrowserState()
+    socket = FakeSocket()
+    socket.protocol = "requested"  # Simulate the constructor's requested protocol.
+    state.sockets["ws1"] = socket
+    browser_settle(state, {"type": "ws_opened", "id": "ws1", "protocol": ""})
+    assert socket.protocol == ""
+
+
+# ================================================================
+# 前端适配层健壮性修订：cancelled 不得伪装成 200 空流
+# ================================================================
+
+def test_cancelled_before_first_frame_errors_stream():
+    """A pre-header cancellation errors and cleans up instead of an empty 200 stream."""
+    state = BrowserState()
+    sid = "s-cancelled"
+    controller = open_stream(state, sid)
+    browser_settle(state, {"type": "cancelled", "id": sid})
+    assert controller.errored is not None
+    assert sid not in state.streams
+    rejects = [payload for kind, payload in state.settled if kind == "reject"]
+    assert rejects  # The pending request must reject instead of resolving cancelled.

@@ -78,6 +78,19 @@ def forwarding_headers(headers) -> dict[str, str]:
     return {k: v for k, v in headers.items() if k.lower() not in blocked}
 
 
+def filter_response_headers(headers) -> dict[str, str]:
+    """Strip hop-by-hop headers and headers forbidden from being written back.
+
+    ``set-cookie`` is forbidden for the browser Response constructor.
+    The frontend rebuilds responses with ``new Response(body, {headers})``
+    and would throw a TypeError otherwise. This helper is used by both P2P
+    and Relay paths so upstream cookies never cross the trust boundary.
+    """
+    blocked = {'content-encoding', 'content-length', 'transfer-encoding', 'connection',
+               'set-cookie', 'set-cookie2'}
+    return {k: v for k, v in headers.items() if k.lower() not in blocked}
+
+
 DEFAULT_STUN_SERVERS = ["stun:stun.l.google.com:19302"]
 
 OFFLINE_PAGE = """<!doctype html>
@@ -725,8 +738,7 @@ class Gateway:
                 # 首帧携带的 body（如有）也计入上限，避免单片超限绕过；且必须原样输出。
                 first_body = first.get("body") or ""
                 guard.add_encoded(first_body)
-            headers = {k: v for k, v in first.get("headers", {}).items()
-                       if k.lower() not in {"content-length", "content-encoding", "transfer-encoding", "connection"}}
+            headers = filter_response_headers(first.get("headers", {}))
             status = int(first.get("status", 200))
             async def body_iter():
                 ended = False
@@ -895,9 +907,9 @@ class Agent:
         auth = httpx.BasicAuth(str(basic["username"]), str(basic.get("password", ""))) if isinstance(basic, dict) else None
         guard = ResponseSizeGuard(response_limit(self.cfg))
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10), auth=auth) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10), auth=auth, follow_redirects=True) as client:
                 async with client.stream(item["method"], url, headers=headers, content=decode_strict(item.get("body", ""))) as r:
-                    out_headers = {k: v for k, v in r.headers.items() if k.lower() not in {"content-encoding", "content-length", "transfer-encoding", "connection"}}
+                    out_headers = filter_response_headers(r.headers)
                     await self.stream_send(ws, {"type":"stream_chunk","id":item["id"],"status":r.status_code,"headers":out_headers})
                     async for chunk in r.aiter_bytes():
                         # 逐片累计上限：单片与累计超限都以稳定 stream_error 终止。
@@ -1215,7 +1227,7 @@ class Agent:
         if isinstance(basic, dict) and basic.get("username") is not None:
             auth = httpx.BasicAuth(str(basic["username"]), str(basic.get("password", "")))
         limit = response_limit(self.cfg)
-        async with httpx.AsyncClient(timeout=timeout, auth=auth) as client:
+        async with httpx.AsyncClient(timeout=timeout, auth=auth, follow_redirects=True) as client:
             try:
                 async with client.stream(item["method"], url, headers=headers,
                                          content=decode_strict(item.get("body", ""))) as r:
@@ -1223,8 +1235,7 @@ class Agent:
                 encoded = base64.b64encode(content).decode()
                 print(f"agent response id={item['id']} status={r.status_code} bytes={len(content)} encoded={len(encoded)}", flush=True)
                 return {"type": "response", "id": item["id"], "status": r.status_code,
-                        "headers": {k: v for k, v in r.headers.items()
-                                    if k.lower() not in {"content-encoding", "content-length", "transfer-encoding", "connection"}},
+                        "headers": filter_response_headers(r.headers),
                         "body": encoded}
             except FrameError as exc:
                 return {"type": "response", "id": item["id"], "status": 502, "headers": {},
