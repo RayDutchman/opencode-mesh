@@ -24,3 +24,7 @@ dist/
 
 # git worktree 隔离工作区
 .worktrees/
+
+# Deployment metadata and on-host source backups
+.mesh-revision
+.mesh-backups/
