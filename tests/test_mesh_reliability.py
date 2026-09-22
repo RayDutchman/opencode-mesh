@@ -1881,6 +1881,31 @@ def test_mesh_bar_injects_runtime_version():
     assert b"__OCM_VERSION_JSON__" not in body
 
 
+def test_mesh_adapter_is_not_injected_into_v1_html():
+    """V1 must keep its native API/WebSocket client instead of the V2 adapter."""
+    body = inject_mesh_bar(
+        b'<html><head><script type="module" src="/assets/index-old.js"></script></head></html>'
+    )
+
+    assert b"ocm-transport-adapter" not in body
+
+
+def test_mesh_adapter_is_injected_into_v2_html():
+    """V2 HTML continues to receive the Mesh transport adapter."""
+    body = inject_mesh_bar(
+        b'<html><head><script type="module" src="/_assets/index-new.js"></script></head></html>'
+    )
+
+    assert b"ocm-transport-adapter" in body
+
+
+def test_adapter_checks_selected_server_frontend_before_switching_transport():
+    """A V2 page must navigate to a selected V1 device instead of mixing SDKs."""
+    assert "selectedServerUrl()" in TRANSPORT_ADAPTER
+    assert "ensureFrontendForDevice" in TRANSPORT_ADAPTER
+    assert "/_assets/" in TRANSPORT_ADAPTER
+
+
 def test_mesh_bar_injection_is_idempotent_with_version():
     """Processing the same HTML twice does not duplicate the adapter."""
     body = inject_mesh_bar(b"<html><head></head><body></body></html>")

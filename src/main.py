@@ -1443,7 +1443,11 @@ class Agent:
 
 
 def inject_mesh_bar(body: bytes) -> bytes:
-    """Inject only the transport adapter; the device list is handled by the native OpenCode Server UI."""
+    """仅向 V2 页面注入适配器，V1 页面保留原生传输实现。"""
+    # V1 使用 /assets，V2 使用 /_assets。两者的 API、事件流和 WebSocket
+    # 协议不同，把 V2 适配器注入 V1 会导致健康检查返回 HTML 并拖垮整个前端。
+    if b"/assets/" in body and b"/_assets/" not in body:
+        return body
     adapter = TRANSPORT_ADAPTER.replace(
         "__OCM_VERSION_JSON__", json.dumps(__version__, ensure_ascii=True)
     ).encode("utf-8")

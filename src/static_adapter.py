@@ -136,7 +136,7 @@ TRANSPORT_ADAPTER = r"""
       return virtualDeviceId(server.pathname);
     } catch (_) { return null; }
   };
-  const selectedServerDeviceId = () => {
+  const selectedServerUrl = () => {
     try {
       const servers = readJson('opencode.global.dat:server', { list: [] }).list || [];
       const layout = readJson('opencode.global.dat:layout', {});
@@ -148,10 +148,30 @@ TRANSPORT_ADAPTER = r"""
         const normalized = String(url).replace(/\/+$/, '');
         return selected === url || selected === normalized || selected.endsWith(normalized);
       });
-      return match ? virtualDeviceId(new URL(match.http.url, location.href).pathname) : null;
+      return match?.http?.url || null;
+    } catch (_) { return null; }
+  };
+  const selectedServerDeviceId = () => {
+    try {
+      const url = selectedServerUrl();
+      return url ? virtualDeviceId(new URL(url, location.href).pathname) : null;
     } catch (_) { return null; }
   };
   const activeDeviceId = () => currentDeviceId() || selectedServerDeviceId() || state.manifest?.device_id || state.defaultDevice;
+  let frontendCheckUrl = null;
+  async function ensureFrontendForDevice() {
+    const url = selectedServerUrl();
+    if (!url || url === frontendCheckUrl) return;
+    frontendCheckUrl = url;
+    try {
+      const response = await nativeFetch(url.replace(/\/+$/, '') + '/', { credentials: 'same-origin', cache: 'no-store' });
+      if (!response.ok) return;
+      const html = await response.text();
+      if (!html.includes('/_assets/') && html.includes('/assets/')) {
+        location.replace(url.replace(/\/+$/, '') + '/');
+      }
+    } catch (_) { frontendCheckUrl = null; }
+  }
   const serverRoutePath = path => {
     const match = path.match(/^\/server\/([^/]+)(\/.*)?$/);
     if (!match) return null;
@@ -623,7 +643,7 @@ TRANSPORT_ADAPTER = r"""
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', renderBar, { once: true });
   else renderBar();
   let relayTick = 0;
-  setInterval(() => { reconnectForDevice(); renderBar(); if (++relayTick % 5 === 0) measureRelayRtt(); }, 2000);
+  setInterval(() => { ensureFrontendForDevice(); reconnectForDevice(); renderBar(); if (++relayTick % 5 === 0) measureRelayRtt(); }, 2000);
   setTimeout(measureRelayRtt, 1500);
   syncNativeServers();
 
