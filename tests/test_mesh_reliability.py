@@ -25,7 +25,9 @@ from pathlib import Path
 import httpx
 
 from src.main import (Agent, Gateway, StreamState, backoff_delay, filter_response_headers,
-                      forwarding_headers, inject_mesh_bar, parse_retry_after)
+                      forwarding_headers, inject_mesh_bar, parse_retry_after,
+                      parse_server_route, rewrite_device_html)
+from src.static_adapter import TRANSPORT_ADAPTER
 from src.p2p import (ASSEMBLY_BUDGET_REASON, CONNECTION_FAILED_REASON,
                      INVALID_ENCODING_REASON, INVALID_SEQUENCE_REASON,
                      MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
@@ -345,6 +347,34 @@ def test_gateway_lifespan_closes_streams_and_bridges(tmp_path):
     assert stream.closed
     assert stream.pending_end == {"type": "stream_error", "error": "Gateway is shutting down"}
     assert closed == [1001, 1001]
+
+
+def test_parse_server_route_resolves_device_and_upstream_path():
+    """OpenCode server routes resolve to the encoded Mesh device scope."""
+    import base64
+
+    server_url = "https://mesh.example/_mesh/device/device-ehang"
+    key = base64.urlsafe_b64encode(server_url.encode()).decode().rstrip("=")
+
+    assert parse_server_route(f"/server/{key}/session/s-1") == ("device-ehang", "/session/s-1")
+    assert parse_server_route(f"/server/{key}/") == ("device-ehang", "/")
+
+
+def test_rewrite_device_html_scopes_root_assets():
+    """Device HTML keeps static assets bound to the device that served it."""
+    body = b'<script src="/_assets/index.js"></script><link href="/assets/app.css">'
+
+    result = rewrite_device_html(body, "device-ehang")
+
+    assert b"/_mesh/device/device-ehang/_assets/index.js" in result
+    assert b"/_mesh/device/device-ehang/assets/app.css" in result
+
+
+def test_adapter_scopes_servers_and_relay_fallback_to_active_device():
+    """The browser adapter must keep server tabs and Relay requests device-scoped."""
+    assert "serverTabUrl(device.device_id)" in TRANSPORT_ADAPTER
+    assert "scopeNativeRequest" in TRANSPORT_ADAPTER
+    assert "currentDeviceId()" in TRANSPORT_ADAPTER
 
 
 def test_agent_accepts_consecutive_ws_data_frames_for_one_socket():
@@ -1751,6 +1781,13 @@ def test_forwarding_headers_strip_credentials_and_csrf_markers():
     assert "referer" not in out
     assert out["accept"] == "application/json"
     assert out["x-opencode-ticket"] == "1"
+
+
+def test_forwarding_headers_strip_accept_encoding():
+    """The Agent must receive uncompressed upstream responses for safe relaying."""
+    out = {k.lower(): v for k, v in forwarding_headers({
+        "Accept-Encoding": "gzip, deflate, br", "Accept": "text/html"}).items()}
+    assert "accept-encoding" not in out
 
 
 def test_agent_local_request_strips_browser_csrf_markers(monkeypatch):

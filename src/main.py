@@ -71,6 +71,37 @@ def harden_permissions(path: Path) -> None:
         os.chmod(path, 0o600)
 
 
+def parse_server_route(path: str) -> tuple[str | None, str]:
+    """解析 OpenCode 的 ``/server/<key>`` 路由并恢复设备上游路径。"""
+    match = re.match(r"^/server/([^/]+)(/.*)?$", path)
+    if not match:
+        return None, path
+    encoded = match.group(1)
+    try:
+        padded = encoded.replace("-", "+").replace("_", "/")
+        padded += "=" * ((4 - len(padded) % 4) % 4)
+        server = urlparse(base64.b64decode(padded, validate=True).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise ValueError("Invalid server route") from None
+    if server.scheme not in {"http", "https"} or not server.netloc:
+        raise ValueError("Invalid server URL")
+
+    device_prefix = "/_mesh/device/"
+    if not server.path.startswith(device_prefix):
+        raise ValueError("Server route is not a Mesh device")
+    device_id = server.path[len(device_prefix):].split("/", 1)[0]
+    if not device_id or any(char in device_id for char in "/\\."):
+        raise ValueError("Invalid server route device")
+    return device_id, match.group(2) or "/"
+
+
+def rewrite_device_html(body: bytes, device_id: str) -> bytes:
+    """把设备 HTML 中的根相对静态资源改成设备作用域路径。"""
+    prefix = "/_mesh/device/" + quote(device_id, safe="")
+    pattern = re.compile(rb"((?:src|href)\s*=\s*[\"'])/(?!/|_mesh/)", re.IGNORECASE)
+    return pattern.sub(lambda match: match.group(1) + prefix.encode("ascii") + b"/", body)
+
+
 def forwarding_headers(headers) -> dict[str, str]:
     """Never send gateway credentials or browser CSRF markers across the Agent trust boundary."""
     blocked = {'authorization', 'cookie', 'proxy-authorization', 'host', 'content-length',
@@ -480,6 +511,7 @@ class Gateway:
 
         @app.websocket("/_mesh/ws/{path:path}")
         @app.websocket("/_mesh/device/{path:path}")
+        @app.websocket("/server/{path:path}")
         @app.websocket("/api/pty/{path:path}")
         @app.websocket("/pty/{path:path}")
         async def browser_ws(client: WebSocket, path: str):
@@ -487,15 +519,26 @@ class Gateway:
                 await client.close(code=4401)
                 return
             explicit_device = None
-            if client.url.path.startswith("/_mesh/device/"):
+            if client.url.path.startswith("/server/"):
+                try:
+                    explicit_device, path = parse_server_route(client.url.path)
+                    path = path.lstrip("/")
+                except ValueError:
+                    await client.close(code=4404)
+                    return
+            elif client.url.path.startswith("/_mesh/device/"):
                 try:
                     explicit_device, path = self.parse_device_route(client.url.path)
                     path = path.lstrip("/")
                 except ValueError:
                     await client.close(code=4404)
                     return
-            device_id = explicit_device or self.cfg.get("default_device")
-            d = self.registry.devices.get(str(device_id))
+            if explicit_device:
+                device_id = explicit_device
+                d = self.registry.devices.get(device_id)
+            else:
+                selected = self.choose_device()
+                device_id, d = selected if selected else (None, None)
             agent_ws = d.get("ws") if d else None
             if not agent_ws:
                 await client.close(code=4403)
@@ -638,7 +681,10 @@ class Gateway:
         async def proxy(req: Request, path: str):
             explicit_device = None
             try:
-                explicit_device, routed_path = self.parse_device_route("/" + path)
+                if path.startswith("server/"):
+                    explicit_device, routed_path = parse_server_route("/" + path)
+                else:
+                    explicit_device, routed_path = self.parse_device_route("/" + path)
             except ValueError:
                 return JSONResponse({"error": "Invalid device route"}, status_code=404)
             if explicit_device:
@@ -710,6 +756,8 @@ class Gateway:
             print(f"proxy response id={request_id} status={result.get('status')} encoded={len(result.get('body', ''))} decoded={len(body)}", flush=True)
             content_type = headers.get("content-type", headers.get("Content-Type", ""))
             if "text/html" in content_type.lower() and int(result.get("status", 502)) == 200:
+                if explicit_device:
+                    body = rewrite_device_html(body, explicit_device)
                 body = inject_mesh_bar(body)
             headers["content-length"] = str(len(body))
             return Response(body, status_code=int(result.get("status", 502)), headers=headers)

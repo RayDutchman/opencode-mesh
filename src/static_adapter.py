@@ -128,13 +128,31 @@ TRANSPORT_ADAPTER = r"""
   const decodeServer = value => decodeURIComponent(escape(atob(value.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - value.length % 4) % 4))));
   const serverTabUrl = deviceId => `${location.origin}/_mesh/device/${encodeURIComponent(deviceId)}`;
   const currentDeviceId = () => {
-    const match = location.pathname.match(/^\/server\/([^/]+)\//);
+    const match = location.pathname.match(/^\/server\/([^/]+)(\/.*)?$/);
     if (!match) return virtualDeviceId(location.pathname);
     try {
       const server = new URL(decodeServer(match[1]));
       if (server.origin !== location.origin) return null;
       return virtualDeviceId(server.pathname);
     } catch (_) { return null; }
+  };
+  const serverRoutePath = path => {
+    const match = path.match(/^\/server\/([^/]+)(\/.*)?$/);
+    if (!match) return null;
+    try {
+      const server = new URL(decodeServer(match[1]));
+      if (server.origin !== location.origin || !virtualDeviceId(server.pathname)) return null;
+      return match[2] || '/';
+    } catch (_) { return null; }
+  };
+  const scopeNativeRequest = (input, init) => {
+    const deviceId = currentDeviceId();
+    if (!deviceId) return [input, init];
+    const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);
+    if (url.origin !== location.origin || url.pathname.startsWith('/_mesh/') || url.pathname.startsWith('/server/') || virtualDeviceId(url.pathname)) return [input, init];
+    url.pathname = '/_mesh/device/' + encodeURIComponent(deviceId) + url.pathname;
+    if (input instanceof Request) return [new Request(url.href, init ? new Request(input, init) : input), undefined];
+    return [url.href, init];
   };
   const readJson = (key, fallback) => { try { return JSON.parse(localStorage.getItem(key) || 'null') ?? fallback; } catch (_) { return fallback; } };
   const headersObject = headers => {
@@ -163,9 +181,8 @@ TRANSPORT_ADAPTER = r"""
       const signature = devices.map(device => `${device.device_id}:${device.name}`).sort().join('|') + '#' + primaryId;
       if (localStorage.getItem('ocm.native-servers.signature') === signature) return;
       const store = readJson('opencode.global.dat:server', { list: [], projects: {}, lastProject: {}, recentlyClosed: {} });
-      store.list = devices.map(device => device.device_id === primaryId
-        ? { type: 'http', displayName: device.name || device.device_id, http: { url: location.origin } }
-        : { type: 'http', displayName: device.name || device.device_id, http: { url: serverTabUrl(device.device_id) } });
+      store.list = devices.map(device =>
+        ({ type: 'http', displayName: device.name || device.device_id, http: { url: serverTabUrl(device.device_id) } }));
       localStorage.setItem('opencode.global.dat:server', JSON.stringify(store));
       localStorage.setItem('ocm.native-servers.signature', signature);
       location.reload();
@@ -491,13 +508,13 @@ TRANSPORT_ADAPTER = r"""
   async function p2pFetch(input, init = {}) {
     const request = new Request(typeof input === 'string' || input instanceof URL ? new URL(input, location.href) : input, init);
     let { path, query } = requestPath(request);
-    const requestedDevice = virtualDeviceId(path);
+    const requestedDevice = virtualDeviceId(path) || currentDeviceId();
     if (requestedDevice && requestedDevice !== state.manifest?.device_id) throw new Error('different device uses Relay');
-    path = devicePath(path);
+    path = serverRoutePath(path) || devicePath(path);
     const id = makeId();
     const sizeProbe = new Uint8Array(await request.clone().arrayBuffer());
     // Fall back to Relay for requests larger than the P2P payload limit.
-    if (sizeProbe.length > MAX_P2P_BODY) return nativeFetch(input, init);
+    if (sizeProbe.length > MAX_P2P_BODY) return nativeFetch(...scopeNativeRequest(input, init));
     const headers = headersObject(request.headers);
     const accept = (headers.accept || '').toLowerCase();
     if (accept.includes('text/event-stream') || path === '/event' || path === '/global/event' || path === '/api/event' || path.endsWith('/event')) {
@@ -550,7 +567,7 @@ TRANSPORT_ADAPTER = r"""
       Promise.resolve(state.ready).then(() => {
         if (this.readyState !== MeshWebSocket.CONNECTING) return;
         if (!state.channel || state.channel.readyState !== 'open') return this.fail(new Error('P2P unavailable'));
-        send({ type: 'ws_open', id: this.id, path: devicePath(url.pathname), query: url.search.slice(1), headers: {}, protocols: Array.isArray(protocols) ? protocols : (protocols ? [protocols] : []) }).catch(error => this.fail(error));
+        send({ type: 'ws_open', id: this.id, path: serverRoutePath(url.pathname) || devicePath(url.pathname), query: url.search.slice(1), headers: {}, protocols: Array.isArray(protocols) ? protocols : (protocols ? [protocols] : []) }).catch(error => this.fail(error));
       });
     }
     addEventListener(type, fn) { if (!this._listeners.has(type)) this._listeners.set(type, new Set()); this._listeners.get(type).add(fn); }
@@ -603,13 +620,14 @@ TRANSPORT_ADAPTER = r"""
       await Promise.race([state.ready, new Promise(resolve => setTimeout(resolve, 1200))]);
       if (state.channel && state.channel.readyState === 'open') return p2pFetch(input, init);
     }
-    return nativeFetch(input, init);
+    return nativeFetch(...scopeNativeRequest(input, init));
   };
   window.WebSocket = class extends MeshWebSocket {
     constructor(input, protocols) {
       const url = new URL(input, location.href);
       if (url.host !== location.host || (virtualDeviceId(url.pathname) && virtualDeviceId(url.pathname) !== state.manifest?.device_id) || !state.channel || state.channel.readyState !== 'open') {
-        return new nativeWebSocket(input, protocols);
+        const [scopedInput] = scopeNativeRequest(input);
+        return new nativeWebSocket(scopedInput, protocols);
       }
       super(input, protocols);
     }
