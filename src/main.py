@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, asyncio, base64, contextlib, hmac, json, os, platform, re, secrets, socket, time
+import argparse, asyncio, base64, contextlib, hmac, json, os, platform, random, re, secrets, socket, time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -9,8 +9,40 @@ import uvicorn
 import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
-from .p2p import P2PUnavailable, answer_offer
+from .p2p import (CHUNK_SIZE, CONNECTION_FAILED_REASON, CONTROL_SEND_TIMEOUT,
+                   INVALID_ENCODING_REASON, INVALID_SEQUENCE_REASON,
+                   PAYLOAD_TOO_LARGE_REASON, REQUEST_TOO_LARGE_REASON,
+                   RESPONSE_TOO_LARGE_REASON, STREAM_OVERFLOW_REASON,
+                   ChunkAssembler, FrameError, P2PUnavailable, ResponseSizeGuard,
+                   answer_offer, decode_strict, decoded_size, frame, is_valid_base64,
+                   iter_frames, p2p_message_limit, p2p_total_budget, read_bounded, request_limit,
+                   response_limit, UPSTREAM_ERROR_REASON, ws_frame_limit)
 from .static_adapter import TRANSPORT_ADAPTER
+
+
+def parse_retry_after(value: str | None) -> float | None:
+    """解析 Retry-After 头（仅支持秒数形式），无有效值时返回 None。"""
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
+    return None
+
+
+def backoff_delay(attempt: int, base: float = 1.0, cap: float = 60.0,
+                  jitter: float = 0.5, retry_after: float | None = None,
+                  rng: random.Random | None = None) -> float:
+    """有界指数退避：attempt 从 1 起算，叠加 jitter，并尊重 Retry-After。"""
+    generator = rng or random.Random()
+    exponent = max(0, int(attempt) - 1)
+    delay = base * (2 ** exponent)
+    delay += generator.uniform(0, delay * jitter)
+    # jitter 叠加后再统一截断，保证最终 delay 永不超过 cap。
+    delay = min(cap, delay)
+    if retry_after is not None:
+        delay = max(delay, min(cap, float(retry_after)))
+    return delay
 
 
 def load_json(path: str) -> dict[str, Any]:
@@ -139,15 +171,54 @@ class Registry:
         return result
 
 
+class StreamState:
+    """有界流缓冲：溢出时产生一条显式 stream_error 并关闭，不驱逐已缓冲分片。"""
+
+    OVERFLOW_REASON = STREAM_OVERFLOW_REASON
+
+    def __init__(self, maxsize: int):
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
+        self.signal = asyncio.Event()
+        self.pending_end: dict[str, Any] | None = None
+        self.overflow_reason: str | None = None
+        self.closed = False
+
+    def push(self, item: dict[str, Any]) -> bool:
+        if self.closed:
+            return False
+        try:
+            self.queue.put_nowait(item)
+            return True
+        except asyncio.QueueFull:
+            if item.get("type") in {"stream_end", "stream_error"}:
+                self.pending_end = item
+                self.closed = True
+                self.signal.set()
+                return True
+            self.overflow_reason = self.OVERFLOW_REASON
+            self.closed = True
+            self.signal.set()
+            return False
+
+    def fail(self, reason: str) -> None:
+        """幂等地注入一条终止性 stream_error。"""
+        if self.closed:
+            return
+        self.closed = True
+        self.pending_end = {"type": "stream_error", "error": reason}
+        self.signal.set()
+
+
 class Gateway:
     def __init__(self, cfg: dict[str, Any]):
         self.cfg = cfg
         self.registry = Registry(cfg)
         self.pending: dict[str, asyncio.Future] = {}
-        self.streams: dict[str, asyncio.Queue] = {}
+        self.streams: dict[str, StreamState] = {}
         self.browser_ws: dict[str, WebSocket] = {}
         self.owners: dict[str, WebSocket] = {}
         self.p2p_answers: dict[str, asyncio.Future] = {}
+        self.p2p_owners: dict[str, WebSocket] = {}
         self.device_send_locks: dict[int, asyncio.Lock] = {}
         self.browser_send_locks: dict[str, asyncio.Lock] = {}
         self.auth_failures: dict[str, list[float]] = {}
@@ -189,6 +260,60 @@ class Gateway:
         lock = self.device_send_locks.setdefault(key, asyncio.Lock())
         async with lock:
             await ws.send_text(json.dumps(message))
+
+    async def send_control(self, ws: WebSocket, message: dict[str, Any],
+                           timeout: float = CONTROL_SEND_TIMEOUT) -> None:
+        """有界控制帧发送：超时或对端已关闭都统一抛出连接级错误。"""
+        try:
+            await asyncio.wait_for(self.send_to_device(ws, message), timeout)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(Exception):
+                await ws.close(code=1011)
+            raise ConnectionError("Agent control send timed out")
+        except Exception as exc:
+            # 对已关闭 socket 写入会抛 RuntimeError/ConnectionError，统一转换为连接级错误。
+            with contextlib.suppress(Exception):
+                await ws.close(code=1011)
+            raise ConnectionError("Agent control connection closed") from exc
+
+    async def attach_device(self, device: dict[str, Any], ws: WebSocket) -> None:
+        """绑定控制连接；同 device_id 重连时关闭旧连接并清理其挂起状态。"""
+        old = device.get("ws")
+        if old is not None and old is not ws:
+            # 先真正关闭旧连接，unblock 其 receive 循环，再清理它持有的状态。
+            with contextlib.suppress(Exception):
+                await old.close(code=1011)
+            await self.cleanup_device(old)
+        device["ws"] = ws
+        device["last_seen"] = int(time.time())
+
+    async def cleanup_device(self, ws: WebSocket) -> None:
+        """幂等地清理某控制连接持有的请求、流、P2P 回答与浏览器桥接。"""
+        self.device_send_locks.pop(id(ws), None)
+        for device in self.registry.devices.values():
+            if device.get("ws") is ws:
+                device.pop("ws", None)
+        for request_id, owner in list(self.owners.items()):
+            if owner is not ws:
+                continue
+            self.owners.pop(request_id, None)
+            future = self.pending.pop(request_id, None)
+            if future and not future.done():
+                future.set_exception(ConnectionError("Device control connection lost"))
+            state = self.streams.pop(request_id, None)
+            if state is not None:
+                state.fail("Device control connection lost")
+            bridge = self.browser_ws.get(request_id)
+            if bridge:
+                with contextlib.suppress(Exception):
+                    await bridge.close(code=1011)
+        for session_id, owner in list(self.p2p_owners.items()):
+            if owner is not ws:
+                continue
+            self.p2p_owners.pop(session_id, None)
+            future = self.p2p_answers.pop(session_id, None)
+            if future and not future.done():
+                future.set_exception(ConnectionError("Device control connection lost"))
 
     @staticmethod
     def allow_rate(bucket: dict[str, list[float]], key: str, limit: int, window: float = 60) -> bool:
@@ -279,8 +404,8 @@ class Gateway:
 
         @app.on_event("shutdown")
         async def shutdown_bridges():
-            for queue in self.streams.values():
-                queue.put_nowait({"type": "stream_error", "error": "Gateway is shutting down"})
+            for state in self.streams.values():
+                state.fail("Gateway is shutting down")
             for bridge in list(self.browser_ws.values()):
                 with contextlib.suppress(Exception):
                     await bridge.close(code=1001)
@@ -324,14 +449,16 @@ class Gateway:
             session_id = secrets.token_urlsafe(18)
             future = asyncio.get_running_loop().create_future()
             self.p2p_answers[session_id] = future
+            self.p2p_owners[session_id] = agent_ws
             try:
-                await self.send_to_device(agent_ws, {"type": "p2p_offer", "id": session_id,
-                                                     "offer": data, "stun_servers": self.cfg.get("stun_servers") or DEFAULT_STUN_SERVERS})
+                await self.send_control(agent_ws, {"type": "p2p_offer", "id": session_id,
+                                                   "offer": data, "stun_servers": self.cfg.get("stun_servers") or DEFAULT_STUN_SERVERS})
                 return JSONResponse(await asyncio.wait_for(future, 20))
             except Exception:
                 return JSONResponse({"error": "P2P connection failed"}, status_code=502)
             finally:
                 self.p2p_answers.pop(session_id, None)
+                self.p2p_owners.pop(session_id, None)
 
         @app.websocket("/_mesh/ws/{path:path}")
         @app.websocket("/_mesh/device/{path:path}")
@@ -368,24 +495,22 @@ class Gateway:
             open_item = {"type": "ws_open", "id": bridge_id, "path": upstream_path,
                          "query": str(query), "headers": forwarding_headers(client.headers)}
             try:
-                await self.send_to_device(agent_ws, open_item)
+                await self.send_control(agent_ws, open_item)
                 while True:
                     msg = await client.receive()
                     if msg.get("type") == "websocket.disconnect":
                         break
                     if msg.get("text") is not None:
-                        await self.send_to_device(agent_ws, {"type": "ws_data", "id": bridge_id,
+                        await self.send_control(agent_ws, {"type": "ws_data", "id": bridge_id,
                             "kind": "text", "data": msg["text"]})
                     elif msg.get("bytes") is not None:
-                        await self.send_to_device(agent_ws, {"type": "ws_data", "id": bridge_id,
+                        await self.send_control(agent_ws, {"type": "ws_data", "id": bridge_id,
                             "kind": "bytes", "data": base64.b64encode(msg["bytes"]).decode()})
             except Exception:
                 pass
             finally:
-                try:
-                    await self.send_to_device(agent_ws, {"type": "ws_close", "id": bridge_id})
-                except Exception:
-                    pass
+                with contextlib.suppress(Exception):
+                    await self.send_control(agent_ws, {"type": "ws_close", "id": bridge_id})
                 self.browser_ws.pop(bridge_id, None)
                 self.owners.pop(bridge_id, None)
                 self.browser_send_locks.pop(bridge_id, None)
@@ -407,7 +532,10 @@ class Gateway:
                 return JSONResponse({"error": "Invalid device ID"}, status_code=400)
             existing = self.registry.devices.get(device_id)
             if existing and not hmac.compare_digest(str(data.get('agent_token', '')).encode(), str(existing.get('auth_token', '')).encode()):
-                return JSONResponse({"error": "Device ownership proof required"}, status_code=403)
+                if not data.get("rotate_token"):
+                    return JSONResponse({"error": "Device ownership proof required"}, status_code=403)
+                # enroll_token 已验证：允许轮换与 Gateway 状态不一致的持久化设备 token。
+                existing["auth_token"] = secrets.token_urlsafe(32)
             d = self.registry.devices.setdefault(device_id, {"device_id": device_id})
             d.update({"name": data.get("name") or "Unnamed device", "platform": data.get("platform", "unknown"),
                       "service": "opencode", "updated_at": int(time.time())})
@@ -434,12 +562,14 @@ class Gateway:
                 await ws.close(code=4403)
                 return
             await ws.accept()
-            d["ws"] = ws
-            d["last_seen"] = int(time.time())
+            await self.attach_device(d, ws)
             try:
                 while True:
                     msg = await ws.receive()
                     if msg.get("type") == "websocket.disconnect":
+                        break
+                    if d.get("ws") is not ws:
+                        # 旧连接已被同 device_id 的新连接替换，不得再更新 last_seen 或解析请求。
                         break
                     if "text" not in msg:
                         continue
@@ -455,7 +585,11 @@ class Gateway:
                             # Never await a slow browser from the shared device receive loop.
                             if item.get("type") == "ws_data":
                                 binary = item.get("kind") == "bytes"
-                                payload = base64.b64decode(item.get("data", "")) if binary else item.get("data", "")
+                                try:
+                                    payload = decode_strict(item.get("data", "")) if binary else item.get("data", "")
+                                except Exception:
+                                    asyncio.create_task(self.close_browser(bridge_id, 1011))
+                                    continue
                                 asyncio.create_task(self.send_browser(bridge_id, payload, binary))
                             elif item.get("type") == "ws_closed":
                                 asyncio.create_task(self.close_browser(bridge_id, item.get("code", 1000)))
@@ -466,13 +600,13 @@ class Gateway:
                         if future and not future.done():
                             future.set_result(item)
                     elif item.get("type") == "stream_chunk":
-                        q = self.streams.get(item.get("id", ""))
-                        if q:
-                            self.enqueue_stream(q, item)
+                        state = self.streams.get(item.get("id", ""))
+                        if state is not None:
+                            self.enqueue_stream(state, item)
                     elif item.get("type") in {"stream_end", "stream_error"}:
-                        q = self.streams.get(item.get("id", ""))
-                        if q:
-                            self.enqueue_stream(q, item)
+                        state = self.streams.get(item.get("id", ""))
+                        if state is not None:
+                            self.enqueue_stream(state, item)
                     elif item.get("type") == "p2p_answer":
                         future = self.p2p_answers.get(item.get("id", ""))
                         if future and not future.done():
@@ -480,23 +614,7 @@ class Gateway:
             except (WebSocketDisconnect, Exception):
                 pass
             finally:
-                self.device_send_locks.pop(id(ws), None)
-                if d.get("ws") is ws:
-                    d.pop("ws", None)
-                for request_id, owner in list(self.owners.items()):
-                    if owner is not ws:
-                        continue
-                    future = self.pending.get(request_id)
-                    if future and not future.done():
-                        future.set_exception(ConnectionError("Device control connection lost"))
-                    queue = self.streams.get(request_id)
-                    if queue is not None:
-                        queue.put_nowait({"type": "stream_error", "error": "Device control connection lost"})
-                    bridge = self.browser_ws.get(request_id)
-                    if bridge:
-                        with contextlib.suppress(Exception):
-                            await bridge.close(code=1011)
-                    self.owners.pop(request_id, None)
+                await self.cleanup_device(ws)
 
         @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
         async def proxy(req: Request, path: str):
@@ -529,8 +647,9 @@ class Gateway:
                 ws = d["ws"]
             request_id = secrets.token_urlsafe(12)
             body = await req.body()
-            if len(body) > int(self.cfg.get("max_request_bytes", 64 * 1024 * 1024)):
-                return JSONResponse({"error": "Request body too large"}, status_code=413)
+            if len(body) > request_limit(self.cfg):
+                return JSONResponse({"error": REQUEST_TOO_LARGE_REASON,
+                                     "reason": REQUEST_TOO_LARGE_REASON}, status_code=413)
             if "text/event-stream" in req.headers.get("accept", "") or path in {"event", "global/event", "api/event"} or (path.startswith("api/session/") and path.endswith("/event")):
                 return await self.stream_proxy(req, d, ws, path, request_id, body)
 
@@ -544,21 +663,32 @@ class Gateway:
             completed = False
             try:
                 print(f"proxy request id={request_id} path=/{path}", flush=True)
-                await asyncio.wait_for(self.send_to_device(ws, item), timeout=10)
+                await self.send_control(ws, item, timeout=10)
                 result = await asyncio.wait_for(future, timeout=float(self.cfg.get("request_timeout", 120)))
                 completed = True
             except Exception:
                 self.pending.pop(request_id, None)
-                return JSONResponse({"error": "Device connection failed"}, status_code=502)
+                return JSONResponse({"error": CONNECTION_FAILED_REASON,
+                                     "reason": CONNECTION_FAILED_REASON}, status_code=502)
             finally:
                 self.pending.pop(request_id, None)
                 self.owners.pop(request_id, None)
                 if not completed:
                     with contextlib.suppress(Exception):
-                        await asyncio.wait_for(self.send_to_device(ws, {"type": "cancel", "id": request_id}), 2)
+                        await self.send_control(ws, {"type": "cancel", "id": request_id}, timeout=2)
             headers = {k: v for k, v in result.get("headers", {}).items()
                        if k.lower() not in {"content-length", "transfer-encoding", "connection", "content-security-policy", "x-frame-options"}}
-            body = base64.b64decode(result.get("body", ""))
+            encoded_body = result.get("body", "")
+            guard = ResponseSizeGuard(response_limit(self.cfg))
+            try:
+                guard.add_encoded(encoded_body)
+            except FrameError as exc:
+                return JSONResponse({"error": str(exc), "reason": str(exc)}, status_code=502)
+            try:
+                body = decode_strict(encoded_body)
+            except Exception:
+                return JSONResponse({"error": INVALID_ENCODING_REASON,
+                                     "reason": INVALID_ENCODING_REASON}, status_code=502)
             print(f"proxy response id={request_id} status={result.get('status')} encoded={len(result.get('body', ''))} decoded={len(body)}", flush=True)
             content_type = headers.get("content-type", headers.get("Content-Type", ""))
             if "text/html" in content_type.lower() and int(result.get("status", 502)) == 200:
@@ -568,79 +698,115 @@ class Gateway:
 
     async def stream_proxy(self, req: Request, d: dict[str, Any], ws: WebSocket,
                            path: str, request_id: str, body: bytes):
-        if len(body) > int(self.cfg.get("max_request_bytes", 64 * 1024 * 1024)):
-            return JSONResponse({"error": "Request body too large"}, status_code=413)
-        q: asyncio.Queue = asyncio.Queue(maxsize=int(self.cfg.get("stream_queue_size", 2048)))
-        self.streams[request_id] = q
+        if len(body) > request_limit(self.cfg):
+            return JSONResponse({"error": REQUEST_TOO_LARGE_REASON,
+                                 "reason": REQUEST_TOO_LARGE_REASON}, status_code=413)
+        state = StreamState(int(self.cfg.get("stream_queue_size", 2048)))
+        self.streams[request_id] = state
         self.owners[request_id] = ws
+        messages = self.stream_messages(state)
+        guard = ResponseSizeGuard(response_limit(self.cfg))
         item = {"type": "stream_request", "id": request_id, "method": req.method,
                 "path": "/" + path, "query": req.url.query, "headers": forwarding_headers(req.headers),
                 "body": base64.b64encode(body).decode()}
         try:
-            await self.send_to_device(ws, item)
-            first = await asyncio.wait_for(q.get(), timeout=30)
+            await self.send_control(ws, item)
+            first = await asyncio.wait_for(messages.__anext__(), timeout=30)
             if first.get("type") == "stream_error":
+                await messages.aclose()
                 self.streams.pop(request_id, None)
-                return JSONResponse({"error": first.get("error", "stream failed")}, status_code=502)
+                self.owners.pop(request_id, None)
+                reason = first.get("reason") or first.get("error", "stream failed")
+                # 非法请求编码属于协议错误，返回 400 而非 502。
+                status_code = 400 if reason == INVALID_ENCODING_REASON else 502
+                return JSONResponse({"error": reason, "reason": reason}, status_code=status_code)
+            first_body = ""
+            if first.get("type") == "stream_chunk":
+                # 首帧携带的 body（如有）也计入上限，避免单片超限绕过；且必须原样输出。
+                first_body = first.get("body") or ""
+                guard.add_encoded(first_body)
             headers = {k: v for k, v in first.get("headers", {}).items()
                        if k.lower() not in {"content-length", "content-encoding", "transfer-encoding", "connection"}}
             status = int(first.get("status", 200))
             async def body_iter():
                 ended = False
                 try:
-                    while True:
-                        msg = await q.get()
+                    if first_body:
+                        yield decode_strict(first_body)
+                    async for msg in messages:
                         if msg.get("type") == "stream_end":
                             ended = True
                             break
                         if msg.get("type") == "stream_error":
                             raise ConnectionError(msg.get("error", "Event stream disconnected"))
                         if msg.get("type") == "stream_chunk":
-                            yield base64.b64decode(msg.get("body", ""))
+                            encoded = msg.get("body") or ""
+                            # 超限时抛出的 FrameError 携带稳定原因，必须原样向上传播，
+                            # 不能被 finally 中的 cancel 或后续断连错误覆盖。
+                            guard.add_encoded(encoded)
+                            yield decode_strict(encoded)
                 finally:
+                    await messages.aclose()
                     self.streams.pop(request_id, None)
                     self.owners.pop(request_id, None)
                     if not ended:
                         with contextlib.suppress(Exception):
-                            await asyncio.wait_for(self.send_to_device(ws, {"type": "cancel", "id": request_id}), 2)
+                            await self.send_control(ws, {"type": "cancel", "id": request_id}, timeout=2)
             return StreamingResponse(body_iter(), status_code=status, headers=headers)
-        except Exception:
+        except FrameError as exc:
+            await messages.aclose()
             self.streams.pop(request_id, None)
             self.owners.pop(request_id, None)
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(self.send_to_device(ws, {"type": "cancel", "id": request_id}), 2)
-            return JSONResponse({"error": "Event stream connection failed"}, status_code=502)
+                await self.send_control(ws, {"type": "cancel", "id": request_id}, timeout=2)
+            return JSONResponse({"error": str(exc), "reason": str(exc)}, status_code=502)
+        except Exception:
+            await messages.aclose()
+            self.streams.pop(request_id, None)
+            self.owners.pop(request_id, None)
+            with contextlib.suppress(Exception):
+                await self.send_control(ws, {"type": "cancel", "id": request_id}, timeout=2)
+            return JSONResponse({"error": CONNECTION_FAILED_REASON,
+                                 "reason": CONNECTION_FAILED_REASON}, status_code=502)
 
     @staticmethod
-    def enqueue_stream(queue: asyncio.Queue, item: dict[str, Any]) -> None:
-        """Drop the oldest non-status event when the browser consumes slowly.
+    def enqueue_stream(state: StreamState, item: dict[str, Any]) -> bool:
+        """向有界流缓冲推送一帧；溢出时产生显式 stream_error 而非驱逐旧分片。"""
+        return state.push(item)
 
-        Never evict the first frame: it carries the upstream status and headers, so
-        losing it would make the gateway synthesize a wrong response.
-        """
-        try:
-            queue.put_nowait(item)
-            return
-        except asyncio.QueueFull:
-            pass
-        kept: list[Any] = []
-        dropped = False
+    @staticmethod
+    async def stream_messages(state: StreamState):
+        """消费有界流缓冲：正常排空、溢出或终止帧都恰好结束一次。"""
         while True:
+            while True:
+                try:
+                    yield state.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            if state.pending_end is not None:
+                terminal = state.pending_end
+                state.pending_end = None
+                yield terminal
+                return
+            if state.overflow_reason is not None:
+                yield {"type": "stream_error", "error": state.overflow_reason,
+                       "reason": state.overflow_reason}
+                return
+            state.signal.clear()
+            getter = asyncio.ensure_future(state.queue.get())
+            waiter = asyncio.ensure_future(state.signal.wait())
             try:
-                pending = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if not dropped and not (isinstance(pending, dict) and "status" in pending):
-                dropped = True
-                continue
-            kept.append(pending)
-        if not dropped and kept:
-            kept.pop(0)
-        for pending in kept:
-            with contextlib.suppress(asyncio.QueueFull):
-                queue.put_nowait(pending)
-        with contextlib.suppress(asyncio.QueueFull):
-            queue.put_nowait(item)
+                done, pending = await asyncio.wait({getter, waiter},
+                                                   return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in (getter, waiter):
+                    if not task.done():
+                        task.cancel()
+                for task in (getter, waiter):
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+            if getter in done and not getter.cancelled():
+                yield getter.result()
 
 
 class Agent:
@@ -651,6 +817,8 @@ class Agent:
         self.ws_queues: dict[str, asyncio.Queue] = {}
         self.p2p_peers: set[Any] = set()
         self.p2p_tasks: dict[tuple[int, str], asyncio.Task] = {}
+        self.p2p_assemblers: dict[int, ChunkAssembler] = {}
+        self.p2p_sequence: dict[tuple[int, str], int] = {}
         self.control_send_lock = asyncio.Lock()
         self.routes()
 
@@ -675,9 +843,11 @@ class Agent:
             auth = (str(basic.get("username", "")), str(basic.get("password", "")))
             headers["Authorization"] = "Basic " + base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode()
         try:
-            async with websockets.connect(url, additional_headers=headers, subprotocols=[],
+            async with websockets.connect(url, additional_headers=headers,
+                                          subprotocols=item.get("protocols") or [],
                                           max_size=None, origin=self.target) as target:
-                await self.control_message(control, {"type": "ws_opened", "id": item["id"]})
+                await self.control_message(control, {"type": "ws_opened", "id": item["id"],
+                                                     "protocol": target.subprotocol or ""})
                 async def to_target():
                     while True:
                         msg = await queue.get()
@@ -685,7 +855,7 @@ class Agent:
                             await target.close(code=int(msg.get("code", 1000)), reason=str(msg.get("reason", "")) or None)
                             return
                         if msg.get("type") == "ws_data":
-                            data = base64.b64decode(msg["data"]) if msg.get("kind") == "bytes" else msg.get("data", "")
+                            data = decode_strict(msg["data"]) if msg.get("kind") == "bytes" else msg.get("data", "")
                             await target.send(data)
                 async def from_target():
                     async for raw in target:
@@ -712,22 +882,40 @@ class Agent:
             self.ws_queues.pop(bridge_id, None)
 
     async def local_stream(self, item: dict[str, Any], ws):
+        if not is_valid_base64(item.get("body") or ""):
+            # 非法编码是协议错误，返回稳定 stream_error 原因而非后续解码异常。
+            await self.stream_send(ws, {"type": "stream_error", "id": item["id"],
+                                        "error": INVALID_ENCODING_REASON,
+                                        "reason": INVALID_ENCODING_REASON})
+            return
         url = self.target + item["path"]
         if item.get("query"): url += "?" + item["query"]
         headers = {k: v for k, v in item.get("headers", {}).items() if k.lower() not in {"host", "content-length", "authorization", "cookie"}}
         basic = self.cfg.get("opencode_basic_auth")
         auth = httpx.BasicAuth(str(basic["username"]), str(basic.get("password", ""))) if isinstance(basic, dict) else None
+        guard = ResponseSizeGuard(response_limit(self.cfg))
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10), auth=auth) as client:
-                async with client.stream(item["method"], url, headers=headers, content=base64.b64decode(item.get("body", ""))) as r:
+                async with client.stream(item["method"], url, headers=headers, content=decode_strict(item.get("body", ""))) as r:
                     out_headers = {k: v for k, v in r.headers.items() if k.lower() not in {"content-encoding", "content-length", "transfer-encoding", "connection"}}
                     await self.stream_send(ws, {"type":"stream_chunk","id":item["id"],"status":r.status_code,"headers":out_headers})
                     async for chunk in r.aiter_bytes():
+                        # 逐片累计上限：单片与累计超限都以稳定 stream_error 终止。
+                        guard.add_bytes(chunk)
                         await self.stream_send(ws, {"type":"stream_chunk","id":item["id"],"body":base64.b64encode(chunk).decode()})
                     await self.stream_send(ws, {"type":"stream_end","id":item["id"]})
-        except Exception as exc:
+        except FrameError:
             with contextlib.suppress(Exception):
-                await self.stream_send(ws, {"type":"stream_error","id":item["id"],"error":str(exc)})
+                await self.stream_send(ws, {"type":"stream_error","id":item["id"],
+                                            "error":RESPONSE_TOO_LARGE_REASON,
+                                            "reason":RESPONSE_TOO_LARGE_REASON})
+        except Exception as exc:
+            reason = CONNECTION_FAILED_REASON if isinstance(
+                exc, (ConnectionError, httpx.ConnectError, httpx.TimeoutException)
+            ) else UPSTREAM_ERROR_REASON
+            with contextlib.suppress(Exception):
+                await self.stream_send(ws, {"type":"stream_error","id":item["id"],
+                                            "error":str(exc), "reason":reason})
 
     async def stream_send(self, ws, message: dict[str, Any]) -> None:
         if isinstance(ws, WebSocket):
@@ -741,8 +929,47 @@ class Agent:
         else:
             await control.send(json.dumps(message))
 
+    async def _p2p_error(self, channel: Any, message_id: str, status: int, reason: str) -> None:
+        """以统一信封回一条带稳定 reason 的协议错误响应。"""
+        payload = json.dumps({"error": reason, "reason": reason}).encode()
+        await self.p2p_send(channel, {"type": "response", "id": message_id, "status": status,
+                                      "headers": {},
+                                      "body": base64.b64encode(payload).decode()})
+
     async def p2p_message(self, channel: Any, item: dict[str, Any]) -> None:
         """Handle HTTP/SSE requests sent by the browser over the WebRTC DataChannel."""
+        if "message_id" in item and "sequence" in item and "final" in item:
+            # 浏览器发来的分片信封：按 channel 隔离重组为完整请求后再分发。
+            assembler = self.p2p_assemblers.setdefault(
+                id(channel), ChunkAssembler(limit=p2p_message_limit(self.cfg),
+                                            budget=p2p_total_budget(self.cfg)))
+            outcome = assembler.feed(item)
+            message_id = str(item.get("message_id", ""))
+            if outcome is None:
+                return
+            if outcome == "accepted":
+                try:
+                    assembled = assembler.result(message_id)
+                    try:
+                        restored = json.loads(assembled.decode("utf-8"))
+                    except Exception:
+                        await self._p2p_error(channel, message_id, 400, INVALID_ENCODING_REASON)
+                        return
+                    # 外层 message_id 必须与内层 id 一致，避免响应路由到错误的逻辑请求。
+                    if str(restored.get("id", "")) != message_id:
+                        await self._p2p_error(channel, message_id, 400, "message_id mismatch")
+                        return
+                    await self.p2p_message(channel, restored)
+                finally:
+                    # 完成后保留墓碑到 TTL，阻止同 message_id 重放。
+                    assembler.complete(message_id)
+            else:
+                # 错误墓碑保留到 TTL：重放同一 message_id 继续得到相同的稳定错误。
+                reason = assembler.reason_of(message_id) or "reassembly error"
+                # 非法编码与乱序/重放是协议错误（400）；超限与缓冲区耗尽是容量错误（413）。
+                status = 400 if reason in {INVALID_ENCODING_REASON, INVALID_SEQUENCE_REASON} else 413
+                await self._p2p_error(channel, message_id, status, reason)
+            return
         key = (id(channel), str(item.get("id", "")))
         if item.get("type") in {"ws_data", "ws_close"}:
             queue = self.ws_queues.get(item.get("id", ""))
@@ -753,6 +980,10 @@ class Agent:
             task = self.p2p_tasks.get(key)
             if task:
                 task.cancel()
+            # 取消也必须释放该 message_id 的残缺装配。
+            assembler = self.p2p_assemblers.get(id(channel))
+            if assembler is not None:
+                assembler.discard(str(item.get("id", "")))
             return
         if item.get("type") == "ping":
             await self.p2p_send(channel, {"type": "pong", "t": item.get("t")})
@@ -762,11 +993,12 @@ class Agent:
 
         encoded_body = item.get("body")
         if isinstance(encoded_body, str):
-            limit = int(self.cfg.get("max_request_bytes", 64 * 1024 * 1024))
-            if len(encoded_body) > limit * 4 // 3 + 4:
-                await self.p2p_send(channel, {"type": "response", "id": item.get("id", ""), "status": 413,
-                                              "headers": {},
-                                              "body": base64.b64encode(json.dumps({"error": "Request body too large"}).encode()).decode()})
+            # 用精确解码长度判断，避免 base64 3 字节边界误差放行超限请求；非法编码直接 400。
+            if not is_valid_base64(encoded_body):
+                await self._p2p_error(channel, item.get("id", ""), 400, INVALID_ENCODING_REASON)
+                return
+            if decoded_size(encoded_body) > request_limit(self.cfg):
+                await self._p2p_error(channel, item.get("id", ""), 413, REQUEST_TOO_LARGE_REASON)
                 return
 
         class ChannelWriter:
@@ -798,42 +1030,122 @@ class Agent:
             with contextlib.suppress(Exception):
                 await self.p2p_send(channel, {"type": "cancelled", "id": item.get("id", "")})
         except Exception as exc:
+            reason = CONNECTION_FAILED_REASON if isinstance(exc, ConnectionError) else UPSTREAM_ERROR_REASON
             await self.p2p_send(channel, {"type": "response", "id": item.get("id", ""), "status": 502,
-                                          "headers": {}, "body": base64.b64encode(json.dumps({"error": str(exc)}).encode()).decode()})
+                                          "headers": {},
+                                          "body": base64.b64encode(json.dumps({"error": str(exc),
+                                                                               "reason": reason}).encode()).decode()})
         finally:
             self.p2p_tasks.pop(key, None)
 
+    def _p2p_next_sequence(self, channel: Any, message_id: str) -> int:
+        key = (id(channel), message_id)
+        value = self.p2p_sequence.get(key, 0)
+        self.p2p_sequence[key] = value + 1
+        return value
+
     async def p2p_send(self, channel: Any, message: dict[str, Any]) -> None:
-        """Split large responses to fit the DataChannel limit, avoiding P2P closure from large provider/file responses."""
+        """使用统一 {message_id, sequence, data, final} 信封发送响应与流生命周期消息。
+
+        流协议：头帧（status/headers）、数据帧（stream_chunk）、终止帧
+        （stream_end/stream_error/cancelled）全部为信封帧，终止帧 final=True 且
+        在首帧携带 type/error 等元数据，浏览器无需裸消息特判。
+        """
+        message_type = message.get("type")
+        message_id = str(message.get("id", ""))
+        key = (id(channel), message_id)
+        metadata = {k: v for k, v in message.items() if k not in {"body", "data"}}
+        # 流生命周期终止帧：单帧 final=True，携带 type/error 元数据。
+        if message_type in {"stream_end", "stream_error", "cancelled", "cancel"}:
+            sequence = self.p2p_sequence.pop(key, 0)
+            terminal = frame(message_id, sequence, b"", True)
+            terminal.update(metadata)
+            await self.p2p_channel_send(channel, terminal)
+            return
+        # 其它控制/WS 消息（ws_open/ws_data/ws_closed/ws_error/pong 等）：
+        # 统一把完整 JSON 作为 data 分片，前端无需判断裸消息。
+        if message_type not in {"response", "stream_chunk"}:
+            payload = json.dumps(message, ensure_ascii=False).encode("utf-8")
+            await self._p2p_send_payload(channel, message_id, message_type, payload, {},
+                                         streaming=False)
+            return
         body = message.get("body")
-        chunk_size = 32768
-        if not isinstance(body, str) or len(body) <= chunk_size:
-            await self.p2p_channel_send(channel, message)
+        if not isinstance(body, str):
+            if message_type == "response":
+                # response 缺 body 属于协议错误：必须抛错，绝不发送 final=False 悬挂帧。
+                raise FrameError("response body must be a base64-encoded string")
+            # 无 body 的流头帧（stream_chunk）同样使用信封（final=False），保证前端统一处理。
+            sequence = self._p2p_next_sequence(channel, message_id)
+            header = frame(message_id, sequence, b"", True)
+            header.update(metadata)
+            await self.p2p_channel_send(channel, header)
             return
-        if message.get("type") == "response":
-            await self.p2p_channel_send(channel, {k: v for k, v in message.items() if k != "body"} | {
-                "type": "response_start", "id": message.get("id", ""),
-            })
-            for offset in range(0, len(body), chunk_size):
-                await self.p2p_channel_send(channel, {"type": "response_chunk", "id": message["id"],
-                                         "body": body[offset:offset + chunk_size]})
-            await self.p2p_channel_send(channel, {"type": "response_end", "id": message["id"]})
+        try:
+            payload = decode_strict(body)
+        except Exception:
+            sequence = self.p2p_sequence.pop(key, 0)
+            terminal = frame(message_id, sequence, b"", True)
+            terminal.update({"type": "stream_error", "id": message_id,
+                             "error": INVALID_ENCODING_REASON,
+                             "reason": INVALID_ENCODING_REASON})
+            await self.p2p_channel_send(channel, terminal)
             return
-        if message.get("type") == "stream_chunk":
-            for offset in range(0, len(body), chunk_size):
-                await self.p2p_channel_send(channel, {"type": "stream_chunk", "id": message["id"],
-                                         "body": body[offset:offset + chunk_size]})
-            return
-        await self.p2p_channel_send(channel, message)
+        await self._p2p_send_payload(channel, message_id, message_type, payload, metadata,
+                                     streaming=(message_type == "stream_chunk"))
+
+    async def _p2p_send_payload(self, channel: Any, message_id: str, message_type: str,
+                                payload: bytes, metadata: dict[str, Any],
+                                streaming: bool) -> None:
+        """按信封发送一段载荷；streaming 时复用同一 message_id 的递增 sequence。"""
+        key = (id(channel), message_id)
+        for index, chunk in enumerate(iter_frames(message_id, payload, CHUNK_SIZE)):
+            frame_message = dict(chunk)
+            if streaming:
+                frame_message["sequence"] = self._p2p_next_sequence(channel, message_id)
+                # 每次 stream_chunk 调用都是一个可交付的逻辑消息；多帧时只让
+                # 最后一帧 final=True，浏览器才能在同一 message_id 上区分消息边界。
+            if index == 0 and metadata:
+                frame_message.update(metadata)
+            await self.p2p_channel_send(channel, frame_message)
+        if not streaming:
+            self.p2p_sequence.pop(key, None)
 
     async def p2p_channel_send(self, channel: Any, message: dict[str, Any]) -> None:
-        """Await the DataChannel buffer serially to avoid overwhelming the browser channel with large responses."""
+        """Await the DataChannel buffer serially within a configured timeout.
+
+        若缓冲在 `p2p_send_timeout` 内未回位到阈值以下，则视为通道卡死：
+        关闭通道并抛 ConnectionError，而不是永久退避等待。
+        """
         payload = json.dumps(message)
+        timeout = float(self.cfg.get("p2p_send_timeout", 10.0))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         while getattr(channel, "bufferedAmount", 0) > 1024 * 1024:
             if channel.readyState != "open":
                 raise ConnectionError("P2P channel closed")
+            if loop.time() >= deadline:
+                with contextlib.suppress(Exception):
+                    getattr(channel, "close", lambda: None)()
+                raise ConnectionError("P2P channel send timed out")
             await asyncio.sleep(0.01)
         channel.send(payload)
+
+    async def reset_p2p_state(self) -> None:
+        """控制连接重建时关闭旧 P2P peer，并清空 tasks/assemblers/sequence/ws 队列。"""
+        tasks = list(self.p2p_tasks.values())
+        for task in tasks:
+            task.cancel()
+        self.p2p_tasks.clear()
+        self.p2p_assemblers.clear()
+        self.p2p_sequence.clear()
+        self.ws_queues.clear()
+        peers = list(self.p2p_peers)
+        self.p2p_peers.clear()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for peer in peers:
+            with contextlib.suppress(Exception):
+                await peer.close()
 
     async def handle_p2p_offer(self, item: dict[str, Any], control) -> None:
         limit = int(self.cfg.get("max_p2p_peers", 4))
@@ -854,6 +1166,10 @@ class Agent:
             for key, task in list(self.p2p_tasks.items()):
                 if key[0] in channels:
                     task.cancel()
+            for channel_id in channels:
+                self.p2p_assemblers.pop(channel_id, None)
+            for sequence_key in [k for k in self.p2p_sequence if k[0] in channels]:
+                self.p2p_sequence.pop(sequence_key, None)
         try:
             peer, answer = await answer_offer(
                 item["offer"], receive, peer_closed,
@@ -873,13 +1189,22 @@ class Agent:
             await self.send_control(ws, result)
         except Exception as exc:
             try:
+                reason = CONNECTION_FAILED_REASON if isinstance(exc, ConnectionError) else UPSTREAM_ERROR_REASON
                 await self.send_control(ws, {"type": "response", "id": item.get("id", ""), "status": 502,
-                                          "headers": {}, "body": base64.b64encode(
-                                              json.dumps({"error": str(exc)}).encode()).decode()})
+                                          "headers": {},
+                                          "body": base64.b64encode(
+                                              json.dumps({"error": str(exc),
+                                                          "reason": reason}).encode()).decode()})
             except Exception:
                 pass
 
     async def local_request(self, item: dict[str, Any], timeout: float = 120) -> dict[str, Any]:
+        if not is_valid_base64(item.get("body") or ""):
+            # 非法 base64 是协议错误：返回 400 而不是让 decode_strict 抛异常变成 502。
+            payload = json.dumps({"error": INVALID_ENCODING_REASON,
+                                  "reason": INVALID_ENCODING_REASON}).encode()
+            return {"type": "response", "id": item["id"], "status": 400, "headers": {},
+                    "body": base64.b64encode(payload).decode()}
         url = self.target + item["path"]
         if item.get("query"):
             url += "?" + item["query"]
@@ -888,29 +1213,57 @@ class Agent:
         basic = self.cfg.get("opencode_basic_auth")
         if isinstance(basic, dict) and basic.get("username") is not None:
             auth = httpx.BasicAuth(str(basic["username"]), str(basic.get("password", "")))
+        limit = response_limit(self.cfg)
         async with httpx.AsyncClient(timeout=timeout, auth=auth) as client:
             try:
-                r = await client.request(item["method"], url, headers=headers, content=base64.b64decode(item.get("body", "")))
-                encoded = base64.b64encode(r.content).decode()
-                print(f"agent response id={item['id']} status={r.status_code} bytes={len(r.content)} encoded={len(encoded)}", flush=True)
+                async with client.stream(item["method"], url, headers=headers,
+                                         content=decode_strict(item.get("body", ""))) as r:
+                    content = await read_bounded(r.aiter_bytes(), limit)
+                encoded = base64.b64encode(content).decode()
+                print(f"agent response id={item['id']} status={r.status_code} bytes={len(content)} encoded={len(encoded)}", flush=True)
                 return {"type": "response", "id": item["id"], "status": r.status_code,
                         "headers": {k: v for k, v in r.headers.items()
                                     if k.lower() not in {"content-encoding", "content-length", "transfer-encoding", "connection"}},
                         "body": encoded}
-            except Exception as exc:
+            except FrameError as exc:
                 return {"type": "response", "id": item["id"], "status": 502, "headers": {},
-                        "body": base64.b64encode(json.dumps({"error": str(exc)}).encode()).decode()}
+                        "body": base64.b64encode(json.dumps({"error": str(exc),
+                                                             "reason": str(exc)}).encode()).decode()}
+            except Exception as exc:
+                reason = CONNECTION_FAILED_REASON if isinstance(
+                    exc, (ConnectionError, httpx.ConnectError, httpx.TimeoutException)
+                ) else UPSTREAM_ERROR_REASON
+                return {"type": "response", "id": item["id"], "status": 502, "headers": {},
+                        "body": base64.b64encode(json.dumps({"error": str(exc),
+                                                             "reason": reason}).encode()).decode()}
 
     async def control_heartbeat(self, ws):
         interval = float(self.cfg.get("heartbeat_seconds", 15))
         while True:
             await asyncio.sleep(interval)
-            await self.send_control(ws, {"type": "pong"})
+            try:
+                await self.send_control(ws, {"type": "pong"})
+            except Exception:
+                # 心跳超时/失败：关闭连接让 run() 进入重建，而不是永久阻塞。
+                with contextlib.suppress(Exception):
+                    await ws.close(code=1011)
+                return
 
-    async def send_control(self, ws, message: dict[str, Any]) -> None:
-        """Serialize all control-plane writes to avoid interleaving responses, heartbeats, and stream frames."""
-        async with self.control_send_lock:
-            await ws.send(json.dumps(message))
+    async def send_control(self, ws, message: dict[str, Any],
+                           timeout: float = CONTROL_SEND_TIMEOUT) -> None:
+        """有界控制发送：串行化写入；超时或对端已关闭都统一抛连接级错误以触发重建。"""
+        try:
+            async with self.control_send_lock:
+                await asyncio.wait_for(ws.send(json.dumps(message)), timeout)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(Exception):
+                await ws.close(code=1011)
+            raise ConnectionError("Agent control send timed out")
+        except Exception as exc:
+            # 对已关闭 socket 写入会抛 RuntimeError/ConnectionError，统一转换为连接级错误。
+            with contextlib.suppress(Exception):
+                await ws.close(code=1011)
+            raise ConnectionError("Agent control connection closed") from exc
 
     async def run(self):
         gateway_url = str(self.cfg.get("gateway_url", "")).rstrip("/")
@@ -924,23 +1277,40 @@ class Agent:
         data = json.loads(state.read_text()) if state.exists() else {"device_id": make_id()}
         private_json(state, data)
         ws_url = gateway_url.replace("https://", "wss://").replace("http://", "ws://").rstrip("/")
-        reconnect = float(self.cfg.get("reconnect_seconds", 5))
+        attempt = 0
         while True:
             try:
                 async with httpx.AsyncClient(timeout=20) as client:
                     r = await client.post(gateway_url + "/_mesh/register", json={
                         "device_id": data["device_id"], "name": hostname(), "platform": platform.platform(),
-                         "enroll_token": self.cfg["enroll_token"], "agent_token": data.get("agent_token", "")})
+                         "enroll_token": self.cfg["enroll_token"], "agent_token": data.get("agent_token", ""),
+                         "rotate_token": bool(data.pop("rotate_token", False))})
+                    if r.status_code == 429:
+                        attempt += 1
+                        delay = backoff_delay(attempt, retry_after=parse_retry_after(r.headers.get("Retry-After")))
+                        print(f"agent register rate limited, retry in {delay:.1f}s", flush=True)
+                        await asyncio.sleep(delay)
+                        continue
+                    if r.status_code == 403 and "ownership" in r.text.lower():
+                        # 本地持久化 token 与 Gateway 状态不一致：用 enroll_token 轮换身份后重试。
+                        data["rotate_token"] = True
+                        attempt += 1
+                        delay = backoff_delay(attempt)
+                        print(f"agent identity recovery scheduled in {delay:.1f}s", flush=True)
+                        await asyncio.sleep(delay)
+                        continue
                     r.raise_for_status()
                     data.update(r.json())
                     private_json(state, data)
+                attempt = 0
                 async with websockets.connect(
                     f"{ws_url}/_mesh/agent/{data['device_id']}",
                     additional_headers={"X-Mesh-Agent-Token": data['agent_token']},
                     max_size=None, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
                     tasks = {}
+                    await self.reset_p2p_state()
                     heartbeat = asyncio.create_task(self.control_heartbeat(ws))
-                    await ws.send(json.dumps({"type": "agent_hello"}))
+                    await self.send_control(ws, {"type": "agent_hello"})
                     try:
                         async for raw in ws:
                             item = json.loads(raw)
@@ -974,7 +1344,7 @@ class Agent:
                                         completed.exception()
                                 task.add_done_callback(finish_p2p)
                             elif item.get("type") == "ping":
-                                await ws.send(json.dumps({"type": "pong"}))
+                                await self.send_control(ws, {"type": "pong"})
                             elif item.get("type") in {"ws_data", "ws_close"}:
                                 q = self.ws_queues.get(item.get("id", ""))
                                 if q:
@@ -986,9 +1356,13 @@ class Agent:
                         await asyncio.gather(*remaining, return_exceptions=True)
                         with contextlib.suppress(asyncio.CancelledError):
                             await heartbeat
+                        # 连接断开/重建：关闭旧 P2P peer 并清空所有关联状态。
+                        await self.reset_p2p_state()
             except Exception as exc:
-                print(f"agent connection/register retry: {type(exc).__name__}: {exc}", flush=True)
-                await asyncio.sleep(reconnect)
+                attempt += 1
+                delay = backoff_delay(attempt)
+                print(f"agent connection/register retry: {type(exc).__name__}: {exc}; retry in {delay:.1f}s", flush=True)
+                await asyncio.sleep(delay)
 
 
 
@@ -1009,7 +1383,10 @@ def main():
     args = parser.parse_args()
     cfg = load_json(args.config)
     if args.mode == "gateway":
-        uvicorn.run(Gateway(cfg).app, host=cfg.get("listen_host", "127.0.0.1"), port=int(cfg.get("listen_port", 8090)), log_level="info", timeout_graceful_shutdown=5)
+        # ws_max_size 必须覆盖应用层请求上限（base64 展开 + JSON 开销），
+        # 否则默认 16MiB 会在应用层限制生效前提前断开大响应。
+        uvicorn.run(Gateway(cfg).app, host=cfg.get("listen_host", "127.0.0.1"), port=int(cfg.get("listen_port", 8090)),
+                    log_level="info", timeout_graceful_shutdown=5, ws_max_size=ws_frame_limit(cfg))
     else:
         agent = Agent(cfg)
         asyncio.run(agent.run())

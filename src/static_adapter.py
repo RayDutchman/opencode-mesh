@@ -12,8 +12,14 @@ TRANSPORT_ADAPTER = r"""
   const b64 = bytes => { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s); };
   const unb64 = text => Uint8Array.from(atob(text || ''), c => c.charCodeAt(0));
   const timeout = (promise, ms) => Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))]);
+  const makeId = () => {
+    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') return globalThis.crypto.randomUUID();
+    return 'ocm-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+  };
+  const CHUNK_SIZE = 32768;
+  const MAX_P2P_BYTES = 64 * 1024 * 1024;
 
-  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, devices: [], defaultDevice: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null };
+  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), incoming: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, devices: [], defaultDevice: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null };
 
   const BAR_CSS = `
   #ocm-mesh-bar{display:flex;align-items:center;gap:8px;height:32px;padding:0 10px;font-size:13px;line-height:20px;flex:0 0 auto;border-bottom:1px solid var(--v2-border-border-base);background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-muted);-webkit-user-select:none;user-select:none}
@@ -169,6 +175,7 @@ TRANSPORT_ADAPTER = r"""
     }
     for (const stream of state.streams.values()) stream.controller.error(error);
     state.streams.clear();
+    state.incoming.clear();
     for (const socket of state.sockets.values()) {
       socket.readyState = MeshWebSocket.CLOSED;
       socket.dispatch('error', error);
@@ -177,7 +184,7 @@ TRANSPORT_ADAPTER = r"""
     state.sockets.clear();
   }
 
-  function settle(message) {
+  function settleMessage(message) {
     if (message.type === 'pong') {
       if (state.pingSent != null) {
         state.rtt = Math.max(0, Date.now() - state.pingSent);
@@ -190,6 +197,7 @@ TRANSPORT_ADAPTER = r"""
     if (socket) {
       if (message.type === 'ws_opened') {
         socket.readyState = MeshWebSocket.OPEN;
+        socket.protocol = message.protocol || socket.protocol;
         socket.dispatch('open', {});
       } else if (message.type === 'ws_data') {
         socket.dispatch('message', { data: message.kind === 'bytes' ? unb64(message.data) : (message.data || '') });
@@ -227,11 +235,13 @@ TRANSPORT_ADAPTER = r"""
     const stream = state.streams.get(message.id);
     if (stream) {
       if (message.type === 'stream_chunk' && message.status) {
-        state.pending.delete(message.id);
-        if (entry.timer) clearTimeout(entry.timer);
-        entry.resolve(message);
+        if (!entry.resolved) {
+          entry.resolved = true;
+          if (entry.timer) clearTimeout(entry.timer);
+          entry.resolve(message);
+        }
       }
-      if (message.type === 'stream_chunk' && message.body) stream.controller.enqueue(unb64(message.body));
+      if (message.type === 'stream_chunk' && message.body !== undefined) stream.controller.enqueue(unb64(message.body));
       if (message.type === 'stream_end' || message.type === 'stream_error') {
         state.streams.delete(message.id);
         state.pending.delete(message.id);
@@ -243,6 +253,68 @@ TRANSPORT_ADAPTER = r"""
     }
   }
 
+  function settle(message) {
+    if (!message || typeof message !== 'object') return;
+    if (!('message_id' in message) || !('sequence' in message) || !('final' in message)) {
+      settleMessage(message);
+      return;
+    }
+    const id = String(message.message_id || '');
+    let entry = state.incoming.get(id);
+    if (!entry) {
+      entry = { next: 0, chunks: [], kind: null, meta: null };
+      state.incoming.set(id, entry);
+    }
+    if (message.sequence !== entry.next) {
+      state.incoming.delete(id);
+      const pending = state.pending.get(id);
+      if (pending) rejectEntry(id, new Error('invalid frame sequence'));
+      return;
+    }
+    entry.next += 1;
+    if (message.type) {
+      entry.kind = message.type;
+      entry.meta = { ...message };
+      delete entry.meta.message_id;
+      delete entry.meta.sequence;
+      delete entry.meta.data;
+      delete entry.meta.final;
+    }
+    entry.chunks.push(unb64(message.data || ''));
+    if (!message.final) return;
+    const bytes = new Uint8Array(entry.chunks.reduce((size, chunk) => size + chunk.length, 0));
+    let offset = 0;
+    for (const chunk of entry.chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+    const meta = entry.meta ? { ...entry.meta } : null;
+    if (meta) {
+      meta.id = meta.id || id;
+      meta.body = b64(bytes);
+      settleMessage(meta);
+      if (entry.kind === 'stream_chunk') {
+        entry.chunks = [];
+        entry.meta = null;
+        return;
+      }
+      state.incoming.delete(id);
+      return;
+    }
+    if (entry.kind === 'stream_chunk') {
+      settleMessage({ type: 'stream_chunk', id, body: b64(bytes) });
+      entry.chunks = [];
+      return;
+    }
+    try {
+      const decoded = JSON.parse(dec.decode(bytes));
+      settleMessage(decoded);
+    } catch (_) {
+      state.incoming.delete(id);
+      const pending = state.pending.get(id);
+      if (pending) rejectEntry(id, new Error('invalid P2P message'));
+      return;
+    }
+    state.incoming.delete(id);
+  }
+
   function scheduleReconnect() {
     if (state.reconnectTimer) return;
     const generation = state.generation;
@@ -251,7 +323,7 @@ TRANSPORT_ADAPTER = r"""
     state.reconnectTimer = setTimeout(() => {
       state.reconnectTimer = null;
       if (generation !== state.generation) return;
-      state.ready = connectP2P(state.deviceId)
+      state.ready = connectP2P(state.routeDeviceId)
         .then(() => { state.reconnectDelay = 1000; })
         .catch(() => { state.reconnectDelay = Math.min(state.reconnectDelay * 2, 30000); scheduleReconnect(); });
     }, state.reconnectDelay);
@@ -313,12 +385,18 @@ TRANSPORT_ADAPTER = r"""
 
   async function send(message) {
     if (!state.channel || state.channel.readyState !== 'open') throw new Error('p2p channel unavailable');
-    const payload = JSON.stringify(message);
-    while (state.channel.bufferedAmount > 1024 * 1024) {
-      await new Promise(resolve => setTimeout(resolve, 10));
-      if (!state.channel || state.channel.readyState !== 'open') throw new Error('p2p channel unavailable');
+    const messageId = String(message.id || makeId());
+    const payload = enc.encode(JSON.stringify(message.id ? message : { ...message, id: messageId }));
+    if (payload.length > MAX_P2P_BYTES) throw new Error('P2P message too large');
+    for (let offset = 0, sequence = 0; offset < payload.length || sequence === 0; offset += CHUNK_SIZE, sequence += 1) {
+      const chunk = payload.slice(offset, offset + CHUNK_SIZE);
+      const envelope = { message_id: messageId, sequence, data: b64(chunk), final: offset + CHUNK_SIZE >= payload.length };
+      while (state.channel.bufferedAmount > 1024 * 1024) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+        if (!state.channel || state.channel.readyState !== 'open') throw new Error('p2p channel unavailable');
+      }
+      state.channel.send(JSON.stringify(envelope));
     }
-    state.channel.send(payload);
   }
 
   async function p2pFetch(input, init = {}) {
@@ -327,7 +405,7 @@ TRANSPORT_ADAPTER = r"""
     const requestedDevice = virtualDeviceId(path);
     if (requestedDevice && requestedDevice !== state.manifest?.device_id) throw new Error('different device uses Relay');
     path = devicePath(path);
-    const id = crypto.randomUUID();
+    const id = makeId();
     const body = new Uint8Array(await request.arrayBuffer());
     const headers = headersObject(request.headers);
     const accept = (headers.accept || '').toLowerCase();
@@ -365,12 +443,12 @@ TRANSPORT_ADAPTER = r"""
       this.readyState = MeshWebSocket.CONNECTING;
       this.bufferedAmount = 0;
       this._listeners = new Map();
-      this.id = crypto.randomUUID();
+       this.id = makeId();
       state.sockets.set(this.id, this);
       Promise.resolve(state.ready).then(() => {
         if (this.readyState !== MeshWebSocket.CONNECTING) return;
         if (!state.channel || state.channel.readyState !== 'open') return this.fail(new Error('P2P unavailable'));
-        send({ type: 'ws_open', id: this.id, path: devicePath(url.pathname), query: url.search.slice(1), headers: {} }).catch(error => this.fail(error));
+        send({ type: 'ws_open', id: this.id, path: devicePath(url.pathname), query: url.search.slice(1), headers: {}, protocols: Array.isArray(protocols) ? protocols : (protocols ? [protocols] : []) }).catch(error => this.fail(error));
       });
     }
     addEventListener(type, fn) { if (!this._listeners.has(type)) this._listeners.set(type, new Set()); this._listeners.get(type).add(fn); }
@@ -379,8 +457,17 @@ TRANSPORT_ADAPTER = r"""
     fail(error) { state.sockets.delete(this.id); this.readyState = MeshWebSocket.CLOSED; this.dispatch('error', error); this.dispatch('close', { code: 1011, reason: error.message }); }
     send(data) {
       if (this.readyState !== MeshWebSocket.OPEN) throw new Error('WebSocket is not open');
-      const bytes = typeof data === 'string' ? null : new Uint8Array(data instanceof ArrayBuffer ? data : data.buffer);
-      send({ type: 'ws_data', id: this.id, kind: bytes ? 'bytes' : 'text', data: bytes ? b64(bytes) : data }).catch(error => this.fail(error));
+       if (typeof data === 'string') {
+         send({ type: 'ws_data', id: this.id, kind: 'text', data }).catch(error => this.fail(error));
+         return;
+       }
+       const toBytes = async value => {
+         if (value instanceof Blob) return new Uint8Array(await value.arrayBuffer());
+         if (value instanceof ArrayBuffer) return new Uint8Array(value);
+         if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+         throw new TypeError('unsupported WebSocket data type');
+       };
+       Promise.resolve(toBytes(data)).then(bytes => send({ type: 'ws_data', id: this.id, kind: 'bytes', data: b64(bytes) })).catch(error => this.fail(error));
     }
     close(code = 1000, reason = '') {
       if (this.readyState === MeshWebSocket.CLOSED) return;
@@ -389,7 +476,8 @@ TRANSPORT_ADAPTER = r"""
     }
   }
 
-  state.ready = connectP2P(currentDeviceId()).catch(() => null);
+  state.routeDeviceId = currentDeviceId();
+  state.ready = connectP2P(state.routeDeviceId).catch(() => { scheduleReconnect(); return null; });
   window.__ocmTransport = state;
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', renderBar, { once: true });
   else renderBar();
@@ -418,6 +506,48 @@ TRANSPORT_ADAPTER = r"""
       super(input, protocols);
     }
   };
+  class MeshXMLHttpRequest {
+    static UNSENT = 0; static OPENED = 1; static HEADERS_RECEIVED = 2; static LOADING = 3; static DONE = 4;
+    constructor() {
+      this.readyState = MeshXMLHttpRequest.UNSENT;
+      this.status = 0; this.statusText = ''; this.response = null; this.responseText = '';
+      this.responseType = ''; this.responseURL = ''; this.timeout = 0;
+      this._listeners = new Map(); this._headers = {}; this._controller = null; this._aborted = false;
+    }
+    addEventListener(type, fn) { if (!this._listeners.has(type)) this._listeners.set(type, new Set()); this._listeners.get(type).add(fn); }
+    removeEventListener(type, fn) { this._listeners.get(type)?.delete(fn); }
+    dispatch(type, event = {}) { this['on' + type]?.(event); for (const fn of this._listeners.get(type) || []) fn.call(this, event); }
+    open(method, url, async = true) {
+      if (async === false) throw new Error('synchronous XMLHttpRequest is not supported by Mesh');
+      this.method = method; this.url = new URL(url, location.href).href; this.readyState = MeshXMLHttpRequest.OPENED; this.dispatch('readystatechange');
+    }
+    setRequestHeader(name, value) { this._headers[name] = value; }
+    getAllResponseHeaders() { return this._responseHeaders || ''; }
+    getResponseHeader(name) { return this._responseHeadersMap?.get(name.toLowerCase()) || null; }
+    abort() { this._aborted = true; this._controller?.abort(); if (this.readyState !== MeshXMLHttpRequest.DONE) { this.readyState = MeshXMLHttpRequest.DONE; this.dispatch('abort'); this.dispatch('loadend'); } }
+    async send(body = null) {
+      if (this.readyState !== MeshXMLHttpRequest.OPENED) throw new Error('InvalidStateError');
+      this._controller = new AbortController();
+      try {
+        const response = await window.fetch(this.url, { method: this.method, headers: this._headers, body, credentials: 'same-origin', signal: this._controller.signal });
+        if (this._aborted) return;
+        this.status = response.status; this.statusText = response.statusText; this.responseURL = response.url;
+        this._responseHeadersMap = new Headers(response.headers);
+        this._responseHeaders = [...this._responseHeadersMap].map(([k, v]) => `${k}: ${v}\r\n`).join('');
+        this.readyState = MeshXMLHttpRequest.HEADERS_RECEIVED; this.dispatch('readystatechange');
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (this.responseType === 'arraybuffer') this.response = bytes.buffer;
+        else if (this.responseType === 'blob') this.response = new Blob([bytes], { type: response.headers.get('content-type') || '' });
+        else if (this.responseType === 'json') this.response = JSON.parse(dec.decode(bytes));
+        else { this.responseText = dec.decode(bytes); this.response = this.responseText; }
+        this.readyState = MeshXMLHttpRequest.DONE; this.dispatch('readystatechange'); this.dispatch('load', { target: this }); this.dispatch('loadend');
+      } catch (error) {
+        if (this._aborted) return;
+        this.readyState = MeshXMLHttpRequest.DONE; this.dispatch('readystatechange'); this.dispatch('error', error); this.dispatch('loadend');
+      }
+    }
+  }
+  window.XMLHttpRequest = MeshXMLHttpRequest;
   class MeshEventSource {
     static CONNECTING = 0; static OPEN = 1; static CLOSED = 2;
     constructor(input, options) {
@@ -426,38 +556,57 @@ TRANSPORT_ADAPTER = r"""
       this.readyState = MeshEventSource.CONNECTING;
       this._listeners = new Map();
       this._controller = new AbortController();
+      this._retryDelay = 1000;
+      this.lastEventId = '';
+      this._retryTimer = null;
       this.start();
     }
     addEventListener(type, fn) { if (!this._listeners.has(type)) this._listeners.set(type, new Set()); this._listeners.get(type).add(fn); }
     removeEventListener(type, fn) { this._listeners.get(type)?.delete(fn); }
     dispatch(type, event) { this['on' + type]?.(event); for (const fn of this._listeners.get(type) || []) fn.call(this, event); }
     async start() {
-      try {
-        const response = await window.fetch(this.url, { headers: { accept: 'text/event-stream' }, signal: this._controller.signal });
-        if (!response.ok) throw new Error('SSE status ' + response.status);
-        this.readyState = MeshEventSource.OPEN; this.dispatch('open', { type: 'open' });
-        const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
-        while (true) {
-          const item = await reader.read(); if (item.done) break;
-          buffer += decoder.decode(item.value, { stream: true });
-          const records = buffer.split(/\r?\n\r?\n/); buffer = records.pop() || '';
-          for (const record of records) {
-            const lines = record.split(/\r?\n/); let event = 'message', id = '', data = [];
-            for (const line of lines) { if (line.startsWith('event:')) event = line.slice(6).trim(); else if (line.startsWith('id:')) id = line.slice(3).trim(); else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, '')); }
-            if (data.length) this.dispatch(event, { type: event, data: data.join('\n'), lastEventId: id, origin: location.origin });
+      while (this.readyState !== MeshEventSource.CLOSED) {
+        try {
+          this._controller = new AbortController();
+          const headers = { accept: 'text/event-stream' };
+          if (this.lastEventId) headers['Last-Event-ID'] = this.lastEventId;
+          const response = await window.fetch(this.url, { headers, signal: this._controller.signal });
+          if (!response.ok) {
+            const error = new Error('SSE status ' + response.status);
+            if (response.status === 401 || response.status === 403) throw Object.assign(error, { permanent: true });
+            throw error;
           }
+          this.readyState = MeshEventSource.OPEN; this._retryDelay = 1000; this.dispatch('open', { type: 'open' });
+          const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
+          while (true) {
+            const item = await reader.read(); if (item.done) break;
+            buffer += decoder.decode(item.value, { stream: true });
+            const records = buffer.split(/\r?\n\r?\n/); buffer = records.pop() || '';
+            for (const record of records) {
+              const lines = record.split(/\r?\n/); let event = 'message', id = '', data = [];
+              for (const line of lines) { if (line.startsWith('event:')) event = line.slice(6).trim(); else if (line.startsWith('id:')) id = line.slice(3).trim(); else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, '')); }
+              if (id) this.lastEventId = id;
+              if (data.length) this.dispatch(event, { type: event, data: data.join('\n'), lastEventId: this.lastEventId, origin: location.origin });
+            }
+          }
+          throw new Error('SSE closed');
+        } catch (error) {
+          if (this.readyState === MeshEventSource.CLOSED || error.name === 'AbortError') return;
+          this.readyState = MeshEventSource.CONNECTING;
+          this.dispatch('error', error);
+          if (error.permanent) { this.readyState = MeshEventSource.CLOSED; return; }
+          await new Promise(resolve => { this._retryTimer = setTimeout(resolve, this._retryDelay); });
+          this._retryTimer = null;
+          this._retryDelay = Math.min(this._retryDelay * 2, 30000);
         }
-        if (this.readyState !== MeshEventSource.CLOSED) { this.readyState = MeshEventSource.CLOSED; this.dispatch('error', new Error('SSE closed')); }
-      } catch (error) {
-        if (this.readyState !== MeshEventSource.CLOSED) { this.readyState = MeshEventSource.CLOSED; this.dispatch('error', error); }
       }
     }
-    close() { this.readyState = MeshEventSource.CLOSED; this._controller.abort(); }
+    close() { this.readyState = MeshEventSource.CLOSED; if (this._retryTimer) clearTimeout(this._retryTimer); this._controller.abort(); }
   }
   window.EventSource = class extends MeshEventSource {
     constructor(input, options) {
       const url = new URL(input, location.href);
-      if (url.host !== location.host || !state.channel || state.channel.readyState !== 'open') return new nativeEventSource(input, options);
+      if (url.host !== location.host) return new nativeEventSource(input, options);
       super(input, options);
     }
   };
