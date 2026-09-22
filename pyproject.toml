@@ -1,9 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "opencode-mesh"
-version = "0.1.0"
+dynamic = ["version"]
 description = "轻量设备发现与 OpenCode 访问网关"
 requires-python = ">=3.11"
 dependencies = ["fastapi>=0.115", "uvicorn>=0.32", "httpx>=0.28", "websockets>=12", "aiortc>=1.9"]
 
 [project.scripts]
 opencode-mesh = "src.main:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "src.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

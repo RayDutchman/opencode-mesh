@@ -9,6 +9,7 @@ import uvicorn
 import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from . import __version__
 from .p2p import (CHUNK_SIZE, CONNECTION_FAILED_REASON, CONTROL_SEND_TIMEOUT,
                    INVALID_ENCODING_REASON, INVALID_SEQUENCE_REASON,
                    PAYLOAD_TOO_LARGE_REASON, REQUEST_TOO_LARGE_REASON,
@@ -71,10 +72,10 @@ def harden_permissions(path: Path) -> None:
 
 
 def forwarding_headers(headers) -> dict[str, str]:
-    """Never send gateway credentials across the Agent trust boundary."""
+    """Never send gateway credentials or browser CSRF markers across the Agent trust boundary."""
     blocked = {'authorization', 'cookie', 'proxy-authorization', 'host', 'content-length',
                'forwarded', 'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host',
-               'x-forwarded-port', 'x-real-ip'}
+               'x-forwarded-port', 'x-real-ip', 'origin', 'referer'}
     return {k: v for k, v in headers.items() if k.lower() not in blocked}
 
 
@@ -856,7 +857,7 @@ class Agent:
             headers["Authorization"] = "Basic " + base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode()
         try:
             async with websockets.connect(url, additional_headers=headers,
-                                          subprotocols=item.get("protocols") or [],
+                                          subprotocols=item.get("protocols") or None,
                                           max_size=None, origin=self.target) as target:
                 await self.control_message(control, {"type": "ws_opened", "id": item["id"],
                                                      "protocol": target.subprotocol or ""})
@@ -902,7 +903,11 @@ class Agent:
             return
         url = self.target + item["path"]
         if item.get("query"): url += "?" + item["query"]
-        headers = {k: v for k, v in item.get("headers", {}).items() if k.lower() not in {"host", "content-length", "authorization", "cookie"}}
+        # Drop browser CSRF markers: local OpenCode validates Origin/Referer against
+        # its own origin, which never matches the Mesh gateway origin.
+        headers = {k: v for k, v in item.get("headers", {}).items()
+                   if k.lower() not in {"host", "content-length", "authorization", "cookie",
+                                        "origin", "referer"}}
         basic = self.cfg.get("opencode_basic_auth")
         auth = httpx.BasicAuth(str(basic["username"]), str(basic.get("password", ""))) if isinstance(basic, dict) else None
         guard = ResponseSizeGuard(response_limit(self.cfg))
@@ -967,8 +972,9 @@ class Agent:
                     except Exception:
                         await self._p2p_error(channel, message_id, 400, INVALID_ENCODING_REASON)
                         return
-                    # 外层 message_id 必须与内层 id 一致，避免响应路由到错误的逻辑请求。
-                    if str(restored.get("id", "")) != message_id:
+                    # HTTP 请求必须保持外层传输 ID 与内层逻辑 ID 一致；WebSocket
+                    # 数据帧则使用每帧独立的传输 ID，并按 socket ID 路由。
+                    if restored.get("type") not in {"ws_data", "ws_close"} and str(restored.get("id", "")) != message_id:
                         await self._p2p_error(channel, message_id, 400, "message_id mismatch")
                         return
                     await self.p2p_message(channel, restored)
@@ -1221,7 +1227,11 @@ class Agent:
         url = self.target + item["path"]
         if item.get("query"):
             url += "?" + item["query"]
-        headers = {k: v for k, v in item.get("headers", {}).items() if k.lower() not in {"host", "content-length", "authorization", "cookie"}}
+        # Drop browser CSRF markers: local OpenCode validates Origin/Referer against
+        # its own origin, which never matches the Mesh gateway origin.
+        headers = {k: v for k, v in item.get("headers", {}).items()
+                   if k.lower() not in {"host", "content-length", "authorization", "cookie",
+                                        "origin", "referer"}}
         auth = None
         basic = self.cfg.get("opencode_basic_auth")
         if isinstance(basic, dict) and basic.get("username") is not None:
@@ -1380,7 +1390,9 @@ class Agent:
 
 def inject_mesh_bar(body: bytes) -> bytes:
     """Inject only the transport adapter; the device list is handled by the native OpenCode Server UI."""
-    adapter = TRANSPORT_ADAPTER.encode("utf-8")
+    adapter = TRANSPORT_ADAPTER.replace(
+        "__OCM_VERSION_JSON__", json.dumps(__version__, ensure_ascii=True)
+    ).encode("utf-8")
     if b"</head>" in body and b"ocm-transport-adapter" not in body:
         body = body.replace(b"</head>", adapter + b"</head>", 1)
     return body

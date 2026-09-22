@@ -18,11 +18,14 @@ import asyncio
 import base64
 import json
 import random
+import re
+import tomllib
+from pathlib import Path
 
 import httpx
 
-from src.main import (Agent, Gateway, StreamState, backoff_delay,
-                      filter_response_headers, parse_retry_after)
+from src.main import (Agent, Gateway, StreamState, backoff_delay, filter_response_headers,
+                      forwarding_headers, inject_mesh_bar, parse_retry_after)
 from src.p2p import (ASSEMBLY_BUDGET_REASON, CONNECTION_FAILED_REASON,
                      INVALID_ENCODING_REASON, INVALID_SEQUENCE_REASON,
                      MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
@@ -314,6 +317,35 @@ def _agent():
     return Agent({"opencode_url": "http://127.0.0.1:1",
                   "max_request_bytes": str(LIMIT_BYTES),
                   "request_timeout": "5"})
+
+
+def test_agent_accepts_consecutive_ws_data_frames_for_one_socket():
+    """Consecutive input frames on one WebSocket use distinct transport IDs."""
+    async def scenario():
+        sent = []
+        agent = _agent()
+        channel = _fake_p2p_channel(sent)
+        queue = asyncio.Queue()
+        agent.ws_queues["socket-1"] = queue
+
+        frames = [
+            ("frame-1", {"type": "ws_data", "id": "socket-1", "kind": "text", "data": "a"}),
+            ("frame-2", {"type": "ws_data", "id": "socket-1", "kind": "text", "data": "b"}),
+            ("frame-3", {"type": "ws_close", "id": "socket-1", "code": 1000, "reason": ""}),
+        ]
+        for frame_id, message in frames:
+            payload = json.dumps(message).encode()
+            await agent.p2p_message(channel, make_chunk(frame_id, 0, payload, True))
+
+        received = []
+        while not queue.empty():
+            received.append(queue.get_nowait())
+        return received, sent
+
+    received, errors = asyncio.run(scenario())
+    assert [item["data"] for item in received[:2]] == ["a", "b"]
+    assert received[2]["type"] == "ws_close"
+    assert errors == []
 
 
 def test_agent_guard_accepts_request_body_at_limit():
@@ -1677,3 +1709,113 @@ def test_cancelled_before_first_frame_errors_stream():
     assert sid not in state.streams
     rejects = [payload for kind, payload in state.settled if kind == "reject"]
     assert rejects  # The pending request must reject instead of resolving cancelled.
+# ---------- item 4：浏览器 CSRF 标记不得穿透到本地 OpenCode ----------
+
+def test_forwarding_headers_strip_credentials_and_csrf_markers():
+    """Gateway-to-agent forwarding strips credentials and browser CSRF markers."""
+    out = {k.lower(): v for k, v in forwarding_headers({
+        "Authorization": "Bearer secret", "Cookie": "session=1",
+        "Origin": "https://oc.252327.xyz:8443", "Referer": "https://oc.252327.xyz:8443/",
+        "Accept": "application/json", "x-opencode-ticket": "1"}).items()}
+    assert "authorization" not in out
+    assert "cookie" not in out
+    assert "origin" not in out
+    assert "referer" not in out
+    assert out["accept"] == "application/json"
+    assert out["x-opencode-ticket"] == "1"
+
+
+def test_agent_local_request_strips_browser_csrf_markers(monkeypatch):
+    """Agent requests to local OpenCode omit browser Origin and Referer markers."""
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+
+        async def aiter_bytes(self):
+            yield b"ok"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def stream(self, method, url, headers=None, content=None):
+            captured["headers"] = {k.lower(): v for k, v in (headers or {}).items()}
+            return FakeResponse()
+
+    monkeypatch.setattr("src.main.httpx.AsyncClient", FakeClient)
+
+    async def scenario():
+        agent = _agent()
+        return await agent.local_request({
+            "type": "request", "id": "r-csrf", "method": "POST",
+            "path": "/pty/x/connect-token",
+            "headers": {"origin": "https://oc.252327.xyz:8443",
+                        "referer": "https://oc.252327.xyz:8443/",
+                        "x-opencode-ticket": "1",
+                        "accept": "application/json"},
+            "body": b64(b"{}")})
+
+    result = asyncio.run(scenario())
+    assert result["status"] == 200
+    assert "origin" not in captured["headers"]
+    assert "referer" not in captured["headers"]
+    assert captured["headers"].get("x-opencode-ticket") == "1"
+
+
+def test_version_source_is_semver_and_declared_in_src():
+    """The runtime version is provided by src.__version__."""
+    import src
+
+    version = getattr(src, "__version__", "")
+    assert re.fullmatch(r"\d+\.\d+\.\d+", version)
+    assert version == "0.1.0"
+
+
+def test_pyproject_uses_dynamic_src_version():
+    """pyproject reads the version from src.__version__ to avoid duplication."""
+    document = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "version" in document["project"].get("dynamic", [])
+    assert document["tool"]["setuptools"]["dynamic"]["version"]["attr"] == "src.__version__"
+
+
+def test_mesh_bar_injects_runtime_version():
+    """The injected status bar renders the current Mesh version."""
+    body = inject_mesh_bar(b"<html><head></head><body></body></html>")
+
+    assert b"OpenCode Mesh" in body
+    assert b'MESH_VERSION = "0.1.0"' in body
+    assert b"version.textContent = 'v' + MESH_VERSION" in body
+    assert b"__OCM_VERSION_JSON__" not in body
+
+
+def test_mesh_bar_injection_is_idempotent_with_version():
+    """Processing the same HTML twice does not duplicate the adapter."""
+    body = inject_mesh_bar(b"<html><head></head><body></body></html>")
+    twice = inject_mesh_bar(body)
+
+    assert twice.count(b"ocm-transport-adapter") == 1
+
+
+def test_installer_supports_release_tags_and_development_branches():
+    """The installer distinguishes v* release tags from development branches."""
+    script = Path("scripts/install.sh").read_text(encoding="utf-8")
+
+    assert 'VERSION="${MESH_VERSION:-main}"' in script
+    assert 'refs/tags/${VERSION}.tar.gz' in script
+    assert 'refs/heads/${VERSION}.tar.gz' in script
+    assert 'src.__version__' in script

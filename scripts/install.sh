@@ -18,6 +18,8 @@ set -euo pipefail
 #
 # Install from a local source directory (skips the GitHub download):
 #   MESH_SOURCE_DIR=/path/to/opencode-mesh MESH_MODE=agent ... bash install.sh
+# Install a release tag instead of the development branch:
+#   MESH_VERSION=v0.1.0 bash install.sh agent
 
 info() { printf '\033[1;34m[mesh]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[mesh]\033[0m %s\n' "$*"; }
@@ -97,8 +99,14 @@ if [ "$MODE" != "agent" ] && [ "$MODE" != "gateway" ]; then
 fi
 
 SERVICE_NAME="opencode-mesh-${MODE}"
-VERSION="main"
-TARBALL="https://github.com/RayDutchman/opencode-mesh/archive/refs/heads/${VERSION}.tar.gz"
+VERSION="${MESH_VERSION:-main}"
+if [[ "$VERSION" == v* ]]; then
+  TARBALL="https://github.com/RayDutchman/opencode-mesh/archive/refs/tags/${VERSION}.tar.gz"
+  SOURCE_KIND="release tag"
+else
+  TARBALL="https://github.com/RayDutchman/opencode-mesh/archive/refs/heads/${VERSION}.tar.gz"
+  SOURCE_KIND="branch"
+fi
 
 info "install directory: ${INSTALL_DIR}"
 info "systemd scope: ${SYSTEMD_KIND}"
@@ -112,7 +120,7 @@ if [ -n "${MESH_SOURCE_DIR:-}" ]; then
     err "MESH_SOURCE_DIR does not contain a src/ directory"; exit 1
   fi
 else
-  info "downloading opencode-mesh source (${VERSION})..."
+  info "downloading opencode-mesh source (${VERSION}, ${SOURCE_KIND})..."
   curl -fsSL "$TARBALL" -o "$tmp/mesh.tar.gz"
   tar -xzf "$tmp/mesh.tar.gz" -C "$tmp"
   SRC="$(find "$tmp" -maxdepth 1 -type d -name 'opencode-mesh-*' | head -n 1)"
@@ -275,7 +283,8 @@ else
   systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
 fi
 
-info "install complete."
+INSTALLED_VERSION="$(cd "$INSTALL_DIR" && "$INSTALL_DIR/.venv/bin/python" -c 'import src; print(src.__version__)')"
+info "install complete (OpenCode Mesh v${INSTALLED_VERSION})."
 
 if [ "$MODE" = "gateway" ]; then
   SHOWN_URL="${PUBLIC_URL:-<your-gateway-url>}"
