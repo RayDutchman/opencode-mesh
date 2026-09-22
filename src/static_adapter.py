@@ -7,6 +7,18 @@ TRANSPORT_ADAPTER = r"""
   const MESH_VERSION = __OCM_VERSION_JSON__;
   const nativeFetch = window.fetch.bind(window);
   const nativeWebSocket = window.WebSocket;
+  const NativeURL = window.URL;
+  // V2 SDK 用绝对 /api 路径构造 URL；在基址尚未丢失时保留明确的设备作用域。
+  window.URL = class extends NativeURL {
+    constructor(input, base) {
+      super(input, base);
+      if (base === undefined || typeof input !== 'string' || !input.startsWith('/api/')) return;
+      const target = new NativeURL(base);
+      if (target.origin !== location.origin || this.origin !== target.origin) return;
+      const match = target.pathname.match(/^\/_mesh\/device\/[^/]+\/?$/);
+      if (match) this.pathname = target.pathname.replace(/\/$/, '') + this.pathname;
+    }
+  };
   const enc = new TextEncoder();
   const dec = new TextDecoder();
   const b64 = bytes => { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s); };

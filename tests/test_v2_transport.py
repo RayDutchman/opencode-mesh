@@ -101,6 +101,15 @@ def test_v2_adapter_keeps_native_xhr_and_eventsource():
     """ + adapter + """
     assert.equal(global.XMLHttpRequest,XHR);
     assert.equal(global.EventSource,ES);
+    // SDK 同时构造两个 Server 的绝对 API 路径时，各自保留明确基址。
+    assert.equal(new URL('/api/session/old/form','https://mesh.test/_mesh/device/gti').href,
+      'https://mesh.test/_mesh/device/gti/api/session/old/form');
+    assert.equal(new URL('/api/session','https://mesh.test/_mesh/device/ehang').href,
+      'https://mesh.test/_mesh/device/ehang/api/session');
+    assert.equal(new URL('/api/info','https://external.test/base').href,
+      'https://external.test/api/info');
+    assert.equal(new URL('https://external.test/api/info','https://mesh.test/_mesh/device/gti').href,
+      'https://external.test/api/info');
     """
     result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
