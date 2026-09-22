@@ -25,7 +25,7 @@ from pathlib import Path
 import httpx
 
 from src.main import (Agent, Gateway, StreamState, backoff_delay, filter_response_headers,
-                      forwarding_headers, inject_mesh_bar, normalize_json_body, normalize_request_body,
+                      forwarding_headers, inject_mesh_bar,
                       parse_retry_after,
                       parse_server_route, rewrite_device_html)
 from src.static_adapter import TRANSPORT_ADAPTER
@@ -1911,21 +1911,6 @@ def test_adapter_does_not_redirect_v2_device_into_mesh_route():
     """V2 client routing must remain at the root; only V1 needs a page switch."""
     assert "const targetIsV1 = !html.includes('/_assets/') && html.includes('/assets/');" in TRANSPORT_ADAPTER
     assert "if (targetIsV1 && deviceId && deviceId !== currentDeviceId())" in TRANSPORT_ADAPTER
-
-
-def test_agent_normalizes_empty_json_mutations_for_v2():
-    """V2 rejects an empty JSON object body, so Mesh must send {} explicitly."""
-    assert normalize_json_body("POST", {"content-type": "application/json"}, b"") == b"{}"
-    assert normalize_json_body("GET", {"content-type": "application/json"}, b"") == b""
-    assert normalize_json_body("POST", {"content-type": "text/plain"}, b"") == b""
-
-
-def test_agent_normalizes_legacy_v2_model_shape():
-    """Old cached model state must use the V2 id/providerID payload shape."""
-    body = b'{"model":{"modelID":"big-pickle","providerID":"opencode","variant":"default"}}'
-    assert normalize_request_body("/api/session/s-1/model", "POST", {"content-type": "application/json"}, body) == (
-        b'{"model":{"providerID":"opencode","variant":"default","id":"big-pickle"}}'
-    )
 
 
 def test_mesh_bar_injection_is_idempotent_with_version():

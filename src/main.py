@@ -106,7 +106,13 @@ def forwarding_headers(headers) -> dict[str, str]:
     """Never send gateway credentials or browser CSRF markers across the Agent trust boundary."""
     blocked = {'authorization', 'cookie', 'proxy-authorization', 'host', 'content-length',
                'forwarded', 'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host',
-               'x-forwarded-port', 'x-real-ip', 'origin', 'referer', 'accept-encoding'}
+               'x-forwarded-port', 'x-real-ip', 'origin', 'referer', 'accept-encoding',
+               'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding',
+               'te', 'trailer', 'upgrade'}
+    # 请求体已经解码，逐跳帧头和 Connection 指定的头不能进入下一跳。
+    for key, value in headers.items():
+        if key.lower() == 'connection':
+            blocked.update(token.strip().lower() for token in value.split(','))
     return {k: v for k, v in headers.items() if k.lower() not in blocked}
 
 
@@ -121,34 +127,6 @@ def filter_response_headers(headers) -> dict[str, str]:
     blocked = {'content-encoding', 'content-length', 'transfer-encoding', 'connection',
                'set-cookie', 'set-cookie2'}
     return {k: v for k, v in headers.items() if k.lower() not in blocked}
-
-
-def normalize_json_body(method: str, headers: dict[str, str], body: bytes) -> bytes:
-    """为严格的 V2 JSON mutation 补上空对象请求体。"""
-    if body or method.upper() not in {"POST", "PUT", "PATCH"}:
-        return body
-    content_type = str(headers.get("content-type", "")).lower()
-    return b"{}" if "application/json" in content_type else body
-
-
-def normalize_request_body(path: str, method: str, headers: dict[str, str], body: bytes) -> bytes:
-    """兼容旧缓存中的 V2 模型字段，并补齐空 JSON mutation。"""
-    body = normalize_json_body(method, headers, body)
-    if not body or "application/json" not in str(headers.get("content-type", "")).lower():
-        return body
-    if not re.fullmatch(r"/api/session/[^/]+/model", path):
-        return body
-    try:
-        payload = json.loads(body)
-        model = payload.get("model")
-        if not isinstance(model, dict) or "id" in model or "modelID" not in model:
-            return body
-        normalized = {key: value for key, value in model.items() if key != "modelID"}
-        normalized["id"] = model["modelID"]
-        payload["model"] = normalized
-        return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
-    except (TypeError, ValueError):
-        return body
 
 
 DEFAULT_STUN_SERVERS = ["stun:stun.l.google.com:19302"]
@@ -985,16 +963,14 @@ class Agent:
         if item.get("query"): url += "?" + item["query"]
         # Drop browser CSRF markers: local OpenCode validates Origin/Referer against
         # its own origin, which never matches the Mesh gateway origin.
-        headers = {k: v for k, v in item.get("headers", {}).items()
-                   if k.lower() not in {"host", "content-length", "authorization", "cookie",
-                                        "origin", "referer", "accept-encoding"}}
+        headers = forwarding_headers(item.get("headers", {}))
         headers["accept-encoding"] = "identity"
         basic = self.cfg.get("opencode_basic_auth")
         auth = httpx.BasicAuth(str(basic["username"]), str(basic.get("password", ""))) if isinstance(basic, dict) else None
         guard = ResponseSizeGuard(response_limit(self.cfg))
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10), auth=auth, follow_redirects=True) as client:
-                body = normalize_request_body(item["path"], item["method"], headers, decode_strict(item.get("body", "")))
+                body = decode_strict(item.get("body", ""))
                 async with client.stream(item["method"], url, headers=headers, content=body) as r:
                     out_headers = filter_response_headers(r.headers)
                     await self.stream_send(ws, {"type":"stream_chunk","id":item["id"],"status":r.status_code,"headers":out_headers})
@@ -1311,9 +1287,7 @@ class Agent:
             url += "?" + item["query"]
         # Drop browser CSRF markers: local OpenCode validates Origin/Referer against
         # its own origin, which never matches the Mesh gateway origin.
-        headers = {k: v for k, v in item.get("headers", {}).items()
-                   if k.lower() not in {"host", "content-length", "authorization", "cookie",
-                                        "origin", "referer", "accept-encoding"}}
+        headers = forwarding_headers(item.get("headers", {}))
         headers["accept-encoding"] = "identity"
         auth = None
         basic = self.cfg.get("opencode_basic_auth")
@@ -1322,7 +1296,7 @@ class Agent:
         limit = response_limit(self.cfg)
         async with httpx.AsyncClient(timeout=timeout, auth=auth, follow_redirects=True) as client:
             try:
-                body = normalize_request_body(item["path"], item["method"], headers, decode_strict(item.get("body", "")))
+                body = decode_strict(item.get("body", ""))
                 async with client.stream(item["method"], url, headers=headers, content=body) as r:
                     content = await read_bounded(r.aiter_bytes(), limit)
                 encoded = base64.b64encode(content).decode()
