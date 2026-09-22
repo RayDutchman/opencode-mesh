@@ -21,3 +21,6 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# git worktree 隔离工作区
+.worktrees/

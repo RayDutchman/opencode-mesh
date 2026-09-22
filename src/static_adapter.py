@@ -4,6 +4,7 @@ from __future__ import annotations
 TRANSPORT_ADAPTER = r"""
 <script id="ocm-transport-adapter">
 (() => {
+  const MESH_VERSION = __OCM_VERSION_JSON__;
   const nativeFetch = window.fetch.bind(window);
   const nativeWebSocket = window.WebSocket;
   const nativeEventSource = window.EventSource;
@@ -18,18 +19,21 @@ TRANSPORT_ADAPTER = r"""
   };
   const CHUNK_SIZE = 32768;
   const MAX_P2P_BYTES = 64 * 1024 * 1024;
+  // Sanity cap: a real round-trip is far below this; anything larger is a clock-jump artifact (lock screen / background timer freeze) and must be discarded.
+  const RTT_MAX_MS = 10000;
 
-  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), incoming: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, devices: [], defaultDevice: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null };
+  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), incoming: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, devices: [], defaultDevice: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null, p2pSendTail: Promise.resolve() };
 
   const BAR_CSS = `
-  #ocm-mesh-bar{display:flex;align-items:center;gap:8px;height:32px;padding:0 10px;font-size:13px;line-height:20px;flex:0 0 auto;border-bottom:1px solid var(--v2-border-border-base);background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-muted);-webkit-user-select:none;user-select:none}
+  #ocm-mesh-bar{display:flex;align-items:center;gap:8px;height:36px;padding:0 10px;font-size:13px;line-height:20px;flex:0 0 auto;border-bottom:1px solid var(--v2-border-border-base);background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-muted);-webkit-user-select:none;user-select:none}
   #ocm-mesh-bar .ocm-title{font-weight:600;color:var(--v2-text-text-base)}
+  #ocm-mesh-bar .ocm-version{font-size:11px;color:var(--v2-text-text-faint);white-space:nowrap}
   #ocm-mesh-bar .ocm-device{border:1px solid var(--v2-border-border-base);border-radius:6px;padding:2px 8px;background:var(--v2-background-bg-layer-02);color:var(--v2-text-text-base);max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #ocm-mesh-bar .ocm-device[data-offline="true"]{color:var(--v2-text-text-faint)}
   #ocm-mesh-bar .ocm-transport{margin-left:auto;display:flex;align-items:center;gap:6px;color:var(--v2-text-text-base)}
   #ocm-mesh-bar .ocm-dot{width:8px;height:8px;border-radius:9999px;background:#22c55e}
   #ocm-mesh-bar .ocm-dot[data-kind="relay"]{background:#3b82f6}
-  #root{height:calc(100dvh - 32px)}
+  #root{height:calc(100dvh - 36px)}
   `;
 
   function ensureBarStyle() {
@@ -49,11 +53,14 @@ TRANSPORT_ADAPTER = r"""
     const title = document.createElement('span');
     title.className = 'ocm-title';
     title.textContent = 'OpenCode Mesh';
+    const version = document.createElement('span');
+    version.className = 'ocm-version';
+    version.textContent = 'v' + MESH_VERSION;
     const device = document.createElement('span');
     device.className = 'ocm-device';
     const transport = document.createElement('span');
     transport.className = 'ocm-transport';
-    bar.append(title, device, transport);
+    bar.append(title, version, device, transport);
     document.body.insertBefore(bar, document.body.firstChild);
     return bar;
   }
@@ -74,12 +81,14 @@ TRANSPORT_ADAPTER = r"""
 
   async function measureRelayRtt() {
     if (state.channel && state.channel.readyState === 'open') return;
+    if (document.hidden) return;
     const deviceId = currentDeviceId();
     const base = deviceId ? '/_mesh/device/' + encodeURIComponent(deviceId) : '';
     const started = Date.now();
     try {
       const response = await nativeFetch(base + '/global/health', { credentials: 'same-origin', cache: 'no-store' });
-      if (response.ok) { state.relayRtt = Date.now() - started; renderBar(); }
+      const elapsed = Date.now() - started;
+      if (response.ok && !document.hidden && elapsed >= 0 && elapsed <= RTT_MAX_MS) { state.relayRtt = elapsed; renderBar(); }
     } catch (_) {}
   }
 
@@ -186,10 +195,10 @@ TRANSPORT_ADAPTER = r"""
 
   function settleMessage(message) {
     if (message.type === 'pong') {
-      if (state.pingSent != null) {
-        state.rtt = Math.max(0, Date.now() - state.pingSent);
+      if (state.pingSent != null && message.t === state.pingSent) {
+        const rtt = Date.now() - state.pingSent;
         state.pingSent = null;
-        renderBar();
+        if (rtt >= 0 && rtt <= RTT_MAX_MS) { state.rtt = rtt; renderBar(); }
       }
       return;
     }
@@ -200,7 +209,14 @@ TRANSPORT_ADAPTER = r"""
         socket.protocol = message.protocol || socket.protocol;
         socket.dispatch('open', {});
       } else if (message.type === 'ws_data') {
-        socket.dispatch('message', { data: message.kind === 'bytes' ? unb64(message.data) : (message.data || '') });
+        let data;
+        if (message.kind === 'bytes') {
+          const bytes = unb64(message.data);
+          data = socket.binaryType === 'arraybuffer' ? bytes.buffer : new Blob([bytes]);
+        } else {
+          data = message.data || '';
+        }
+        socket.dispatch('message', { data });
       } else if (message.type === 'ws_closed' || message.type === 'ws_error') {
         socket.readyState = MeshWebSocket.CLOSED;
         if (message.type === 'ws_error') socket.dispatch('error', new Error(message.error || 'WebSocket failed'));
@@ -385,7 +401,7 @@ TRANSPORT_ADAPTER = r"""
 
   async function send(message) {
     if (!state.channel || state.channel.readyState !== 'open') throw new Error('p2p channel unavailable');
-    const messageId = String(message.id || makeId());
+    const messageId = ['ws_data', 'ws_close'].includes(message.type) ? makeId() : String(message.id || makeId());
     const payload = enc.encode(JSON.stringify(message.id ? message : { ...message, id: messageId }));
     if (payload.length > MAX_P2P_BYTES) throw new Error('P2P message too large');
     for (let offset = 0, sequence = 0; offset < payload.length || sequence === 0; offset += CHUNK_SIZE, sequence += 1) {
@@ -399,6 +415,15 @@ TRANSPORT_ADAPTER = r"""
     }
   }
 
+  async function orderedP2PSend(task) {
+    const previous = state.p2pSendTail;
+    let release;
+    state.p2pSendTail = new Promise(resolve => { release = resolve; });
+    await previous;
+    try { return await task(); }
+    finally { release(); }
+  }
+
   async function p2pFetch(input, init = {}) {
     const request = new Request(typeof input === 'string' || input instanceof URL ? new URL(input, location.href) : input, init);
     let { path, query } = requestPath(request);
@@ -406,7 +431,6 @@ TRANSPORT_ADAPTER = r"""
     if (requestedDevice && requestedDevice !== state.manifest?.device_id) throw new Error('different device uses Relay');
     path = devicePath(path);
     const id = makeId();
-    const body = new Uint8Array(await request.arrayBuffer());
     const headers = headersObject(request.headers);
     const accept = (headers.accept || '').toLowerCase();
     if (accept.includes('text/event-stream') || path === '/event' || path === '/global/event' || path === '/api/event' || path.endsWith('/event')) {
@@ -416,7 +440,12 @@ TRANSPORT_ADAPTER = r"""
         state.pending.set(id, entry);
       });
       const stream = new ReadableStream({ start(controller) { state.streams.set(id, { controller }); }, cancel() { state.streams.delete(id); state.pending.delete(id); send({ type: 'cancel', id }); } });
-      try { await send({ type: 'stream_request', id, method: request.method, path, query, headers, body: b64(body) }); }
+      try {
+        await orderedP2PSend(async () => {
+          const body = new Uint8Array(await request.arrayBuffer());
+          await send({ type: 'stream_request', id, method: request.method, path, query, headers, body: b64(body) });
+        });
+      }
       catch (error) { state.pending.delete(id); state.streams.delete(id); throw error; }
       request.signal.addEventListener('abort', () => { const s = state.streams.get(id); if (s) s.controller.error(new DOMException('Aborted', 'AbortError')); rejectEntry(id, new DOMException('Aborted', 'AbortError')); state.streams.delete(id); send({ type: 'cancel', id }).catch(() => {}); }, { once: true });
       const meta = await first;
@@ -426,7 +455,10 @@ TRANSPORT_ADAPTER = r"""
       const entry = { resolve, reject };
       entry.timer = setTimeout(() => rejectEntry(id, new Error('request timeout')), 120000);
       state.pending.set(id, entry);
-      send({ type: 'request', id, method: request.method, path, query, headers, body: b64(body) }).catch(error => rejectEntry(id, error));
+      orderedP2PSend(async () => {
+        const body = new Uint8Array(await request.arrayBuffer());
+        await send({ type: 'request', id, method: request.method, path, query, headers, body: b64(body) });
+      }).catch(error => rejectEntry(id, error));
       if (request.signal) request.signal.addEventListener('abort', () => { rejectEntry(id, new DOMException('Aborted', 'AbortError')); send({ type: 'cancel', id }).catch(() => {}); }, { once: true });
     });
     if (result.type === 'cancelled') throw new DOMException('Request cancelled', 'AbortError');
@@ -442,6 +474,7 @@ TRANSPORT_ADAPTER = r"""
       this.protocol = Array.isArray(protocols) ? protocols[0] || '' : (protocols || '');
       this.readyState = MeshWebSocket.CONNECTING;
       this.bufferedAmount = 0;
+      this.binaryType = 'blob';
       this._listeners = new Map();
        this.id = makeId();
       state.sockets.set(this.id, this);
@@ -610,6 +643,18 @@ TRANSPORT_ADAPTER = r"""
       super(input, options);
     }
   };
+  function resetRttAfterBackground() {
+    state.rtt = null; state.relayRtt = null; state.pingSent = null;
+    renderBar();
+    if (state.channel && state.channel.readyState === 'open') {
+      state.pingSent = Date.now();
+      send({ type: 'ping', t: state.pingSent }).catch(() => { state.pingSent = null; });
+    }
+    measureRelayRtt();
+  }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) resetRttAfterBackground(); });
+  window.addEventListener('pageshow', event => { if (event.persisted) resetRttAfterBackground(); });
+
   window.addEventListener('beforeunload', () => { if (state.pc) state.pc.close(); });
 })();
 </script>

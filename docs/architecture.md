@@ -27,7 +27,7 @@ OpenCode Mesh 将多台设备上的 OpenCode 统一暴露到一个公网 Gateway
                          公网 HTTPS
 浏览器/OpenCode Web UI --------------------> Gateway
      │                                         │
-     │ WebRTC DataChannel（优先）               │ 长期 WebSocket 控制连接
+     │ WebRTC DataChannel（优先）              │ 长期 WebSocket 控制连接
      │                                         │
      └────────────────────────────────────────> Agent
                                                │
@@ -283,6 +283,8 @@ Agent  --agent_token--> Gateway 控制 WebSocket
 opencode-mesh/
 ├── pyproject.toml
 ├── README.md
+├── CHANGELOG.md
+├── .github/workflows/
 ├── src/
 │   ├── __init__.py
 │   ├── main.py
@@ -360,6 +362,10 @@ P2P 和分片基础设施：
 - `scripts/install.sh`：安装依赖、写入配置、生成 systemd 服务，并处理 root/普通用户两种安装范围。
 - `scripts/uninstall.sh`：显式按 `agent`、`gateway` 或 `all` 卸载，Agent 模式会先尝试注销设备，并支持保留设备身份。
 - `scripts/deploy-agent.sh`：通过 SSH 将 Agent 部署到远程 Linux 设备。
+
+### 10.4 版本控制
+
+`src/__init__.py` 中的 `__version__` 是唯一的软件版本来源，`pyproject.toml` 通过 setuptools 动态读取。Gateway 注入浏览器的状态栏显示该版本；`transport-manifest.version` 仍然是协议版本。发布使用 `vX.Y.Z` Git tag，`scripts/install.sh` 默认安装 `main`，设置 `MESH_VERSION=vX.Y.Z` 可固定到指定发布版本。
 - `scripts/bootstrap.sh`：本地开发环境初始化。
 - `scripts/check_auth.py`：使用 ASGI transport 验证认证、注册所有权、请求头隔离、注销和文件权限。
 

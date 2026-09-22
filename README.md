@@ -19,6 +19,17 @@
 
 ## 快速开始
 
+### 版本安装
+
+仓库使用 SemVer 版本号，发布 tag 使用 `vX.Y.Z` 格式。安装脚本默认从 `main` 分支获取最新开发版本；生产环境可以固定到发布 tag：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | \
+  MESH_VERSION=v0.1.0 bash -s -- agent
+```
+
+安装完成后会打印实际运行版本。升级时修改 `MESH_VERSION` 后重新执行安装；需要回滚时指定较早的 tag。版本号的唯一来源是 `src/__init__.py`，发布前需同步创建对应的 Git tag。
+
 ### 第 1 步：部署 Gateway（公网服务器）
 
 在公网服务器上执行：
