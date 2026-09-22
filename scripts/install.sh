@@ -237,13 +237,13 @@ ExecStart=${EXEC}
 Restart=always
 RestartSec=5
 
-[Install]
-WantedBy=default.target
+  [Install]
+  WantedBy=default.target
 UNIT
-  systemctl --user daemon-reload
-  systemctl --user enable --now "${SERVICE_NAME}.service"
   info "enabling user linger (keeps the service running while logged out)..."
   loginctl enable-linger "$(id -un)" 2>/dev/null || warn "could not enable linger (no loginctl); the session must stay logged in"
+  systemctl --user daemon-reload
+  systemctl --user enable --now "${SERVICE_NAME}.service"
 else
   UNIT_FILE="$UNIT_DIR/${SERVICE_NAME}.service"
   cat > "$UNIT_FILE" <<UNIT
@@ -292,7 +292,8 @@ Gateway is ready.
 
   Install an Agent on each OpenCode device:
 
-    curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | MESH_GATEWAY_URL=${SHOWN_URL} MESH_ENROLL_TOKEN=${ENROLL_TOKEN} bash -s -- agent
+    read -r -s MESH_ENROLL_TOKEN; export MESH_ENROLL_TOKEN
+    curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | MESH_GATEWAY_URL=${SHOWN_URL} bash -s -- agent
 
 ========================================================================
 INFO

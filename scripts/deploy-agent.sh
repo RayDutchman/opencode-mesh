@@ -37,6 +37,13 @@ OPENCODE_USERNAME=${OPENCODE_USERNAME:-opencode}
 MESH_DEVICE_NAME=${MESH_DEVICE_NAME:-}
 MESH_PYTHON=${MESH_PYTHON:-python3}
 
+case "$MESH_GATEWAY_URL" in
+  https://*) ;;
+  http://) err "Gateway URL must include a host"; exit 2 ;;
+  http://*) warn "Gateway is not using HTTPS; enrollment token and proxied data will be sent in clear text" ;;
+  *) err "Gateway URL must start with https:// or http://"; exit 2 ;;
+esac
+
 command -v ssh >/dev/null || { echo 'ssh is required' >&2; exit 1; }
 command -v tar >/dev/null || { echo 'tar is required' >&2; exit 1; }
 
@@ -56,6 +63,8 @@ config = {
     "state_file": "./data/agent-state.json",
     "reconnect_seconds": 5,
 }
+if config["gateway_url"].startswith("http://"):
+    config["allow_insecure_gateway"] = True
 if os.environ.get("OPENCODE_USERNAME") or os.environ.get("OPENCODE_PASSWORD"):
     config["opencode_basic_auth"] = {
         "username": os.environ.get("OPENCODE_USERNAME", "opencode"),
@@ -76,11 +85,14 @@ tar -czf - --exclude='./.git' --exclude='./.venv' --exclude='./data' \
   ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$REMOTE" \
   "tar -xzf - -C '$INSTALL_DIR'"
 ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$REMOTE" \
+  "install -m 0600 /dev/stdin '$INSTALL_DIR/config/agent.local.json'" < "$tmp/config/agent.local.json"
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$REMOTE" \
   "INSTALL_DIR='$INSTALL_DIR' PYTHON='$MESH_PYTHON' bash -s" <<'REMOTE_SCRIPT'
 set -euo pipefail
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/data" "$INSTALL_DIR/config"
 mkdir -p "$HOME/.config/systemd/user"
+loginctl enable-linger "$(id -un)" 2>/dev/null || echo "warning: could not enable user linger"
 if [ ! -d "$INSTALL_DIR/.venv" ]; then
   "$PYTHON" -m venv "$INSTALL_DIR/.venv" || "$PYTHON" -m venv --system-site-packages "$INSTALL_DIR/.venv"
 fi
@@ -94,9 +106,4 @@ systemctl --user daemon-reload
 systemctl --user enable --now opencode-mesh-agent.service
 systemctl --user --no-pager --full status opencode-mesh-agent.service
 REMOTE_SCRIPT
-
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$REMOTE" \
-  "cat > '$INSTALL_DIR/config/agent.local.json'" < "$tmp/config/agent.local.json"
-ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$REMOTE" \
-  "systemctl --user restart opencode-mesh-agent.service"
 echo "deployment complete: ${REMOTE}:${INSTALL_DIR}"

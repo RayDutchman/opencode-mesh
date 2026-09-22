@@ -27,7 +27,12 @@ ask() {
   printf '%s' "${value:-$default}"
 }
 
-MODE="${1:-${MESH_MODE:-all}}"
+MODE="${1:-${MESH_MODE:-}}"
+case "$MODE" in
+  agent|gateway|all) ;;
+  "") err "mode is required; use agent, gateway, or all"; exit 2 ;;
+  *) err "invalid mode '$MODE'; use agent, gateway, or all"; exit 2 ;;
+esac
 
 if [ "$(id -u)" -eq 0 ]; then
   INSTALL_DIR="${MESH_INSTALL_DIR:-/opt/opencode-mesh}"
@@ -58,7 +63,7 @@ done
 $SC_CMD daemon-reload 2>/dev/null || true
 
 # Tell the Gateway to drop the agent registration so no offline device remains.
-if [ -f "$INSTALL_DIR/config/agent.json" ] && [ -f "$INSTALL_DIR/data/agent-state.json" ]; then
+if [ "$MODE" != "gateway" ] && [ -f "$INSTALL_DIR/config/agent.json" ] && [ -f "$INSTALL_DIR/data/agent-state.json" ]; then
   GATEWAY_URL="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("gateway_url",""))' "$INSTALL_DIR/config/agent.json" 2>/dev/null || true)"
   DEVICE_ID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("device_id",""))' "$INSTALL_DIR/data/agent-state.json" 2>/dev/null || true)"
   TOKEN="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("agent_token",""))' "$INSTALL_DIR/data/agent-state.json" 2>/dev/null || true)"
@@ -73,14 +78,21 @@ if [ -d "$INSTALL_DIR" ]; then
   if [ -z "$KEEP" ]; then
     KEEP="$(ask "Keep the data/ directory (device identity and state)? (y/N)" "N")"
   fi
+  case "$KEEP" in
+    y|Y|n|N|"") ;;
+    *) err "MESH_KEEP_DATA must be y or n"; exit 2 ;;
+  esac
   if [ "$KEEP" = "y" ] || [ "$KEEP" = "Y" ]; then
-    BACKUP="$(mktemp -d)/opencode-mesh-data"
-    mkdir -p "$BACKUP"
-    [ -d "$INSTALL_DIR/data" ] && cp -r "$INSTALL_DIR/data" "$BACKUP/" 2>/dev/null || true
-    info "data backed up to ${BACKUP}"
+    info "removing install files while preserving ${INSTALL_DIR}/data ..."
+    shopt -s dotglob nullglob
+    for item in "$INSTALL_DIR"/*; do
+      [ "$(basename "$item")" = "data" ] || rm -rf "$item"
+    done
+    shopt -u dotglob nullglob
+  else
+    info "removing install directory ${INSTALL_DIR} ..."
+    rm -rf "$INSTALL_DIR"
   fi
-  info "removing install directory ${INSTALL_DIR} ..."
-  rm -rf "$INSTALL_DIR"
 fi
 
 info "uninstall complete."

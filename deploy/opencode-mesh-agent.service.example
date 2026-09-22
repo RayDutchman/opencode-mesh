@@ -9,10 +9,8 @@ WorkingDirectory=/opt/opencode-mesh
 ExecStart=/opt/opencode-mesh/.venv/bin/python -m src.main --mode agent --config /opt/opencode-mesh/config/agent.json
 Restart=always
 RestartSec=5
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ReadWritePaths=/opt/opencode-mesh/data
+# This template is used by systemd --user; keep it portable across user managers.
+ReadWritePaths=/opt/opencode-mesh/data /opt/opencode-mesh/config
 
 [Install]
 WantedBy=default.target
