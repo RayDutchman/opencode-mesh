@@ -32,7 +32,7 @@ Gateway 提供页面、设备发现和 WebRTC 信令。直连建立后，消息�
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | \
-  MESH_VERSION=v0.1.0 bash -s -- agent
+  MESH_VERSION=v0.2.0 bash -s -- agent
 ```
 
 安装完成后会打印实际运行版本。升级时修改 `MESH_VERSION` 后重新执行安装；需要回滚时指定较早的 tag。版本号的唯一来源是 `src/__init__.py`，发布前需同步创建对应的 Git tag。
