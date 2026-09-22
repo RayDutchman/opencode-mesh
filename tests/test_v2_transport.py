@@ -138,8 +138,9 @@ def test_discovery_preserves_native_server_names_and_skips_v1():
     assert result.returncode == 0, result.stderr
 
 
-def test_p2p_upload_cannot_move_to_new_device_channel():
-    """读取流式请求体期间切换设备，旧 mutation 必须失败而非发给新设备。"""
+@pytest.mark.parametrize('scenario', ['switch', 'abort', 'stream'])
+def test_p2p_upload_keeps_device_and_cancellation(scenario):
+    """流式请求体在切换或取消后，不得继续发送 mutation。"""
     adapter = TRANSPORT_ADAPTER.split('<script id="ocm-transport-adapter">', 1)[1].split('</script>', 1)[0]
     script = """
     const assert=require('node:assert/strict');
@@ -152,7 +153,9 @@ def test_p2p_upload_cannot_move_to_new_device_channel():
     global.setTimeout=global.setInterval=()=>0;
     global.fetch=()=>new Promise(()=>{});
     global.WebSocket=class {};
-    """ + adapter.replace('__OCM_VERSION_JSON__', '"test"') + """
+    """ + adapter.replace('__OCM_VERSION_JSON__', '"test"') + f'\nconst scenario={json.dumps(scenario)};\n' + """
+    let completed=false;
+    process.on('beforeExit',()=>assert.ok(completed,'async assertions did not complete'));
     (async()=>{
       const state=window.__ocmTransport;
       state.manifest={device_id:'gti'};
@@ -160,9 +163,12 @@ def test_p2p_upload_cannot_move_to_new_device_channel():
       const channel={readyState:'open',bufferedAmount:0,send:()=>assert.fail('closed old channel sent')};
       state.channel=channel;
       let controller;
+      const cancellation=new AbortController();
+      if(scenario==='abort') cancellation.abort();
       const body=new ReadableStream({start(c){controller=c}});
       const operation=window.fetch('https://mesh.test/_mesh/device/gti/api/session/test/prompt',
-        {method:'POST',body,duplex:'half'});
+        {method:'POST',body,duplex:'half',signal:cancellation.signal,
+          headers:scenario==='stream'?{accept:'text/event-stream'}:{}});
       channel.readyState='closed';
       state.channel={readyState:'open',bufferedAmount:0,send(frame){
         sent.push(frame);
@@ -170,9 +176,46 @@ def test_p2p_upload_cannot_move_to_new_device_channel():
         state.pending.get(msg.id)?.resolve({status:204,body:''});
       }};
       controller.enqueue(new TextEncoder().encode('{}'));controller.close();
-      await assert.rejects(operation,/channel unavailable/);
+      await assert.rejects(operation,scenario==='abort'?/abort/i:/channel unavailable/);
       assert.equal(sent.length,0);
-    })().catch(e=>{console.error(e);process.exitCode=1});
+    })().then(()=>{completed=true}).catch(e=>{completed=true;console.error(e);process.exitCode=1});
+    """
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_large_request_falls_back_with_original_body():
+    """Request 流式上传超过 P2P 上限后，Relay 接收相同请求体和设备地址。"""
+    adapter = TRANSPORT_ADAPTER.split('<script id="ocm-transport-adapter">', 1)[1].split('</script>', 1)[0]
+    script = """
+    const assert=require('node:assert/strict');
+    global.window=global;
+    global.location={origin:'https://mesh.test',host:'mesh.test',pathname:'/',href:'https://mesh.test/'};
+    global.document={readyState:'loading',addEventListener(){}};
+    global.history={pushState(){},replaceState(){}};
+    global.localStorage={getItem(){return null}};
+    global.addEventListener=()=>{};
+    global.setTimeout=global.setInterval=()=>0;
+    global.fetch=async(input,init)=>{
+      if(typeof input==='string'&&input.startsWith('/_mesh/')) return new Promise(()=>{});
+      const req=new Request(input,init);
+      assert.equal(req.url,'https://mesh.test/_mesh/device/gti/api/upload');
+      const bytes=new Uint8Array(await req.arrayBuffer());
+      assert.equal(bytes.length,32*1024*1024+1);
+      assert.equal(bytes[bytes.length-1],42);
+      return new Response(null,{status:204});
+    };
+    global.WebSocket=class {};
+    """ + adapter.replace('__OCM_VERSION_JSON__', '"test"') + """
+    let completed=false;
+    process.on('beforeExit',()=>assert.ok(completed,'async assertions did not complete'));
+    (async()=>{
+      const s=window.__ocmTransport;
+      s.manifest={device_id:'gti'};s.channel={readyState:'open'};
+      const body=new Uint8Array(32*1024*1024+1);body[body.length-1]=42;
+      const request=new Request('https://mesh.test/_mesh/device/gti/api/upload',{method:'POST',body});
+      assert.equal((await window.fetch(request)).status,204);
+    })().then(()=>{completed=true}).catch(e=>{completed=true;console.error(e);process.exitCode=1});
     """
     result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr

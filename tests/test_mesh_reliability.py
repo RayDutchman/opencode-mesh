@@ -1861,7 +1861,6 @@ def test_version_source_is_semver_and_declared_in_src():
 
     version = getattr(src, "__version__", "")
     assert re.fullmatch(r"\d+\.\d+\.\d+", version)
-    assert version == "0.1.0"
 
 
 def test_pyproject_uses_dynamic_src_version():
@@ -1874,10 +1873,11 @@ def test_pyproject_uses_dynamic_src_version():
 
 def test_mesh_bar_injects_runtime_version():
     """The injected status bar renders the current Mesh version."""
+    from src import __version__
     body = inject_mesh_bar(b"<html><head></head><body></body></html>")
 
     assert b"OpenCode Mesh" in body
-    assert b'MESH_VERSION = "0.1.0"' in body
+    assert f'MESH_VERSION = "{__version__}"'.encode() in body
     assert b"version.textContent = 'v' + MESH_VERSION" in body
     assert b"__OCM_VERSION_JSON__" not in body
 

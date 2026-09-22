@@ -535,15 +535,18 @@ TRANSPORT_ADAPTER = r"""
 
   async function p2pFetch(input, init = {}) {
     const channel = state.channel;
-    const request = new Request(typeof input === 'string' || input instanceof URL ? new URL(input, location.href) : input, init);
+    const [scopedInput, scopedInit] = scopeNativeRequest(input, init);
+    const request = new Request(typeof scopedInput === 'string' || scopedInput instanceof URL ? new URL(scopedInput, location.href) : scopedInput, scopedInit);
+    request.signal.throwIfAborted();
     let { path, query } = requestPath(request);
     const requestedDevice = virtualDeviceId(path) || activeDeviceId();
-    if (requestedDevice && requestedDevice !== state.manifest?.device_id) return nativeFetch(...scopeNativeRequest(input, init));
+    if (requestedDevice && requestedDevice !== state.manifest?.device_id) return nativeFetch(request);
     path = serverRoutePath(path) || devicePath(path);
     const id = makeId();
     const sizeProbe = new Uint8Array(await request.clone().arrayBuffer());
+    request.signal.throwIfAborted();
     // Fall back to Relay for requests larger than the P2P payload limit.
-    if (sizeProbe.length > MAX_P2P_BODY) return nativeFetch(...scopeNativeRequest(input, init));
+    if (sizeProbe.length > MAX_P2P_BODY) return nativeFetch(request);
     const headers = headersObject(request.headers);
     const accept = (headers.accept || '').toLowerCase();
     if (accept.includes('text/event-stream') || path === '/event' || path === '/global/event' || path === '/api/event' || path.endsWith('/event')) {
@@ -556,22 +559,21 @@ TRANSPORT_ADAPTER = r"""
       request.signal.addEventListener('abort', () => { rejectEntry(id, new DOMException('Aborted', 'AbortError')); }, { once: true });
       if (request.signal && request.signal.aborted) rejectEntry(id, new DOMException('Aborted', 'AbortError'));
       try {
-        await orderedP2PSend(async () => {
-          const body = new Uint8Array(await request.arrayBuffer());
-          await send({ type: 'stream_request', id, method: request.method, path, query, headers, body: b64(body) }, channel);
-        });
+        const [meta] = await Promise.all([first, orderedP2PSend(async () => {
+          request.signal.throwIfAborted();
+          await send({ type: 'stream_request', id, method: request.method, path, query, headers, body: b64(sizeProbe) }, channel);
+        })]);
+        return new Response(stream, { status: meta.status, headers: meta.headers });
       }
       catch (error) { rejectEntry(id, error); throw error; }
-      const meta = await first;
-      return new Response(stream, { status: meta.status, headers: meta.headers });
     }
     const result = await new Promise((resolve, reject) => {
       const entry = { resolve, reject, channel };
       entry.timer = setTimeout(() => rejectEntry(id, new Error('request timeout')), 120000);
       state.pending.set(id, entry);
       orderedP2PSend(async () => {
-        const body = new Uint8Array(await request.arrayBuffer());
-        await send({ type: 'request', id, method: request.method, path, query, headers, body: b64(body) }, channel);
+        request.signal.throwIfAborted();
+        await send({ type: 'request', id, method: request.method, path, query, headers, body: b64(sizeProbe) }, channel);
       }).catch(error => rejectEntry(id, error));
       if (request.signal) request.signal.addEventListener('abort', () => { rejectEntry(id, new DOMException('Aborted', 'AbortError')); }, { once: true });
     });

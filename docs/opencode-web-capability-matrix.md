@@ -1,5 +1,7 @@
 # OpenCode Web 数据面能力矩阵
 
+> 以下 `/doc` 路由盘点及 V1/混合版本条目保留作历史参考，不再是当前兼容承诺。V2 开发线使用运行设备的 `/openapi.json`，不替换原生 EventSource；当前设计及验收记录见 [V2 设计](superpowers/specs/2026-09-23-v2-minimal-transport-design.md) 与 [执行记录](superpowers/plans/2026-09-23-v2-minimal-transport.md)。
+
 基线：通过真实 OpenCode Web 会话访问 `GET /doc`，当前验证样本返回 **162 个路径、188 个操作**；实际版本以设备运行版本为准。完整机器可读路由目录由 `GET /doc` 生成，禁止凭猜测删减 API。
 
 当前实现证据：

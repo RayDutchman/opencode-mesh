@@ -13,12 +13,11 @@
 ## 架构
 
 ```
-浏览器 ──HTTPS──> Gateway（公网服务器）
-                    │  ① WebRTC 直连（LAN / STUN 打洞，最优）
-                    │  ② Relay 中继（WebSocket 控制通道，兜底）
-                    ▼
-                  Agent（每台 OpenCode 设备）──> 本机 OpenCode
+浏览器 ───── WebRTC 直连 ───────────────────> Agent ──> OpenCode V2
+  └── HTTPS/WSS ──> Gateway ── WebSocket 中继 ──┘
 ```
+
+Gateway 提供页面、设备发现和 WebRTC 信令。直连建立后，消息、事件流和终端数据直接到 Agent；直连不可用时走 Relay。手机只需浏览器，无需安装 VPN 客户端。
 
 - **Gateway**：部署在有公网地址的服务器上，负责浏览器 HTTP Basic Auth、设备注册与路由、以及 Relay 中继。
 - **Agent**：部署在每台运行 OpenCode 的设备上，主动连接 Gateway，并代理本机 OpenCode。它只对外连接，不监听任何端口。
@@ -74,7 +73,11 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 
 ### 第 3 步：浏览器访问
 
-打开 Gateway 的公网地址，输入第 1 步设置的登录用户名/密码即可。每台已注册的设备会作为 OpenCode 原生 Server 出现在界面里，可分别访问其项目、会话与终端。
+打开 Gateway 的公网地址，输入第 1 步设置的登录用户名/密码即可。发现的在线 **OpenCode V2** 设备会补充到原生 Server 列表，可分别访问其项目、会话与终端。Server 改名、外部 Server 和会话管理交给 OpenCode；Mesh 不再覆盖已有名称或整张列表。
+
+当前开发线以 **V2.0.6** 为验证版本，不再维护 V1 前端兼容。浏览器页面使用原生 `/server/<encoded-server>/...` 路由；`/_mesh/device/<id>` 是 Server 的请求地址，不是 V2 页面入口。状态栏显示当前设备及 P2P/Relay；后台访问其他 Server 时会使用该 Server 的明确地址。
+
+Mesh 只适配 `fetch` 和 WebSocket 传输，不替换原生 XMLHttpRequest/EventSource，也不改写 JSON 请求体。P2P 已发出的请求若中断，结果可能未知，不会自动换到 Relay 重发 mutation；后续请求可走 Relay。
 
 ## 非交互安装
 
