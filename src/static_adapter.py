@@ -136,6 +136,7 @@ TRANSPORT_ADAPTER = r"""
       return virtualDeviceId(server.pathname);
     } catch (_) { return null; }
   };
+  const activeDeviceId = () => currentDeviceId() || state.manifest?.device_id || state.defaultDevice;
   const serverRoutePath = path => {
     const match = path.match(/^\/server\/([^/]+)(\/.*)?$/);
     if (!match) return null;
@@ -146,7 +147,7 @@ TRANSPORT_ADAPTER = r"""
     } catch (_) { return null; }
   };
   const scopeNativeRequest = (input, init) => {
-    const deviceId = currentDeviceId();
+    const deviceId = activeDeviceId();
     if (!deviceId) return [input, init];
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);
     if (url.origin !== location.origin || url.pathname.startsWith('/_mesh/') || url.pathname.startsWith('/server/') || virtualDeviceId(url.pathname)) return [input, init];
@@ -508,7 +509,7 @@ TRANSPORT_ADAPTER = r"""
   async function p2pFetch(input, init = {}) {
     const request = new Request(typeof input === 'string' || input instanceof URL ? new URL(input, location.href) : input, init);
     let { path, query } = requestPath(request);
-    const requestedDevice = virtualDeviceId(path) || currentDeviceId();
+    const requestedDevice = virtualDeviceId(path) || activeDeviceId();
     if (requestedDevice && requestedDevice !== state.manifest?.device_id) throw new Error('different device uses Relay');
     path = serverRoutePath(path) || devicePath(path);
     const id = makeId();

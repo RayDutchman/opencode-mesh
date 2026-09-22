@@ -377,6 +377,12 @@ def test_adapter_scopes_servers_and_relay_fallback_to_active_device():
     assert "currentDeviceId()" in TRANSPORT_ADAPTER
 
 
+def test_adapter_uses_manifest_device_for_root_relay_requests():
+    """A root Server page must bind fallback API calls to its selected device."""
+    assert "const activeDeviceId = () => currentDeviceId() || state.manifest?.device_id || state.defaultDevice" in TRANSPORT_ADAPTER
+    assert "const deviceId = activeDeviceId();" in TRANSPORT_ADAPTER
+
+
 def test_agent_accepts_consecutive_ws_data_frames_for_one_socket():
     """Consecutive input frames on one WebSocket use distinct transport IDs."""
     async def scenario():
