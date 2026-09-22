@@ -1907,6 +1907,12 @@ def test_adapter_checks_selected_server_frontend_before_switching_transport():
     assert "/_assets/" in TRANSPORT_ADAPTER
 
 
+def test_adapter_does_not_redirect_v2_device_into_mesh_route():
+    """V2 client routing must remain at the root; only V1 needs a page switch."""
+    assert "const targetIsV1 = !html.includes('/_assets/') && html.includes('/assets/');" in TRANSPORT_ADAPTER
+    assert "if (targetIsV1 && deviceId && deviceId !== currentDeviceId())" in TRANSPORT_ADAPTER
+
+
 def test_agent_normalizes_empty_json_mutations_for_v2():
     """V2 rejects an empty JSON object body, so Mesh must send {} explicitly."""
     assert normalize_json_body("POST", {"content-type": "application/json"}, b"") == b"{}"

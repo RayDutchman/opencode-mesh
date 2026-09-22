@@ -166,14 +166,11 @@ TRANSPORT_ADAPTER = r"""
     frontendCheckUrl = url;
     try {
       const deviceId = virtualDeviceId(new URL(url, location.href).pathname);
-      if (deviceId && deviceId !== currentDeviceId()) {
-        location.replace(url.replace(/\/+$/, '') + '/');
-        return;
-      }
       const response = await nativeFetch(url.replace(/\/+$/, '') + '/', { credentials: 'same-origin', cache: 'no-store' });
       if (!response.ok) return;
       const html = await response.text();
-      if (!html.includes('/_assets/') && html.includes('/assets/')) {
+      const targetIsV1 = !html.includes('/_assets/') && html.includes('/assets/');
+      if (targetIsV1 && deviceId && deviceId !== currentDeviceId()) {
         location.replace(url.replace(/\/+$/, '') + '/');
       }
     } catch (_) { frontendCheckUrl = null; }
