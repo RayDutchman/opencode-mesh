@@ -123,6 +123,34 @@ def filter_response_headers(headers) -> dict[str, str]:
     return {k: v for k, v in headers.items() if k.lower() not in blocked}
 
 
+def normalize_json_body(method: str, headers: dict[str, str], body: bytes) -> bytes:
+    """为严格的 V2 JSON mutation 补上空对象请求体。"""
+    if body or method.upper() not in {"POST", "PUT", "PATCH"}:
+        return body
+    content_type = str(headers.get("content-type", "")).lower()
+    return b"{}" if "application/json" in content_type else body
+
+
+def normalize_request_body(path: str, method: str, headers: dict[str, str], body: bytes) -> bytes:
+    """兼容旧缓存中的 V2 模型字段，并补齐空 JSON mutation。"""
+    body = normalize_json_body(method, headers, body)
+    if not body or "application/json" not in str(headers.get("content-type", "")).lower():
+        return body
+    if not re.fullmatch(r"/api/session/[^/]+/model", path):
+        return body
+    try:
+        payload = json.loads(body)
+        model = payload.get("model")
+        if not isinstance(model, dict) or "id" in model or "modelID" not in model:
+            return body
+        normalized = {key: value for key, value in model.items() if key != "modelID"}
+        normalized["id"] = model["modelID"]
+        payload["model"] = normalized
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+    except (TypeError, ValueError):
+        return body
+
+
 DEFAULT_STUN_SERVERS = ["stun:stun.l.google.com:19302"]
 
 OFFLINE_PAGE = """<!doctype html>
@@ -966,7 +994,8 @@ class Agent:
         guard = ResponseSizeGuard(response_limit(self.cfg))
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10), auth=auth, follow_redirects=True) as client:
-                async with client.stream(item["method"], url, headers=headers, content=decode_strict(item.get("body", ""))) as r:
+                body = normalize_request_body(item["path"], item["method"], headers, decode_strict(item.get("body", "")))
+                async with client.stream(item["method"], url, headers=headers, content=body) as r:
                     out_headers = filter_response_headers(r.headers)
                     await self.stream_send(ws, {"type":"stream_chunk","id":item["id"],"status":r.status_code,"headers":out_headers})
                     async for chunk in r.aiter_bytes():
@@ -1293,8 +1322,8 @@ class Agent:
         limit = response_limit(self.cfg)
         async with httpx.AsyncClient(timeout=timeout, auth=auth, follow_redirects=True) as client:
             try:
-                async with client.stream(item["method"], url, headers=headers,
-                                         content=decode_strict(item.get("body", ""))) as r:
+                body = normalize_request_body(item["path"], item["method"], headers, decode_strict(item.get("body", "")))
+                async with client.stream(item["method"], url, headers=headers, content=body) as r:
                     content = await read_bounded(r.aiter_bytes(), limit)
                 encoded = base64.b64encode(content).decode()
                 print(f"agent response id={item['id']} status={r.status_code} bytes={len(content)} encoded={len(encoded)}", flush=True)

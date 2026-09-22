@@ -142,6 +142,7 @@ TRANSPORT_ADAPTER = r"""
       const layout = readJson('opencode.global.dat:layout', {});
       const selected = layout.home?.selection?.server;
       if (!selected) return null;
+      if (/^https?:\/\//i.test(selected)) return selected;
       const match = servers.find(entry => {
         const url = entry?.http?.url;
         if (!url) return false;
@@ -164,6 +165,11 @@ TRANSPORT_ADAPTER = r"""
     if (!url || url === frontendCheckUrl) return;
     frontendCheckUrl = url;
     try {
+      const deviceId = virtualDeviceId(new URL(url, location.href).pathname);
+      if (deviceId && deviceId !== currentDeviceId()) {
+        location.replace(url.replace(/\/+$/, '') + '/');
+        return;
+      }
       const response = await nativeFetch(url.replace(/\/+$/, '') + '/', { credentials: 'same-origin', cache: 'no-store' });
       if (!response.ok) return;
       const html = await response.text();
