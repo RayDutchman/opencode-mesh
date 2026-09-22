@@ -75,7 +75,7 @@ def forwarding_headers(headers) -> dict[str, str]:
     """Never send gateway credentials or browser CSRF markers across the Agent trust boundary."""
     blocked = {'authorization', 'cookie', 'proxy-authorization', 'host', 'content-length',
                'forwarded', 'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host',
-               'x-forwarded-port', 'x-real-ip', 'origin', 'referer'}
+               'x-forwarded-port', 'x-real-ip', 'origin', 'referer', 'accept-encoding'}
     return {k: v for k, v in headers.items() if k.lower() not in blocked}
 
 
@@ -911,7 +911,8 @@ class Agent:
         # its own origin, which never matches the Mesh gateway origin.
         headers = {k: v for k, v in item.get("headers", {}).items()
                    if k.lower() not in {"host", "content-length", "authorization", "cookie",
-                                        "origin", "referer"}}
+                                        "origin", "referer", "accept-encoding"}}
+        headers["accept-encoding"] = "identity"
         basic = self.cfg.get("opencode_basic_auth")
         auth = httpx.BasicAuth(str(basic["username"]), str(basic.get("password", ""))) if isinstance(basic, dict) else None
         guard = ResponseSizeGuard(response_limit(self.cfg))
@@ -1235,7 +1236,8 @@ class Agent:
         # its own origin, which never matches the Mesh gateway origin.
         headers = {k: v for k, v in item.get("headers", {}).items()
                    if k.lower() not in {"host", "content-length", "authorization", "cookie",
-                                        "origin", "referer"}}
+                                        "origin", "referer", "accept-encoding"}}
+        headers["accept-encoding"] = "identity"
         auth = None
         basic = self.cfg.get("opencode_basic_auth")
         if isinstance(basic, dict) and basic.get("username") is not None:
