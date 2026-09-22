@@ -87,6 +87,23 @@ OPENCODE_PASSWORD='本机 OpenCode 密码' \
 bash -c 'curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | bash -s -- agent'
 ```
 
+## 更新已有部署（推荐）
+
+统一使用 Git tag 或 commit 部署，无需逐个同步 Python 文件：
+
+```bash
+bash scripts/deploy-release.sh root@your-vps /root/opencode-mesh gateway system v0.1.0
+bash scripts/deploy-release.sh user@device /home/user/.local/share/opencode-mesh agent user v0.1.0
+# 本机以 Git 工作区运行的 Agent：工作区须干净，且 HEAD 与部署 ref 一致
+bash scripts/deploy-release.sh local "$PWD" agent user HEAD
+```
+
+脚本将指定 Git ref 的 `src/`、`scripts/`、`pyproject.toml` 打包，通过 SHA-256 校验后更新，安装依赖并重启服务；不复制本地配置、密钥或 data。目标机沿用原有 systemd 单元、配置和虚拟环境，需已完成首次安装。
+
+安装目录的 `.mesh-revision` 记录完整 commit；`.mesh-backups/` 保留更新前源码。安装或服务启动失败时自动恢复旧源码并尝试重新安装、启动旧版（共享虚拟环境的依赖不是完整快照）。`active` 检查不代表 Agent 已连通 Gateway，联网状态仍需从设备列表确认。
+
+只打包**已提交的代码**。正式发布先递增 `src.__version__`、更新 CHANGELOG、测试并创建新的 `vX.Y.Z` tag，再部署该 tag；不要移动旧发布 tag。回滚可指定旧 tag，开发工作区需先切换到相应提交。
+
 ## 卸载
 
 ```bash

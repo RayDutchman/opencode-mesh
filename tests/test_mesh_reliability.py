@@ -319,6 +319,34 @@ def _agent():
                   "request_timeout": "5"})
 
 
+def test_gateway_lifespan_closes_streams_and_bridges(tmp_path):
+    """Shutdown cleans up every bridge even if one close fails."""
+    gateway = Gateway({"state_file": str(tmp_path / "state.json")})
+    stream = StreamState(4)
+    closed = []
+
+    class Bridge:
+        def __init__(self, fails=False):
+            self.fails = fails
+
+        async def close(self, code):
+            closed.append(code)
+            if self.fails:
+                raise RuntimeError("already disconnected")
+
+    async def scenario():
+        async with gateway.app.router.lifespan_context(gateway.app):
+            gateway.streams["stream"] = stream
+            gateway.browser_ws.update(first=Bridge(True), second=Bridge())
+            assert not stream.closed
+            assert closed == []
+
+    asyncio.run(scenario())
+    assert stream.closed
+    assert stream.pending_end == {"type": "stream_error", "error": "Gateway is shutting down"}
+    assert closed == [1001, 1001]
+
+
 def test_agent_accepts_consecutive_ws_data_frames_for_one_socket():
     """Consecutive input frames on one WebSocket use distinct transport IDs."""
     async def scenario():

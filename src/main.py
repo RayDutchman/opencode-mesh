@@ -237,8 +237,20 @@ class Gateway:
         self.browser_send_locks: dict[str, asyncio.Lock] = {}
         self.auth_failures: dict[str, list[float]] = {}
         self.register_attempts: dict[str, list[float]] = {}
-        self.app = FastAPI(title="OpenCode Mesh Gateway")
+        self.app = FastAPI(title="OpenCode Mesh Gateway", lifespan=self.lifespan)
         self.routes()
+
+    @contextlib.asynccontextmanager
+    async def lifespan(self, app: FastAPI):
+        """Close active streams and browser bridges when the Gateway stops."""
+        try:
+            yield
+        finally:
+            for state in list(self.streams.values()):
+                state.fail("Gateway is shutting down")
+            for bridge in list(self.browser_ws.values()):
+                with contextlib.suppress(Exception):
+                    await bridge.close(code=1001)
 
     def check_auth(self, req: Request) -> bool:
         auth = self.cfg.get("auth", {})
@@ -415,14 +427,6 @@ class Gateway:
                 return JSONResponse({"error": "unauthorized"}, status_code=401,
                                     headers={"WWW-Authenticate": 'Basic realm="OpenCode Mesh"'})
             return await call_next(req)
-
-        @app.on_event("shutdown")
-        async def shutdown_bridges():
-            for state in self.streams.values():
-                state.fail("Gateway is shutting down")
-            for bridge in list(self.browser_ws.values()):
-                with contextlib.suppress(Exception):
-                    await bridge.close(code=1001)
 
         @app.get("/_mesh/devices")
         async def devices(req: Request):
