@@ -1,11 +1,13 @@
 import asyncio
 import base64
 import json
+import subprocess
 
 import httpx
 import pytest
 
 from src.main import Agent, forwarding_headers
+from src.static_adapter import TRANSPORT_ADAPTER
 
 
 def test_relay_reframes_decoded_chunked_body():
@@ -56,3 +58,121 @@ def test_agent_preserves_body_and_reframes_headers(monkeypatch, stream, body):
     assert len(requests) == 1
     assert requests[0].content == body
     assert 'transfer-encoding' not in requests[0].headers
+
+
+def test_browser_scopes_websocket_and_preserves_explicit_server():
+    """原生 V2 PTY 使用根绝对 WSS URL，仍须绑定页面 Server。"""
+    helpers = TRANSPORT_ADAPTER.split('  const requestPath =', 1)[1].split('  function rejectEntry', 1)[0]
+    script = """
+    const assert=require('node:assert/strict');
+    const server='https://mesh.test/_mesh/device/ehang';
+    const location={origin:'https://mesh.test',href:'https://mesh.test/server/'+Buffer.from(server).toString('base64url')+'/session/ses_test'};
+    location.pathname=new URL(location.href).pathname;
+    const state={manifest:{device_id:'gti'},defaultDevice:'gti'};
+    const localStorage={getItem:()=>null};
+    """ + 'const requestPath =' + helpers + """
+    assert.equal(scopeNativeRequest('wss://mesh.test/api/pty/p/connect')[0],
+      'wss://mesh.test/_mesh/device/ehang/api/pty/p/connect');
+    assert.equal(scopeNativeRequest('wss://other.test/api/pty/p/connect')[0],
+      'wss://other.test/api/pty/p/connect');
+    assert.equal(scopeNativeRequest('https://mesh.test/_mesh/device/gti/api/info')[0],
+      'https://mesh.test/_mesh/device/gti/api/info');
+    """
+    subprocess.run(['node', '-e', script], check=True, capture_output=True, text=True)
+
+
+def test_v2_adapter_keeps_native_xhr_and_eventsource():
+    """执行整个适配器，V2 未使用的原生接口不应被替换。"""
+    adapter = TRANSPORT_ADAPTER.split('<script id="ocm-transport-adapter">', 1)[1].split('</script>', 1)[0]
+    adapter = adapter.replace('__OCM_VERSION_JSON__', '"test"')
+    script = """
+    const assert=require('node:assert/strict');
+    global.window=global;
+    global.location={origin:'https://mesh.test',pathname:'/',href:'https://mesh.test/'};
+    global.document={readyState:'loading',addEventListener(){}};
+    global.history={pushState(){},replaceState(){}};
+    global.localStorage={getItem(){return null}};
+    global.addEventListener=()=>{};
+    global.setTimeout=global.setInterval=()=>0;
+    global.fetch=()=>new Promise(()=>{});
+    global.WebSocket=class {};
+    const XHR=global.XMLHttpRequest=class {};
+    const ES=global.EventSource=class {};
+    """ + adapter + """
+    assert.equal(global.XMLHttpRequest,XHR);
+    assert.equal(global.EventSource,ES);
+    """
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_discovery_preserves_native_server_names_and_skips_v1():
+    """设备发现只补充 V2 入口，保留用户名称与自建 Server。"""
+    helpers = 'const requestPath =' + TRANSPORT_ADAPTER.split('  const requestPath =', 1)[1].split('  function rejectEntry', 1)[0]
+    script = """
+    const assert=require('node:assert/strict');
+    const location={origin:'https://mesh.test',href:'https://mesh.test/',pathname:'/',reload(){}};
+    const original=[{type:'http',displayName:'My workstation',http:{url:'https://mesh.test/_mesh/device/gti'}},
+      {type:'http',displayName:'External',http:{url:'https://external.test'}}];
+    const storage=new Map([['opencode.global.dat:server',JSON.stringify({list:original})]]);
+    const localStorage={getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v)};
+    const state={}; const renderBar=()=>{};
+    const nativeFetch=async url=>{
+      if(url==='/_mesh/devices') return Response.json({devices:[
+        {device_id:'gti',name:'Renamed host',online:true},
+        {device_id:'ehang',name:'ehang',online:true},
+        {device_id:'legacy',name:'legacy',online:true}],default_device:'gti'});
+      if(url.includes('legacy')) return new Response('<html>V1</html>',{headers:{'content-type':'text/html'}});
+      return Response.json({version:'2.0.6'});
+    };
+    """ + helpers + """
+    (async()=>{
+      await syncNativeServers();
+      const store=JSON.parse(storage.get('opencode.global.dat:server'));
+      assert.deepEqual(store.list.slice(0,2),original);
+      assert.equal(store.list.length,3);
+      assert.equal(store.list[2].http.url,'https://mesh.test/_mesh/device/ehang');
+    })().catch(e=>{console.error(e);process.exitCode=1});
+    """
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_p2p_upload_cannot_move_to_new_device_channel():
+    """读取流式请求体期间切换设备，旧 mutation 必须失败而非发给新设备。"""
+    adapter = TRANSPORT_ADAPTER.split('<script id="ocm-transport-adapter">', 1)[1].split('</script>', 1)[0]
+    script = """
+    const assert=require('node:assert/strict');
+    global.window=global;
+    global.location={origin:'https://mesh.test',host:'mesh.test',pathname:'/',href:'https://mesh.test/'};
+    global.document={readyState:'loading',addEventListener(){}};
+    global.history={pushState(){},replaceState(){}};
+    global.localStorage={getItem(){return null}};
+    global.addEventListener=()=>{};
+    global.setTimeout=global.setInterval=()=>0;
+    global.fetch=()=>new Promise(()=>{});
+    global.WebSocket=class {};
+    """ + adapter.replace('__OCM_VERSION_JSON__', '"test"') + """
+    (async()=>{
+      const state=window.__ocmTransport;
+      state.manifest={device_id:'gti'};
+      const sent=[];
+      const channel={readyState:'open',bufferedAmount:0,send:()=>assert.fail('closed old channel sent')};
+      state.channel=channel;
+      let controller;
+      const body=new ReadableStream({start(c){controller=c}});
+      const operation=window.fetch('https://mesh.test/_mesh/device/gti/api/session/test/prompt',
+        {method:'POST',body,duplex:'half'});
+      channel.readyState='closed';
+      state.channel={readyState:'open',bufferedAmount:0,send(frame){
+        sent.push(frame);
+        const msg=JSON.parse(Buffer.from(JSON.parse(frame).data,'base64'));
+        state.pending.get(msg.id)?.resolve({status:204,body:''});
+      }};
+      controller.enqueue(new TextEncoder().encode('{}'));controller.close();
+      await assert.rejects(operation,/channel unavailable/);
+      assert.equal(sent.length,0);
+    })().catch(e=>{console.error(e);process.exitCode=1});
+    """
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr

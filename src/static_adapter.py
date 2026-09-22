@@ -7,7 +7,6 @@ TRANSPORT_ADAPTER = r"""
   const MESH_VERSION = __OCM_VERSION_JSON__;
   const nativeFetch = window.fetch.bind(window);
   const nativeWebSocket = window.WebSocket;
-  const nativeEventSource = window.EventSource;
   const enc = new TextEncoder();
   const dec = new TextDecoder();
   const b64 = bytes => { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s); };
@@ -25,8 +24,6 @@ TRANSPORT_ADAPTER = r"""
   const SEND_TIMEOUT_MS = 10000;
   // Bound the whole P2P setup, including manifest and answer fetches.
   const CONNECT_TIMEOUT_MS = 40000;
-  // Reconnect an SSE stream that receives no bytes, including heartbeat comments.
-  const SSE_IDLE_MS = 45000;
   // Sanity cap: a real round-trip is far below this; anything larger is a clock-jump artifact (lock screen / background timer freeze) and must be discarded.
   const RTT_MAX_MS = 10000;
 
@@ -94,7 +91,7 @@ TRANSPORT_ADAPTER = r"""
     const base = deviceId ? '/_mesh/device/' + encodeURIComponent(deviceId) : '';
     const started = Date.now();
     try {
-      const response = await nativeFetch(base + '/global/health', { credentials: 'same-origin', cache: 'no-store' });
+      const response = await nativeFetch(base + '/api/info', { credentials: 'same-origin', cache: 'no-store' });
       const elapsed = Date.now() - started;
       if (response.ok && !document.hidden && elapsed >= 0 && elapsed <= RTT_MAX_MS) { state.relayRtt = elapsed; renderBar(); }
     } catch (_) {}
@@ -159,22 +156,6 @@ TRANSPORT_ADAPTER = r"""
     } catch (_) { return null; }
   };
   const activeDeviceId = () => currentDeviceId() || selectedServerDeviceId() || state.manifest?.device_id || state.defaultDevice;
-  let frontendCheckUrl = null;
-  async function ensureFrontendForDevice() {
-    const url = selectedServerUrl();
-    if (!url || url === frontendCheckUrl) return;
-    frontendCheckUrl = url;
-    try {
-      const deviceId = virtualDeviceId(new URL(url, location.href).pathname);
-      const response = await nativeFetch(url.replace(/\/+$/, '') + '/', { credentials: 'same-origin', cache: 'no-store' });
-      if (!response.ok) return;
-      const html = await response.text();
-      const targetIsV1 = !html.includes('/_assets/') && html.includes('/assets/');
-      if (targetIsV1 && deviceId && deviceId !== currentDeviceId()) {
-        location.replace(url.replace(/\/+$/, '') + '/');
-      }
-    } catch (_) { frontendCheckUrl = null; }
-  }
   const serverRoutePath = path => {
     const match = path.match(/^\/server\/([^/]+)(\/.*)?$/);
     if (!match) return null;
@@ -188,7 +169,8 @@ TRANSPORT_ADAPTER = r"""
     const deviceId = activeDeviceId();
     if (!deviceId) return [input, init];
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);
-    if (url.origin !== location.origin || url.pathname.startsWith('/_mesh/') || url.pathname.startsWith('/server/') || virtualDeviceId(url.pathname)) return [input, init];
+    const httpOrigin = url.origin.replace(/^ws:/, 'http:').replace(/^wss:/, 'https:');
+    if (httpOrigin !== location.origin || url.pathname.startsWith('/_mesh/') || url.pathname.startsWith('/server/') || virtualDeviceId(url.pathname)) return [input, init];
     url.pathname = '/_mesh/device/' + encodeURIComponent(deviceId) + url.pathname;
     if (input instanceof Request) return [new Request(url.href, init ? new Request(input, init) : input), undefined];
     return [url.href, init];
@@ -215,15 +197,23 @@ TRANSPORT_ADAPTER = r"""
       state.devices = Array.isArray(payload.devices) ? payload.devices : [];
       state.defaultDevice = payload.default_device || null;
       renderBar();
-      const devices = state.devices.filter(device => device.online);
-      const primaryId = payload.default_device || (devices[0] && devices[0].device_id);
-      const signature = devices.map(device => `${device.device_id}:${device.name}`).sort().join('|') + '#' + primaryId;
-      if (localStorage.getItem('ocm.native-servers.signature') === signature) return;
+      const devices = (await Promise.all(state.devices.filter(device => device.online).map(async device => {
+        try {
+          const info = await nativeFetch(serverTabUrl(device.device_id) + '/api/info', {
+            credentials: 'same-origin', signal: AbortSignal.timeout(5000)
+          });
+          if (!info.ok || !info.headers.get('content-type')?.includes('application/json')) return null;
+          return String((await info.json()).version).startsWith('2.') ? device : null;
+        } catch (_) { return null; }
+      }))).filter(Boolean);
       const store = readJson('opencode.global.dat:server', { list: [], projects: {}, lastProject: {}, recentlyClosed: {} });
-      store.list = devices.map(device =>
+      // 原生 Server 列表由用户管理，只补充新发现的 V2 入口，不覆盖名称和外部地址。
+      const existing = new Set((store.list || []).map(entry => entry.http?.url?.replace(/\/+$/, '')));
+      const added = devices.filter(device => !existing.has(serverTabUrl(device.device_id))).map(device =>
         ({ type: 'http', displayName: device.name || device.device_id, http: { url: serverTabUrl(device.device_id) } }));
+      if (!added.length) return;
+      store.list = [...(store.list || []), ...added];
       localStorage.setItem('opencode.global.dat:server', JSON.stringify(store));
-      localStorage.setItem('ocm.native-servers.signature', signature);
       location.reload();
     } catch (_) {}
   }
@@ -242,7 +232,7 @@ TRANSPORT_ADAPTER = r"""
       state.streams.delete(id);
       stream.controller.error(err);
     }
-    send({ type: 'cancel', id }).catch(() => {});
+    if (entry) send({ type: 'cancel', id }, entry.channel).catch(() => {});
   }
 
   function failTransport(error) {
@@ -511,9 +501,8 @@ TRANSPORT_ADAPTER = r"""
   }
   window.addEventListener('popstate', reconnectForDevice);
 
-  async function send(message) {
-    // Snapshot the channel so one message cannot split across reconnect sessions.
-    const channel = state.channel;
+  async function send(message, channel = state.channel) {
+    // 调用方在异步读取之前固定通道，设备切换不能改变请求的目标。
     if (!channel || channel.readyState !== 'open') throw new Error('p2p channel unavailable');
     const messageId = ['ws_data', 'ws_close'].includes(message.type) ? makeId() : String(message.id || makeId());
     const payload = enc.encode(JSON.stringify(message.id ? message : { ...message, id: messageId }));
@@ -545,6 +534,7 @@ TRANSPORT_ADAPTER = r"""
   }
 
   async function p2pFetch(input, init = {}) {
+    const channel = state.channel;
     const request = new Request(typeof input === 'string' || input instanceof URL ? new URL(input, location.href) : input, init);
     let { path, query } = requestPath(request);
     const requestedDevice = virtualDeviceId(path) || activeDeviceId();
@@ -558,17 +548,17 @@ TRANSPORT_ADAPTER = r"""
     const accept = (headers.accept || '').toLowerCase();
     if (accept.includes('text/event-stream') || path === '/event' || path === '/global/event' || path === '/api/event' || path.endsWith('/event')) {
       const first = new Promise((resolve, reject) => {
-        const entry = { resolve, reject };
+        const entry = { resolve, reject, channel };
         entry.timer = setTimeout(() => rejectEntry(id, new Error('stream headers timeout')), 30000);
         state.pending.set(id, entry);
       });
-      const stream = new ReadableStream({ start(controller) { state.streams.set(id, { controller }); }, cancel() { state.streams.delete(id); state.pending.delete(id); send({ type: 'cancel', id }).catch(() => {}); } });
+      const stream = new ReadableStream({ start(controller) { state.streams.set(id, { controller }); }, cancel() { state.streams.delete(id); state.pending.delete(id); send({ type: 'cancel', id }, channel).catch(() => {}); } });
       request.signal.addEventListener('abort', () => { rejectEntry(id, new DOMException('Aborted', 'AbortError')); }, { once: true });
       if (request.signal && request.signal.aborted) rejectEntry(id, new DOMException('Aborted', 'AbortError'));
       try {
         await orderedP2PSend(async () => {
           const body = new Uint8Array(await request.arrayBuffer());
-          await send({ type: 'stream_request', id, method: request.method, path, query, headers, body: b64(body) });
+          await send({ type: 'stream_request', id, method: request.method, path, query, headers, body: b64(body) }, channel);
         });
       }
       catch (error) { rejectEntry(id, error); throw error; }
@@ -576,12 +566,12 @@ TRANSPORT_ADAPTER = r"""
       return new Response(stream, { status: meta.status, headers: meta.headers });
     }
     const result = await new Promise((resolve, reject) => {
-      const entry = { resolve, reject };
+      const entry = { resolve, reject, channel };
       entry.timer = setTimeout(() => rejectEntry(id, new Error('request timeout')), 120000);
       state.pending.set(id, entry);
       orderedP2PSend(async () => {
         const body = new Uint8Array(await request.arrayBuffer());
-        await send({ type: 'request', id, method: request.method, path, query, headers, body: b64(body) });
+        await send({ type: 'request', id, method: request.method, path, query, headers, body: b64(body) }, channel);
       }).catch(error => rejectEntry(id, error));
       if (request.signal) request.signal.addEventListener('abort', () => { rejectEntry(id, new DOMException('Aborted', 'AbortError')); }, { once: true });
     });
@@ -599,21 +589,22 @@ TRANSPORT_ADAPTER = r"""
       this.readyState = MeshWebSocket.CONNECTING;
       this.binaryType = 'blob';
       this._listeners = new Map();
+      this._channel = state.channel;
       // Serialize frames so text cannot overtake a queued binary frame.
       this._sendQueue = Promise.resolve();
        this.id = makeId();
       state.sockets.set(this.id, this);
       Promise.resolve(state.ready).then(() => {
         if (this.readyState !== MeshWebSocket.CONNECTING) return;
-        if (!state.channel || state.channel.readyState !== 'open') return this.fail(new Error('P2P unavailable'));
-        send({ type: 'ws_open', id: this.id, path: serverRoutePath(url.pathname) || devicePath(url.pathname), query: url.search.slice(1), headers: {}, protocols: Array.isArray(protocols) ? protocols : (protocols ? [protocols] : []) }).catch(error => this.fail(error));
+        if (!this._channel || this._channel.readyState !== 'open') return this.fail(new Error('P2P unavailable'));
+        send({ type: 'ws_open', id: this.id, path: serverRoutePath(url.pathname) || devicePath(url.pathname), query: url.search.slice(1), headers: {}, protocols: Array.isArray(protocols) ? protocols : (protocols ? [protocols] : []) }, this._channel).catch(error => this.fail(error));
       });
     }
     addEventListener(type, fn) { if (!this._listeners.has(type)) this._listeners.set(type, new Set()); this._listeners.get(type).add(fn); }
     removeEventListener(type, fn) { this._listeners.get(type)?.delete(fn); }
     dispatch(type, event) { this['on' + type]?.(event); for (const fn of this._listeners.get(type) || []) fn.call(this, event); }
     // Expose shared DataChannel backpressure to callers.
-    get bufferedAmount() { return state.channel && state.channel.readyState === 'open' ? state.channel.bufferedAmount : 0; }
+    get bufferedAmount() { return this._channel && this._channel.readyState === 'open' ? this._channel.bufferedAmount : 0; }
     fail(error) { state.sockets.delete(this.id); this.readyState = MeshWebSocket.CLOSED; this.dispatch('error', error); this.dispatch('close', { code: 1011, reason: error.message }); }
     send(data) {
       if (this.readyState !== MeshWebSocket.OPEN) throw new Error('WebSocket is not open');
@@ -626,17 +617,17 @@ TRANSPORT_ADAPTER = r"""
        // Serialize all frames so text cannot overtake a queued binary frame.
        this._sendQueue = this._sendQueue.then(async () => {
          if (typeof data === 'string') {
-           await send({ type: 'ws_data', id: this.id, kind: 'text', data });
+            await send({ type: 'ws_data', id: this.id, kind: 'text', data }, this._channel);
            return;
          }
          const bytes = await toBytes(data);
-         await send({ type: 'ws_data', id: this.id, kind: 'bytes', data: b64(bytes) });
+          await send({ type: 'ws_data', id: this.id, kind: 'bytes', data: b64(bytes) }, this._channel);
        }).catch(error => { this.fail(error); });
     }
     close(code = 1000, reason = '') {
       if (this.readyState === MeshWebSocket.CLOSED) return;
       this.readyState = MeshWebSocket.CLOSING;
-      send({ type: 'ws_close', id: this.id, code, reason }).catch(() => {});
+      send({ type: 'ws_close', id: this.id, code, reason }, this._channel).catch(() => {});
     }
   }
 
@@ -646,7 +637,7 @@ TRANSPORT_ADAPTER = r"""
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', renderBar, { once: true });
   else renderBar();
   let relayTick = 0;
-  setInterval(() => { ensureFrontendForDevice(); reconnectForDevice(); renderBar(); if (++relayTick % 5 === 0) measureRelayRtt(); }, 2000);
+  setInterval(() => { reconnectForDevice(); renderBar(); if (++relayTick % 5 === 0) measureRelayRtt(); }, 2000);
   setTimeout(measureRelayRtt, 1500);
   syncNativeServers();
 
@@ -663,154 +654,12 @@ TRANSPORT_ADAPTER = r"""
   };
   window.WebSocket = class extends MeshWebSocket {
     constructor(input, protocols) {
-      const url = new URL(input, location.href);
+      const [scopedInput] = scopeNativeRequest(input);
+      const url = new URL(scopedInput, location.href);
       if (url.host !== location.host || (virtualDeviceId(url.pathname) && virtualDeviceId(url.pathname) !== state.manifest?.device_id) || !state.channel || state.channel.readyState !== 'open') {
-        const [scopedInput] = scopeNativeRequest(input);
         return new nativeWebSocket(scopedInput, protocols);
       }
-      super(input, protocols);
-    }
-  };
-  const makeEventTarget = () => {
-    const target = { _listeners: new Map() };
-    target.addEventListener = (type, fn) => { if (!target._listeners.has(type)) target._listeners.set(type, new Set()); target._listeners.get(type).add(fn); };
-    target.removeEventListener = (type, fn) => { target._listeners.get(type)?.delete(fn); };
-    target.dispatch = (type, event = {}) => { target['on' + type]?.(event); for (const fn of target._listeners.get(type) || []) fn.call(target, event); };
-    return target;
-  };
-  class MeshXMLHttpRequest {
-    static UNSENT = 0; static OPENED = 1; static HEADERS_RECEIVED = 2; static LOADING = 3; static DONE = 4;
-    constructor() {
-      this.readyState = MeshXMLHttpRequest.UNSENT;
-      this.status = 0; this.statusText = ''; this.response = null; this.responseText = '';
-      this.responseType = ''; this.responseURL = ''; this.timeout = 0;
-      this.upload = makeEventTarget();
-      this._listeners = new Map(); this._headers = {}; this._controller = null; this._aborted = false; this._timedOut = false;
-    }
-    addEventListener(type, fn) { if (!this._listeners.has(type)) this._listeners.set(type, new Set()); this._listeners.get(type).add(fn); }
-    removeEventListener(type, fn) { this._listeners.get(type)?.delete(fn); }
-    dispatch(type, event = {}) { this['on' + type]?.(event); for (const fn of this._listeners.get(type) || []) fn.call(this, event); }
-    open(method, url, async = true) {
-      if (async === false) throw new Error('synchronous XMLHttpRequest is not supported by Mesh');
-      this.method = method; this.url = new URL(url, location.href).href; this.readyState = MeshXMLHttpRequest.OPENED; this.dispatch('readystatechange');
-    }
-    setRequestHeader(name, value) { this._headers[name] = value; }
-    getAllResponseHeaders() { return this._responseHeaders || ''; }
-    getResponseHeader(name) { return this._responseHeadersMap?.get(name.toLowerCase()) || null; }
-    abort() { this._aborted = true; this._controller?.abort(); if (this.readyState !== MeshXMLHttpRequest.DONE) { this.readyState = MeshXMLHttpRequest.DONE; this.dispatch('abort'); this.dispatch('loadend'); } }
-    async send(body = null) {
-      if (this.readyState !== MeshXMLHttpRequest.OPENED) throw new Error('InvalidStateError');
-      this._controller = new AbortController();
-      this._timedOut = false;
-      let timeoutTimer = null;
-      if (this.timeout > 0) timeoutTimer = setTimeout(() => { this._timedOut = true; this._controller.abort(); }, this.timeout);
-      try {
-        const response = await window.fetch(this.url, { method: this.method, headers: this._headers, body, credentials: 'same-origin', signal: this._controller.signal });
-        if (this._aborted) return;
-        this.status = response.status; this.statusText = response.statusText; this.responseURL = response.url;
-        this._responseHeadersMap = new Headers(response.headers);
-        this._responseHeaders = [...this._responseHeadersMap].map(([k, v]) => `${k}: ${v}\r\n`).join('');
-        this.readyState = MeshXMLHttpRequest.HEADERS_RECEIVED; this.dispatch('readystatechange');
-        const total = Number(response.headers.get('content-length')) || 0;
-        const chunks = []; let loaded = 0;
-        if (response.body) {
-          this.readyState = MeshXMLHttpRequest.LOADING; this.dispatch('readystatechange');
-          const reader = response.body.getReader();
-          while (true) {
-            const item = await reader.read(); if (item.done) break;
-            chunks.push(item.value); loaded += item.value.length;
-            this.dispatch('progress', { type: 'progress', lengthComputable: total > 0, loaded, total, target: this });
-          }
-        }
-        if (this._aborted) return;
-        const bytes = new Uint8Array(loaded);
-        let offset = 0; for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-        if (this.responseType === 'arraybuffer') this.response = bytes.buffer;
-        else if (this.responseType === 'blob') this.response = new Blob([bytes], { type: response.headers.get('content-type') || '' });
-        else if (this.responseType === 'json') this.response = JSON.parse(dec.decode(bytes));
-        else { this.responseText = dec.decode(bytes); this.response = this.responseText; }
-        this.readyState = MeshXMLHttpRequest.DONE; this.dispatch('readystatechange'); this.dispatch('load', { type: 'load', target: this }); this.dispatch('loadend', { type: 'loadend', target: this });
-      } catch (error) {
-        if (this._aborted) return;
-        this.readyState = MeshXMLHttpRequest.DONE; this.dispatch('readystatechange');
-        if (this._timedOut) this.dispatch('timeout', { type: 'timeout', target: this });
-        else this.dispatch('error', error);
-        this.dispatch('loadend', { type: 'loadend', target: this });
-      } finally {
-        if (timeoutTimer) clearTimeout(timeoutTimer);
-      }
-    }
-  }
-  window.XMLHttpRequest = MeshXMLHttpRequest;
-  class MeshEventSource {
-    static CONNECTING = 0; static OPEN = 1; static CLOSED = 2;
-    constructor(input, options) {
-      this.url = new URL(input, location.href).href;
-      this.withCredentials = !!(options && options.withCredentials);
-      this.readyState = MeshEventSource.CONNECTING;
-      this._listeners = new Map();
-      this._controller = new AbortController();
-      this._retryDelay = 1000;
-      this.lastEventId = '';
-      this._retryTimer = null;
-      this._idleTimedOut = false;
-      this.start();
-    }
-    addEventListener(type, fn) { if (!this._listeners.has(type)) this._listeners.set(type, new Set()); this._listeners.get(type).add(fn); }
-    removeEventListener(type, fn) { this._listeners.get(type)?.delete(fn); }
-    dispatch(type, event) { this['on' + type]?.(event); for (const fn of this._listeners.get(type) || []) fn.call(this, event); }
-    async start() {
-      while (this.readyState !== MeshEventSource.CLOSED) {
-        try {
-          this._controller = new AbortController();
-          const headers = { accept: 'text/event-stream' };
-          if (this.lastEventId) headers['Last-Event-ID'] = this.lastEventId;
-          const response = await window.fetch(this.url, { headers, signal: this._controller.signal });
-          if (!response.ok) {
-            const error = new Error('SSE status ' + response.status);
-            if (response.status === 401 || response.status === 403) throw Object.assign(error, { permanent: true });
-            throw error;
-          }
-          this.readyState = MeshEventSource.OPEN; this._retryDelay = 1000; this.dispatch('open', { type: 'open' });
-          const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
-          // Abort a half-dead stream whose read remains pending without any bytes.
-          let idleTimer = setTimeout(() => { this._idleTimedOut = true; this._controller.abort(); }, SSE_IDLE_MS);
-          const armIdle = () => { clearTimeout(idleTimer); idleTimer = setTimeout(() => { this._idleTimedOut = true; this._controller.abort(); }, SSE_IDLE_MS); };
-          try {
-            while (true) {
-              const item = await reader.read(); if (item.done) break;
-              armIdle();
-              buffer += decoder.decode(item.value, { stream: true });
-              const records = buffer.split(/\r?\n\r?\n/); buffer = records.pop() || '';
-              for (const record of records) {
-                const lines = record.split(/\r?\n/); let event = 'message', id = '', data = [];
-                for (const line of lines) { if (line.startsWith('event:')) event = line.slice(6).trim(); else if (line.startsWith('id:')) id = line.slice(3).trim(); else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, '')); }
-                if (id) this.lastEventId = id;
-                if (data.length) this.dispatch(event, { type: event, data: data.join('\n'), lastEventId: this.lastEventId, origin: location.origin });
-              }
-            }
-          } finally { clearTimeout(idleTimer); }
-          throw new Error('SSE closed');
-        } catch (error) {
-          const idleTimedOut = this._idleTimedOut; this._idleTimedOut = false;
-          if (this.readyState === MeshEventSource.CLOSED) return;
-          if (error.name === 'AbortError' && !idleTimedOut) return;
-          this.readyState = MeshEventSource.CONNECTING;
-          this.dispatch('error', error);
-          if (error.permanent) { this.readyState = MeshEventSource.CLOSED; return; }
-          await new Promise(resolve => { this._retryTimer = setTimeout(resolve, this._retryDelay); });
-          this._retryTimer = null;
-          this._retryDelay = Math.min(this._retryDelay * 2, 30000);
-        }
-      }
-    }
-    close() { this.readyState = MeshEventSource.CLOSED; if (this._retryTimer) clearTimeout(this._retryTimer); this._controller.abort(); }
-  }
-  window.EventSource = class extends MeshEventSource {
-    constructor(input, options) {
-      const url = new URL(input, location.href);
-      if (url.host !== location.host) return new nativeEventSource(input, options);
-      super(input, options);
+      super(scopedInput, protocols);
     }
   };
   function resetRttAfterBackground() {

@@ -1903,14 +1903,12 @@ def test_mesh_adapter_is_injected_into_v2_html():
 def test_adapter_checks_selected_server_frontend_before_switching_transport():
     """A V2 page must navigate to a selected V1 device instead of mixing SDKs."""
     assert "selectedServerUrl()" in TRANSPORT_ADAPTER
-    assert "ensureFrontendForDevice" in TRANSPORT_ADAPTER
-    assert "/_assets/" in TRANSPORT_ADAPTER
+    assert "ensureFrontendForDevice" not in TRANSPORT_ADAPTER
 
 
 def test_adapter_does_not_redirect_v2_device_into_mesh_route():
     """V2 client routing must remain at the root; only V1 needs a page switch."""
-    assert "const targetIsV1 = !html.includes('/_assets/') && html.includes('/assets/');" in TRANSPORT_ADAPTER
-    assert "if (targetIsV1 && deviceId && deviceId !== currentDeviceId())" in TRANSPORT_ADAPTER
+    assert "location.replace" not in TRANSPORT_ADAPTER
 
 
 def test_mesh_bar_injection_is_idempotent_with_version():
