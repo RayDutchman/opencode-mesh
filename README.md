@@ -15,6 +15,8 @@
 - **Gateway**：部署在有公网地址的服务器上，负责浏览器 HTTP Basic Auth、设备注册与路由、以及 Relay 中继。
 - **Agent**：部署在每台运行 OpenCode 的设备上，主动连接 Gateway，并代理本机 OpenCode。它只对外连接，不监听任何端口。
 
+更完整的工作原理、组件边界、数据流和文件职责见 [`docs/architecture.md`](docs/architecture.md)。
+
 ## 快速开始
 
 ### 第 1 步：部署 Gateway（公网服务器）
@@ -32,7 +34,7 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 
 > ⚠️ **enroll_token 是 Gateway 的“加入密钥”，请把它保存下来**。下一步在每台设备上安装 Agent 时都要填这个值。它相当于整个 Mesh 的准入凭据，不要外泄。
 
-安装完成后脚本会直接打印一段**可粘贴到设备执行的 Agent 安装命令**（已包含 Gateway 地址和 enroll_token），照抄即可。若安装时填写了 Gateway 公网地址（或设置 `MESH_PUBLIC_URL`），命令里就是真实地址，否则是占位符。
+安装完成后脚本会打印 Agent 安装步骤和 Gateway 地址。脚本不会把 enroll token 拼进可执行命令；请在 Agent 安装提示中粘贴保存的 token。
 
 Gateway 默认只监听 `127.0.0.1:18080`，请用反向代理为它提供 HTTPS（可参考 `deploy/Caddyfile.example`）。**务必使用 HTTPS**：Agent 默认拒绝连接非 `https://` 的 Gateway（内网测试可在 Agent 配置中设置 `allow_insecure_gateway`）。
 
@@ -82,9 +84,12 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 
 # 只卸载 Gateway
 curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/uninstall.sh | bash -s -- gateway
+
+# 同时卸载 Agent 和 Gateway
+curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/uninstall.sh | bash -s -- all
 ```
 
-卸载会停止并删除 systemd 服务与安装目录；Agent 卸载时还会通知 Gateway 注销设备。若想保留设备身份（`data/` 目录），可在提示时选择 `y`，或用 `MESH_KEEP_DATA=y` 跳过交互。
+卸载必须显式指定 `agent`、`gateway` 或 `all`。卸载会停止并删除对应 systemd 服务与安装文件；Agent 卸载时还会通知 Gateway 注销设备。若想保留设备身份（`data/` 目录），可在提示时选择 `y`，或用 `MESH_KEEP_DATA=y` 跳过交互。
 
 ## 安装位置与平台支持
 
@@ -99,3 +104,10 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 - `agent.json`：`gateway_url`、`enroll_token`、`opencode_url`、可选的 `opencode_basic_auth`。
 
 `enroll_token` 属于 Gateway，同一 Gateway 上的所有 Agent 共用同一个值。`device_id` 与 `agent_token` 由系统自动生成/签发，无需手工配置。
+
+## 更多文档
+
+- [`docs/architecture.md`](docs/architecture.md)：原理、架构、数据流和文件结构说明。
+- [`docs/protocol.md`](docs/protocol.md)：控制消息与 P2P 分片协议规格。
+- [`docs/opencode-web-capability-matrix.md`](docs/opencode-web-capability-matrix.md)：OpenCode Web 路径能力与验收矩阵。
+- [`docs/opencode-web-route-catalog.json`](docs/opencode-web-route-catalog.json)：机器可读的 OpenCode 路由目录。

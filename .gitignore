@@ -5,3 +5,19 @@ data/
 *.local.json
 .cache-opencode.js
 交接给WSL-OpenCode.md
+
+# Python 构建与缓存产物
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+
+# 子 agent 驱动开发的临时产物
+.superpowers/
+
+# 编辑器与系统文件
+.DS_Store
+.idea/
+.vscode/

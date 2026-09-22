@@ -2,17 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 在保持 `https://oc.252327.xyz:8443/` 作为统一访问入口的前提下，完整兼容当前 OpenCode Web 实际使用的数据面，并按局域网直连、P2P、VPS Relay 的顺序选择最快可用路径。
+**Goal:** 在保持可配置公网 Gateway 作为统一访问入口的前提下，完整兼容当前 OpenCode Web 实际使用的数据面，并按局域网直连、P2P、VPS Relay 的顺序选择最快可用路径。
 
-**Architecture:** VPS 提供静态资源、认证、设备发现、路由协商和最后的 Relay fallback；WSL Agent 连接真实 `http://10.0.0.101:40960`。浏览器运行时通过统一 transport adapter 路由 HTTP、SSE、PTY WebSocket 和普通 WebSocket，LAN 优先，P2P 次之，Relay 最后。OpenCode 的原始 HTTP、SSE、WebSocket、认证头、事件 ID、PTY cursor/ticket 和取消语义保持不变。
+**Architecture:** VPS 提供静态资源、认证、设备发现、路由协商和最后的 Relay fallback；Agent 连接设备本机 OpenCode。浏览器运行时通过统一 transport adapter 路由 HTTP、SSE、PTY WebSocket 和普通 WebSocket，LAN 优先，P2P 次之，Relay 最后。OpenCode 的原始 HTTP、SSE、WebSocket、认证头、事件 ID、PTY cursor/ticket 和取消语义保持不变。
 
 **Tech Stack:** Python 3、FastAPI/Uvicorn、httpx、websockets、原生 OpenCode Web UI、浏览器 Service Worker/Fetch/EventSource/WebSocket 适配、WebRTC DataChannel（P2P 阶段）。
 
 ## Global Constraints
 
-- 真实 OpenCode 服务固定为 `http://10.0.0.101:40960`，不得重启、修改或把它当作可中断的测试服务。
+- 真实 OpenCode 服务由设备本地配置提供，验收时不得重启、修改或把它当作可中断的测试服务。
 - 不修改 VPS 的 Xray、Hysteria、FRP、Lucky、防火墙、网络配置，不重启 VPS。
-- Gateway 的临时登录密码为 `password`，所有链路验收通过后再修改正式密码。
+- Gateway 仅允许在受控环境使用临时凭据；公开文档不得记录真实密码。
 - 不引入模拟 OpenCode 作为验收依据；每项功能必须访问真实 OpenCode。
 - 保留 HTTP/1.1、SSE、WebSocket、PTY 原始语义，不将所有流统一粗暴转换成普通 JSON 响应。
 - 每项能力必须记录 LAN、P2P、Relay 三种路径的状态；P2P 未可用时必须自动回退 Relay。
@@ -130,7 +130,7 @@ Manifest 必须声明：协议版本、设备 ID、LAN 候选、P2P signaling �
 
 - [ ] **Step 1: 选择并验证 WSL mirrored LAN address**
 
-只读确认浏览器所在 LAN 能访问 `10.0.0.101`；不得绑定或修改真实 OpenCode 的 `40960` 监听配置。
+只读确认浏览器所在 LAN 能访问设备候选地址；不得绑定或修改真实 OpenCode 的监听配置。
 
 - [ ] **Step 2: 提供同源可验证入口**
 
