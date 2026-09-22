@@ -136,7 +136,22 @@ TRANSPORT_ADAPTER = r"""
       return virtualDeviceId(server.pathname);
     } catch (_) { return null; }
   };
-  const activeDeviceId = () => currentDeviceId() || state.manifest?.device_id || state.defaultDevice;
+  const selectedServerDeviceId = () => {
+    try {
+      const servers = readJson('opencode.global.dat:server', { list: [] }).list || [];
+      const layout = readJson('opencode.global.dat:layout', {});
+      const selected = layout.home?.selection?.server;
+      if (!selected) return null;
+      const match = servers.find(entry => {
+        const url = entry?.http?.url;
+        if (!url) return false;
+        const normalized = String(url).replace(/\/+$/, '');
+        return selected === url || selected === normalized || selected.endsWith(normalized);
+      });
+      return match ? virtualDeviceId(new URL(match.http.url, location.href).pathname) : null;
+    } catch (_) { return null; }
+  };
+  const activeDeviceId = () => currentDeviceId() || selectedServerDeviceId() || state.manifest?.device_id || state.defaultDevice;
   const serverRoutePath = path => {
     const match = path.match(/^\/server\/([^/]+)(\/.*)?$/);
     if (!match) return null;
@@ -452,7 +467,7 @@ TRANSPORT_ADAPTER = r"""
   }
 
   async function reconnectForDevice() {
-    const deviceId = currentDeviceId();
+    const deviceId = activeDeviceId();
     if (deviceId === state.routeDeviceId) return;
     state.generation += 1;
     if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
@@ -510,7 +525,7 @@ TRANSPORT_ADAPTER = r"""
     const request = new Request(typeof input === 'string' || input instanceof URL ? new URL(input, location.href) : input, init);
     let { path, query } = requestPath(request);
     const requestedDevice = virtualDeviceId(path) || activeDeviceId();
-    if (requestedDevice && requestedDevice !== state.manifest?.device_id) throw new Error('different device uses Relay');
+    if (requestedDevice && requestedDevice !== state.manifest?.device_id) return nativeFetch(...scopeNativeRequest(input, init));
     path = serverRoutePath(path) || devicePath(path);
     const id = makeId();
     const sizeProbe = new Uint8Array(await request.clone().arrayBuffer());
@@ -602,13 +617,13 @@ TRANSPORT_ADAPTER = r"""
     }
   }
 
-  state.routeDeviceId = currentDeviceId();
+  state.routeDeviceId = activeDeviceId();
   state.ready = connectP2P(state.routeDeviceId).catch(() => { scheduleReconnect(); return null; });
   window.__ocmTransport = state;
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', renderBar, { once: true });
   else renderBar();
   let relayTick = 0;
-  setInterval(() => { renderBar(); if (++relayTick % 5 === 0) measureRelayRtt(); }, 2000);
+  setInterval(() => { reconnectForDevice(); renderBar(); if (++relayTick % 5 === 0) measureRelayRtt(); }, 2000);
   setTimeout(measureRelayRtt, 1500);
   syncNativeServers();
 

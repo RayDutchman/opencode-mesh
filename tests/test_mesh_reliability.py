@@ -379,8 +379,15 @@ def test_adapter_scopes_servers_and_relay_fallback_to_active_device():
 
 def test_adapter_uses_manifest_device_for_root_relay_requests():
     """A root Server page must bind fallback API calls to its selected device."""
-    assert "const activeDeviceId = () => currentDeviceId() || state.manifest?.device_id || state.defaultDevice" in TRANSPORT_ADAPTER
+    assert "const activeDeviceId = () => currentDeviceId() || selectedServerDeviceId() || state.manifest?.device_id || state.defaultDevice" in TRANSPORT_ADAPTER
     assert "const deviceId = activeDeviceId();" in TRANSPORT_ADAPTER
+
+
+def test_adapter_resolves_v2_selected_server_before_manifest():
+    """V2's selected Server must override the page's P2P manifest device."""
+    assert "selectedServerDeviceId()" in TRANSPORT_ADAPTER
+    assert "const activeDeviceId = () => currentDeviceId() || selectedServerDeviceId() || state.manifest?.device_id || state.defaultDevice" in TRANSPORT_ADAPTER
+    assert "different device uses Relay" not in TRANSPORT_ADAPTER
 
 
 def test_agent_accepts_consecutive_ws_data_frames_for_one_socket():
