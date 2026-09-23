@@ -1,11 +1,12 @@
-"""V2 bootstrap adapter: an isolated resource namespace separates the native cache; only the verified entry contract is replaced."""
+"""V2 frontend adapter: isolate cached assets and adapt verified bootstrap and preload contracts."""
 
 import re
 import base64
+import json
 from urllib.parse import quote
 
 
-ASSET_ROOT = '/_mesh/ui/1/'
+ASSET_ROOT = '/_mesh/ui/2/'
 
 
 def legacy_server_redirect(path: str, origin: str, device_id: str | None) -> str | None:
@@ -30,13 +31,21 @@ def asset_prefix(device_id: str) -> str:
 
 
 def parse_asset_route(path: str) -> tuple[str, str]:
-    match = re.fullmatch(r'/_mesh/ui/1/([^/]+)(/_assets/.+)', path)
+    match = re.fullmatch(re.escape(ASSET_ROOT) + r'([^/]+)(/_assets/.+)', path)
     if not match or '..' in match[2].split('/'):
         raise ValueError('Invalid frontend asset route')
     return match[1], match[2]
 
 
-def adapt_entry(path: str, body: bytes) -> bytes:
+def adapt_entry(path: str, body: bytes, device_id: str | None = None) -> bytes:
+    if re.fullmatch(r'/_assets/preload-helper-[\w-]+\.js', path):
+        # Verified Vite helpers prefix dependency-table entries with the origin root.
+        # Bind that prefix to the source device, independently of the active Server.
+        prefix = rb'function\(([\w$]+)\)\{return([\x22\x27`])/\2\+\1\}'
+        if not device_id or len(re.findall(prefix, body)) != 1:
+            raise ValueError('Unsupported OpenCode preload contract')
+        root = json.dumps(asset_prefix(device_id) + '/').encode()
+        return re.sub(prefix, lambda m: b'function(' + m[1] + b'){return ' + root + b'+' + m[1] + b'}', body)
     if not re.fullmatch(r'/_assets/index-[\w-]+\.js', path):
         return body
     # The getter must be unique in a real V2.0.6 bundle; if a newer build changes

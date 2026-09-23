@@ -783,7 +783,7 @@ class Gateway:
                 headers['cache-control'] = 'no-store'
             if frontend_asset and int(result.get('status', 502)) == 200:
                 try:
-                    body = adapt_entry('/' + path, body)
+                    body = adapt_entry('/' + path, body, device_id)
                 except ValueError as exc:
                     return JSONResponse({'error': str(exc)}, status_code=502)
                 # The new namespace isolates the old versions' immutable cache; the entry adapter applies only within that namespace.

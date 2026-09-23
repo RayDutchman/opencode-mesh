@@ -255,7 +255,7 @@ Mesh 生成的协议/上游错误均声明 JSON 类型。流式首帧前失败�
 
 设备发现通过 `/_mesh/devices` 获取设备，再探测在线设备的 `/api/info`。JSON 响应且版本以 `2.` 开头的设备会被补充到原生 Server 列表。配置中的主设备身份在暂时离线/探测超时时仍保留，不改指另一台设备。按 URL 去重，不覆盖用户名称、外部地址或其他存储字段。
 
-V2.0.6 原生入口硬编码 `location.origin`，没有外部启动配置钩子。`src/frontend.py` 因而只在版本隔离的 `/_mesh/ui/1/{device_id}/_assets/...` 资源命名空间中，精确替换已验证的唯一入口 getter，并让入口模块等待 `window.__ocmBootstrap.ready`。新命名空间防止复用旧 immutable 资源。若入口契约变化则返回明确错误，而不是猜测替换其他 JavaScript。
+V2.0.6 原生入口硬编码 `location.origin`，没有外部启动配置钩子。`src/frontend.py` 因而只在版本隔离的 `/_mesh/ui/2/{device_id}/_assets/...` 资源命名空间中，精确替换已验证的唯一入口 getter，并让入口模块等待 `window.__ocmBootstrap.ready`。预加载器还会将依赖表中的相对资源拼为根路径；适配器将已验证的 `preload-helper-*.js` 路径构造函数绑定到该资源的来源设备，避免 CSS 和懒加载模块落到默认上游。资源归属不随当前 Server 选择改变。新命名空间防止复用旧 immutable 资源。若入口或预加载器契约变化则返回明确错误，而不是猜测替换其他 JavaScript。
 
 发现与存储迁移在原生应用启动前完成，不再迟到刷新用户正在编辑的页面。仅移除同源 origin 的重复 Server 列表项，迁移其默认选择、首页选择和已知 PWA 旧路由；明确设备条目优先保留用户改名。原生 canonical Server 改为明确设备后，既有 `local` 项目状态保留给原生迁移逻辑处理；不清空 localStorage 或数据库。
 

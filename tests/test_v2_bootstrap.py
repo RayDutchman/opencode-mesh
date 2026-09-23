@@ -11,6 +11,26 @@ from src.main import Gateway
 from src.static_adapter import TRANSPORT_ADAPTER
 
 
+@pytest.mark.parametrize('quote', ['"', "'", '`'])
+@pytest.mark.parametrize('dependency', ['panel.css', 'panel.js'])
+def test_preload_dependencies_stay_with_their_source_device(quote, dependency):
+    source = ('var asset=function(e){return'+quote+'/'+quote+'+e};').encode()
+    adapted = adapt_entry('/_assets/preload-helper-test.js', source, 'device-b')
+    script = adapted.decode() + f'\nconsole.log(asset("_assets/{dependency}"));'
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == asset_prefix('device-b') + '/_assets/' + dependency
+    assert adapt_entry('/_assets/ordinary.js', source, 'device-b') == source
+
+
+@pytest.mark.parametrize('source', [
+    b'unknown shape',
+    b'var a=function(e){return`/`+e},b=function(e){return`/`+e};',
+])
+def test_unknown_preload_contract_fails_explicitly(source):
+    with pytest.raises(ValueError, match='preload'):
+        adapt_entry('/_assets/preload-helper-test.js', source, 'device-b')
+
+
 def test_asset_namespace_preserves_device_and_rejects_api():
     prefix = asset_prefix('device-a')
     assert parse_asset_route(prefix + '/_assets/index-a.js') == ('device-a', '/_assets/index-a.js')
@@ -43,6 +63,8 @@ def test_gateway_serves_adapted_assets_and_rejects_implicit_api(tmp_path):
             paths.append(item['path'])
             if item['path'].startswith('/_assets/'):
                 body = b'function a(){return location.origin}currentServerUrl;defaultServerUrl;'
+                if '/preload-helper-' in item['path']:
+                    body = b'var asset=function(e){return`/`+e};'
                 mime = 'text/javascript'
             else:
                 body = b'<html><head><script type="module" src="/_assets/index-test.js"></script></head></html>'
@@ -66,6 +88,9 @@ def test_gateway_serves_adapted_assets_and_rejects_implicit_api(tmp_path):
             assert response.status_code == 200
             assert response.text.startswith('await window.__ocmBootstrap.ready;')
             assert paths[-1] == '/_assets/index-test.js'
+            response = await client.get(asset_prefix('device-a') + '/_assets/preload-helper-test.js')
+            assert response.status_code == 200
+            assert asset_prefix('device-a') + '/' in response.text
     asyncio.run(scenario())
 
 
