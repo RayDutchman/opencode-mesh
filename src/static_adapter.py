@@ -99,8 +99,9 @@ TRANSPORT_ADAPTER = r"""
   async function measureRelayRtt() {
     if (state.channel && state.channel.readyState === 'open') return;
     if (document.hidden) return;
-    const deviceId = currentDeviceId();
-    const base = deviceId ? '/_mesh/device/' + encodeURIComponent(deviceId) : '';
+    const deviceId = activeDeviceId();
+    if (!deviceId) return;
+    const base = '/_mesh/device/' + encodeURIComponent(deviceId);
     const started = Date.now();
     try {
       const response = await nativeFetch(base + '/api/info', { credentials: 'same-origin', cache: 'no-store' });

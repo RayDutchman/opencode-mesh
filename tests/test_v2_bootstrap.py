@@ -151,3 +151,22 @@ def test_bootstrap_retries_failed_discovery_before_starting_ui():
     '''
     result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
+
+
+def test_home_relay_measurement_never_probes_gateway_as_server():
+    function = 'async function measureRelayRtt' + TRANSPORT_ADAPTER.split('async function measureRelayRtt', 1)[1].split('  function renderBar', 1)[0]
+    script = r'''
+    const assert=require('node:assert/strict');
+    const state={},document={hidden:false},RTT_MAX_MS=30000;
+    let device=null;const currentDeviceId=()=>null,activeDeviceId=()=>device;
+    const urls=[],nativeFetch=async url=>{urls.push(url);return {ok:true}};
+    const renderBar=()=>{};
+    ''' + function + r'''
+    (async()=>{
+      await measureRelayRtt();assert.deepEqual(urls,[]);
+      device='ehang';await measureRelayRtt();
+      assert.deepEqual(urls,['/_mesh/device/ehang/api/info']);
+    })().catch(error=>{console.error(error);process.exitCode=1});
+    '''
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
