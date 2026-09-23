@@ -1,15 +1,15 @@
-"""install.sh / uninstall.sh 同机多实例行为测试。
+"""install.sh / uninstall.sh multi-instance behavior tests.
 
-契约（docs/superpowers/specs/2026-09-23-multi-agent-design.md 与用户确认）：
-- 所有 Agent 共享人工配置 config/agents.json：顶层公共字段 + agents 映射按实例。
-- 配置不写 state_file，身份由程序按安装根目录与实例名派生（默认 agent-state.json，具名 agent-state-<name>.json）。
-- 默认服务 opencode-mesh-agent.service（--instance default），具名 opencode-mesh-agent@<name>.service。
-- 安装只合并指定实例键，保留其他实例与未知顶层字段；已有共享代码不覆盖；MESH_INSTALL_ONLY=1 不启用/启动。
-- 检测到旧式单 Agent 配置（agent.json / agent.local.json / agent-*.json）时显式拒绝，不默默覆盖。
-- 单实例卸载只移除该实例配置键与独立 unit，保留共享目录、其他实例与自动身份状态。
-- 全部通过临时目录与 mock 命令验证，不真实部署。
+Contract (docs/superpowers/specs/2026-09-23-multi-agent-design.md, confirmed with the user):
+- All agents share the manual config/agents.json: top-level common fields + per-instance agents mapping.
+- Config does not write state_file; identity is derived by the program from the install root and instance name (default agent-state.json, named agent-state-<name>.json).
+- Default service opencode-mesh-agent.service (--instance default), named opencode-mesh-agent@<name>.service.
+- Install only merges the given instance keys, keeping other instances and unknown top-level fields; existing shared code is not overwritten; MESH_INSTALL_ONLY=1 does not enable/start.
+- Legacy single-agent configs (agent.json / agent.local.json / agent-*.json) are explicitly rejected, never silently overwritten.
+- Single-instance uninstall removes only that instance's config keys and standalone unit, keeping shared directories, other instances and auto identity state.
+- Everything is verified through temp directories and mock commands, no real deployment.
 
-运行：.venv/bin/python -m pytest tests/test_instance_install.py -q
+Run: .venv/bin/python -m pytest tests/test_instance_install.py -q
 """
 
 import json
@@ -46,7 +46,7 @@ printf '%s\\n' "$*" >> "${FAKE_CURL_LOG:?}"
 exit 0
 """
 
-# 临时文件保存远端脚本/数据，由 mock ssh 就地执行（模拟远端文件系统）。
+# Temp files hold the remote script/data, executed in place by the mock ssh (simulating the remote filesystem).
 FAKE_SSH = """#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' "$*" >> "${FAKE_SSH_LOG:?}"
@@ -55,7 +55,7 @@ shift
 exec bash -c "$*"
 """
 
-# venv 内 python stub：记录 pip 调用，回答版本查询，其余成功退出。
+# Python stub inside the venv: logs pip calls, answers version queries, exits success otherwise.
 STUB_PY = f"""#!{REAL_PY}
 import os, sys
 if sys.argv[1:3] == ["-m", "pip"]:
@@ -70,7 +70,7 @@ if sys.argv[1:2] == ["-c"] and "src.__version__" in sys.argv[1]:
 sys.exit(0)
 """
 
-# PATH 中的 python3：拦截 venv/pip/版本查询，其余透传到真实解释器（含 heredoc JSON 生成）。
+# python3 on PATH: intercepts venv/pip/version queries, passes everything else through to the real interpreter (including heredoc JSON generation).
 FAKE_PYTHON = f"""#!{REAL_PY}
 import os, sys
 
@@ -104,7 +104,7 @@ main()
 
 
 def make_fakebin(tmp_path):
-    """构造 fake 命令目录，返回 (fakebin, logs 字典)。"""
+    """Build the fake command directory, returning (fakebin, logs dict)."""
     fakebin = tmp_path / "fakebin"
     fakebin.mkdir()
     logs = {
@@ -155,7 +155,7 @@ def base_env(tmp_path, fakebin, logs, **extra):
 
 
 def make_source(tmp_path):
-    """构造 MESH_SOURCE_DIR / tar 打包用的伪源码仓库。"""
+    """Build a fake source repo used for MESH_SOURCE_DIR / tar packaging."""
     src = tmp_path / "mesh-src"
     (src / "src").mkdir(parents=True)
     (src / "src" / "main.py").write_text("placeholder\n")
@@ -169,7 +169,7 @@ def make_source(tmp_path):
 
 
 def seed_shared_code(install_dir):
-    """在既有安装目录铺共享代码（安装/部署不得覆盖它们）。"""
+    """Seed shared code in an existing install dir (install/deploy must not overwrite it)."""
     (install_dir / "src").mkdir(parents=True, exist_ok=True)
     (install_dir / "src" / "SENTINEL").write_text("keep-me\n")
     (install_dir / "scripts").mkdir(exist_ok=True)
@@ -213,7 +213,7 @@ def agent_env(**extra):
 
 
 def test_install_named_keeps_shared_code_and_merges_config(tmp_path):
-    """具名安装：保留共享源码/venv，只更新 agents[beta]，保留其他实例与未知顶层字段，仅安装不启用。"""
+    """Named install: keep shared source/venv, only update agents[beta], preserve other instances and unknown top-level fields, install only without enabling."""
     fakebin, logs = make_fakebin(tmp_path)
     source = make_source(tmp_path)
     inst = tmp_path / "inst"
@@ -242,17 +242,17 @@ def test_install_named_keeps_shared_code_and_merges_config(tmp_path):
     assert agents["agents"]["alpha"]["opencode_url"] == "http://127.0.0.1:4097"
     assert agents["agents"]["beta"]["device_name"] == "Device Beta"
     assert agents["agents"]["beta"]["opencode_url"] == "http://127.0.0.1:4096"
-    # 配置不写身份路径
+    # config must not write the identity path
     assert "state_file" not in agents and "state_file" not in agents["agents"]["beta"]
 
     unit = unit_dir(tmp_path) / "opencode-mesh-agent@beta.service"
     assert unit.exists()
     assert "--config" in unit.read_text() and "--instance beta" in unit.read_text()
 
-    # 共享代码未被覆盖
+    # shared code must not be overwritten
     assert (inst / "src" / "SENTINEL").read_text() == "keep-me\n"
     assert (inst / ".venv" / "bin" / "python").read_text() == STUB_PY
-    # 仅安装：daemon-reload 执行，不 enable/start/restart，不启用 linger
+    # install only: daemon-reload runs, no enable/start/restart, no linger
     systemctl_log = logs["systemctl"].read_text()
     assert "daemon-reload" in systemctl_log
     assert "enable" not in systemctl_log and "start" not in systemctl_log
@@ -260,7 +260,7 @@ def test_install_named_keeps_shared_code_and_merges_config(tmp_path):
 
 
 def test_install_default_bootstraps_new_dir_and_keeps_paths(tmp_path):
-    """默认实例安装到新目录：bootstrap 共享代码，写 agents.default 与默认单元名（兼容路径）。"""
+    """Default instance installs into a fresh dir: bootstrap shared code, write agents.default and the default unit name (compatibility path)."""
     fakebin, logs = make_fakebin(tmp_path)
     source = make_source(tmp_path)
     inst = tmp_path / "inst2"
@@ -286,7 +286,7 @@ def test_install_default_bootstraps_new_dir_and_keeps_paths(tmp_path):
 
 
 def test_install_rejects_legacy_single_config(tmp_path):
-    """旧式 config/agent.json 存在时显式拒绝，不默默覆盖。"""
+    """Legacy config/agent.json present: reject explicitly, never silently overwrite."""
     fakebin, logs = make_fakebin(tmp_path)
     source = make_source(tmp_path)
     inst = tmp_path / "legacy"
@@ -340,7 +340,7 @@ def test_install_gateway_rejects_instance(tmp_path):
 
 
 def make_install_state(tmp_path, inst):
-    """铺一套含 default 与 win 两个实例的安装目录 + 单元。"""
+    """Lay out an install dir containing default and win instances plus units."""
     (inst / "config").mkdir(parents=True, exist_ok=True)
     (inst / "config" / "agents.json").write_text(json.dumps({
         "gateway_url": "https://mesh.example.com",
@@ -365,7 +365,7 @@ def uninstall_env(tmp_path, fakebin, logs, inst, **extra):
 
 
 def test_uninstall_single_instances_isolated(tmp_path):
-    """单实例卸载：只移除对应单元与配置键；共享目录、状态、其他实例保留；末实例删除空 agents.json。"""
+    """Single-instance uninstall: remove only the matching unit and config keys; shared dirs, state and other instances stay; the last instance removes the empty agents.json."""
     fakebin, logs = make_fakebin(tmp_path)
     inst = make_install_state(tmp_path, tmp_path / "u1")
     ud = unit_dir(tmp_path)
@@ -376,12 +376,12 @@ def test_uninstall_single_instances_isolated(tmp_path):
     assert not (ud / "opencode-mesh-agent.service").exists()
     assert (ud / "opencode-mesh-agent@win.service").exists()
     agents = read_json(inst / "config" / "agents.json")
-    assert set(agents["agents"]) == {"win"}  # default 键被移除，win 保留
-    assert (inst / "data" / "agent-state.json").exists()  # 状态保留
-    # 共享目录与 src 保留
+    assert set(agents["agents"]) == {"win"}  # default key removed, win kept
+    assert (inst / "data" / "agent-state.json").exists()  # state kept
+    # shared dir and src kept
     assert (inst / "src" / "SENTINEL").read_text() == "keep\n"
 
-    # 卸载最后一个实例：agents.json 应按空 agents 删除，数据仍保留
+    # uninstall last instance: agents.json deleted once agents is empty, data still kept
     result = run_script("uninstall.sh", ["agent", "win"], env)
     assert result.returncode == 0, result.stderr
     assert not (ud / "opencode-mesh-agent@win.service").exists()
@@ -391,7 +391,7 @@ def test_uninstall_single_instances_isolated(tmp_path):
 
 
 def test_uninstall_default_with_other_instance_keeps_directory(tmp_path):
-    """默认实例卸载时其他（inactive）实例存在 → 保留共享目录与配置。"""
+    """Default instance uninstall while another (inactive) instance exists -> keep shared dir and config."""
     fakebin, logs = make_fakebin(tmp_path)
     inst = make_install_state(tmp_path, tmp_path / "u2")
     ud = unit_dir(tmp_path)
@@ -407,7 +407,7 @@ def test_uninstall_default_with_other_instance_keeps_directory(tmp_path):
 
 
 def test_uninstall_all_removes_everything(tmp_path):
-    """all：全部单元与配置键移除，deregister 每个 agent，默认 KEEP=N 时删除安装目录。"""
+    """all: remove every unit and config key, deregister each agent, delete the install dir when default KEEP=N."""
     fakebin, logs = make_fakebin(tmp_path)
     inst = make_install_state(tmp_path, tmp_path / "u3")
     seed_unit(tmp_path, "opencode-mesh-gateway", inst)

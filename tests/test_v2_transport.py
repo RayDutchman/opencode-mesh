@@ -11,7 +11,7 @@ from src.static_adapter import TRANSPORT_ADAPTER
 
 
 def test_relay_reframes_decoded_chunked_body():
-    """代理读完分块体后必须让 HTTP 客户端重新决定帧格式。"""
+    """After the proxy reads a chunked body, the HTTP client must decide the framing format anew."""
     headers = forwarding_headers({
         'Content-Type': 'application/json',
         'Transfer-Encoding': 'chunked',
@@ -32,7 +32,7 @@ def test_relay_reframes_decoded_chunked_body():
 @pytest.mark.parametrize('stream', [False, True])
 @pytest.mark.parametrize('body', [b'', b'{}', b'{"model":{"modelID":"test","providerID":"test"}}'])
 def test_agent_preserves_body_and_reframes_headers(monkeypatch, stream, body):
-    """HTTP 与流式通道均传输原始业务字节，不猜测业务字段。"""
+    """Both HTTP and streaming channels carry raw business bytes and never guess business fields."""
     requests = []
     def handle(request):
         requests.append(request)
@@ -61,7 +61,7 @@ def test_agent_preserves_body_and_reframes_headers(monkeypatch, stream, body):
 
 
 def test_browser_scopes_websocket_and_preserves_explicit_server():
-    """裸 origin 保持默认 Server，显式入口不受页面切换影响。"""
+    """A bare origin keeps the default Server; explicit entries are unaffected by page switches."""
     helpers = TRANSPORT_ADAPTER.split('  const requestPath =', 1)[1].split('  function rejectEntry', 1)[0]
     script = """
     const assert=require('node:assert/strict');
@@ -84,7 +84,7 @@ def test_browser_scopes_websocket_and_preserves_explicit_server():
 
 
 def test_v2_adapter_keeps_native_xhr_and_eventsource():
-    """执行整个适配器，V2 未使用的原生接口不应被替换。"""
+    """Run the whole adapter; native interfaces unused by V2 must not be replaced."""
     adapter = TRANSPORT_ADAPTER.split('<script id="ocm-transport-adapter">', 1)[1].split('</script>', 1)[0]
     adapter = adapter.replace('__OCM_VERSION_JSON__', '"test"')
     script = """
@@ -103,7 +103,7 @@ def test_v2_adapter_keeps_native_xhr_and_eventsource():
     """ + adapter + """
     assert.equal(global.XMLHttpRequest,XHR);
     assert.equal(global.EventSource,ES);
-    // SDK 同时构造两个 Server 的绝对 API 路径时，各自保留明确基址。
+    // When the SDK builds absolute API paths for two Servers at once, each keeps its explicit base.
     assert.equal(new URL('/api/session/old/form','https://mesh.test/_mesh/device/device-a').href,
       'https://mesh.test/_mesh/device/device-a/api/session/old/form');
     assert.equal(new URL('/api/session','https://mesh.test/_mesh/device/device-b').href,
@@ -118,7 +118,7 @@ def test_v2_adapter_keeps_native_xhr_and_eventsource():
 
 
 def test_discovery_preserves_native_server_names_and_skips_v1():
-    """设备发现只补充 V2 入口，保留用户名称与自建 Server。"""
+    """Device discovery only adds V2 entries and preserves user names and user-created Servers."""
     helpers = 'const requestPath =' + TRANSPORT_ADAPTER.split('  const requestPath =', 1)[1].split('  function rejectEntry', 1)[0]
     script = """
     const assert=require('node:assert/strict');
@@ -151,7 +151,7 @@ def test_discovery_preserves_native_server_names_and_skips_v1():
 
 @pytest.mark.parametrize('scenario', ['switch', 'abort', 'stream'])
 def test_p2p_upload_keeps_device_and_cancellation(scenario):
-    """流式请求体在切换或取消后，不得继续发送 mutation。"""
+    """After a switch or cancel, the streaming request body must not keep sending mutations."""
     adapter = TRANSPORT_ADAPTER.split('<script id="ocm-transport-adapter">', 1)[1].split('</script>', 1)[0]
     script = """
     const assert=require('node:assert/strict');
@@ -196,10 +196,11 @@ def test_p2p_upload_keeps_device_and_cancellation(scenario):
 
 
 def test_bounded_probe_discards_on_abort_without_replay():
-    """探测读取期间 abort 立即拒绝；底层流被释放；不发送任何 mutation。
+    """Abort during probing rejects immediately; the underlying stream is released; no mutation is sent.
 
-    当前实现先 clone().arrayBuffer() 全量缓冲后才检查中止信号，读取未完成的流时
-    abort 无法打断；有界探测必须在读取过程中立即响应取消。
+    The current implementation buffers fully with clone().arrayBuffer() before checking
+    the abort signal, so abort cannot interrupt an incomplete stream read; a bounded
+    probe must respond to cancellation while reading.
     """
     adapter = TRANSPORT_ADAPTER.split('<script id="ocm-transport-adapter">', 1)[1].split('</script>', 1)[0]
     script = """
@@ -222,11 +223,11 @@ def test_bounded_probe_discards_on_abort_without_replay():
       s.channel={readyState:'open',bufferedAmount:0,send:frame=>{throw new Error('send must not run on abort')}};
       const ac=new AbortController();
       let released=false;
-      // 只推 1 字节后暂停的流：探测读第一块后停在 pending read 上
+      // Stream paused after pushing just 1 byte: the probe reads the first block and parks on a pending read
       const body=new ReadableStream({start(c){c.enqueue(new Uint8Array(1));},cancel(){released=true;}});
       const operation=window.fetch('https://mesh.test/_mesh/device/device-a/api/session/test/prompt',
         {method:'POST',body,duplex:'half',signal:ac.signal});
-      // setImmediate 未被适配器 mock 覆盖；在探测已停在 pending read 上后触发取消
+      // setImmediate is not covered by the adapter mock; trigger the cancel after the probe parks on a pending read
       setImmediate(()=>ac.abort(new DOMException('Aborted','AbortError')));
       await assert.rejects(operation,/abort/i);
       await new Promise(r=>setImmediate(r));
@@ -238,10 +239,11 @@ def test_bounded_probe_discards_on_abort_without_replay():
 
 
 def test_bounded_probe_relays_oversize_stream_without_full_buffering():
-    """未知大小流超过 P2P 上限后立即走 Relay 并释放残余源流，不做全量缓冲。
+    """An unknown-size stream over the P2P limit immediately goes to Relay and releases the remaining source stream without full buffering.
 
-    永不结束的流：有界探测只读约上限字节就进入 Relay；若沿用全量缓冲实现，
-    arrayBuffer() 将永远等待，测试超时失败（行为回归测试）。
+    A never-ending stream: the bounded probe reads about the limit's worth of bytes and
+    then enters Relay; a full-buffering implementation would make arrayBuffer() wait
+    forever, so the test would time out (behavior regression test).
     """
     adapter = TRANSPORT_ADAPTER.split('<script id="ocm-transport-adapter">', 1)[1].split('</script>', 1)[0]
     script = """
@@ -256,7 +258,7 @@ def test_bounded_probe_relays_oversize_stream_without_full_buffering():
     global.relayInput=null;
     global.enqueued=0;
     global.released=false;
-    // nativeFetch 真身：拦截设备发现路径，Relay 请求即时吊销 body 并返回 204
+    // Real nativeFetch: intercept device discovery; immediately cancel Relay request bodies and return 204
     global.fetch=async input=>{
       if(typeof input==='string'&&input.startsWith('/_mesh/')) return new Promise(()=>{});
       global.relayInput=input;
@@ -271,7 +273,7 @@ def test_bounded_probe_relays_oversize_stream_without_full_buffering():
       const s=window.__ocmTransport;
       s.manifest={device_id:'device-a'};
       s.channel={readyState:'open'};
-      // 永不结束的推流源；setImmediate 不受适配器 mock 影响，cancel 回调负责停泵并标记释放
+      // Never-ending push source; setImmediate is unaffected by the adapter mock; the cancel callback stops the pump and marks release
       const body=new ReadableStream({start(c){
         const pump=()=>{if(global.released)return;c.enqueue(new Uint8Array(1024*1024));global.enqueued+=1024*1024;if(!global.released)setImmediate(pump);};
         pump();
@@ -279,7 +281,7 @@ def test_bounded_probe_relays_oversize_stream_without_full_buffering():
       const url='https://mesh.test/_mesh/device/device-a/api/upload';
       assert.equal((await window.fetch(url,{method:'POST',body,duplex:'half'})).status,204);
       assert.ok(global.relayInput instanceof Request,'Relay 必须收到 Request');
-      // 有界探测只读约上限字节（33MiB 出头），不能任其无限增长
+      // The bounded probe reads only about the limit's worth of bytes (just over 33MiB); it must never grow without bound
       assert.ok(global.enqueued < 33*1024*1024+4*1024*1024,'探测必须在上限附近停止');
       assert.ok(global.released,'转入 Relay 后残余源流必须被释放');
     })().then(()=>{completed=true}).catch(e=>{completed=true;console.error(e);process.exitCode=1});
@@ -289,7 +291,7 @@ def test_bounded_probe_relays_oversize_stream_without_full_buffering():
 
 
 def test_large_request_falls_back_with_original_body():
-    """Request 流式上传超过 P2P 上限后，Relay 接收相同请求体和设备地址。"""
+    """After a streaming upload exceeds the P2P limit, Relay receives the same request body and device address."""
     adapter = TRANSPORT_ADAPTER.split('<script id="ocm-transport-adapter">', 1)[1].split('</script>', 1)[0]
     script = """
     const assert=require('node:assert/strict');

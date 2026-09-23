@@ -121,7 +121,7 @@ os.replace(temporary, path)
 PY
 fi
 
-# 单实例卸载始终保留共享源码和内部身份，避免影响其他停止中的实例。
+# Single-instance uninstall keeps the shared source and identity so that other stopped instances are unaffected.
 if [[ "$MODE" != all ]]; then
   info "instance removed; shared installation and identity retained"
   exit 0

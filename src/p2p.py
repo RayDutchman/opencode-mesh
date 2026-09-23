@@ -9,23 +9,25 @@ import time
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 
-# 有界协议常量：控制帧超时、请求/响应上限、分片大小。
+# Bounded protocol constants: control frame timeout, request/response limits, chunk size.
 CONTROL_SEND_TIMEOUT = 5.0
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
-# 兼容旧配置名：仅当显式设置 max_p2p_message_bytes 时覆盖，否则继承请求上限。
+# Backward-compatible config name: only an explicit max_p2p_message_bytes overrides; otherwise inherit the request limit.
 MAX_P2P_MESSAGE_BYTES = 1024 * 1024
 CHUNK_SIZE = 32768
-# 稳定错误原因：Relay 与 P2P 两端共用，前端按 reason 判断是否可重试。
+# Stable error reasons shared by Relay and P2P; the frontend uses reason to decide whether a retry is possible.
 REQUEST_TOO_LARGE_REASON = "request exceeds max_request_bytes limit"
 RESPONSE_TOO_LARGE_REASON = "response exceeds max_response_bytes limit"
 PAYLOAD_TOO_LARGE_REASON = "reassembled payload exceeds max_p2p_message_bytes limit"
 INVALID_ENCODING_REASON = "invalid base64 encoding"
 STREAM_OVERFLOW_REASON = "stream buffer overflow"
-# 分片路径的协议错误（乱序、重放）与缓冲区资源不足，分别使用稳定常量归类。
+# Protocol errors on the fragmented path (out-of-order, replay) and buffer exhaustion
+# are classified by separate stable constants.
 INVALID_SEQUENCE_REASON = "invalid frame sequence"
 ASSEMBLY_BUDGET_REASON = "reassembly byte budget exceeded"
-# 上游失败：连接级失败与其它传输层错误分别归类，避免误导。
+# Upstream failures: connection-level failures and other transport errors are classified
+# separately to avoid misleading callers.
 CONNECTION_FAILED_REASON = "connection failed"
 UPSTREAM_ERROR_REASON = "upstream request failed"
 WS_FRAME_FLOOR_BYTES = 16 * 1024 * 1024
@@ -38,31 +40,31 @@ class P2PUnavailable(RuntimeError):
 
 
 class FrameError(RuntimeError):
-    """分片信封违反有界重组契约（超限、乱序、重复或编码非法）。"""
+    """A fragment envelope violated the bounded reassembly contract (overflow, out-of-order, duplicate, or invalid encoding)."""
 
 
 def request_limit(cfg: dict[str, Any]) -> int:
-    """请求体有效上限的唯一读取入口（默认 64MiB）。"""
+    """Sole accessor for the effective request body limit (default 64MiB)."""
     return int(cfg.get("max_request_bytes", MAX_REQUEST_BYTES))
 
 
 def response_limit(cfg: dict[str, Any]) -> int:
-    """响应体有效上限的唯一读取入口（默认 64MiB）。"""
+    """Sole accessor for the effective response body limit (default 64MiB)."""
     return int(cfg.get("max_response_bytes", MAX_RESPONSE_BYTES))
 
 
 def p2p_message_limit(cfg: dict[str, Any]) -> int:
-    """P2P 单条消息上限；未显式配置时与请求上限一致，避免 Relay/P2P 分叉。"""
+    """Per-message P2P limit; without explicit config it matches the request limit so Relay/P2P do not diverge."""
     if cfg.get("max_p2p_message_bytes") is not None:
         return int(cfg["max_p2p_message_bytes"])
     return request_limit(cfg)
 
 
 def p2p_total_budget(cfg: dict[str, Any]) -> int:
-    """所有并行分片装配累计缓冲字节的全局上限。
+    """Global cap on the cumulative buffered bytes of all parallel chunk assemblies.
 
-    默认与单条消息上限一致（避免 64MiB × max_assemblies × peer 的放大）；
-    可用 max_p2p_total_bytes 显式收紧或放宽。
+    Defaults to the per-message limit (avoiding a 64MiB x max_assemblies x peer
+    amplification); max_p2p_total_bytes can tighten or loosen it explicitly.
     """
     if cfg.get("max_p2p_total_bytes") is not None:
         return int(cfg["max_p2p_total_bytes"])
@@ -70,12 +72,12 @@ def p2p_total_budget(cfg: dict[str, Any]) -> int:
 
 
 def ws_frame_limit(cfg: dict[str, Any]) -> int:
-    """uvicorn ws_max_size：覆盖应用层上限（base64 展开 + JSON 开销），不低于 16MiB。"""
+    """uvicorn ws_max_size: covers the application limit (base64 expansion + JSON overhead), never below 16MiB."""
     return max(WS_FRAME_FLOOR_BYTES, request_limit(cfg) * 2)
 
 
 def is_valid_base64(encoded: str) -> bool:
-    """不分配解码结果，严格校验标准 base64 字符集与填充。"""
+    """Validate standard base64 charset and padding strictly, without allocating a decoded result."""
     if encoded == "":
         return True
     if not isinstance(encoded, str) or len(encoded) % 4 != 0:
@@ -93,14 +95,14 @@ def is_valid_base64(encoded: str) -> bool:
 
 
 def decode_strict(encoded: str) -> bytes:
-    """严格解码标准 base64；非法字符、错误填充或长度都抛 ValueError。"""
+    """Strictly decode standard base64; invalid characters, malformed padding, or bad length raise ValueError."""
     return base64.b64decode(encoded or "", validate=True)
 
 
 class ResponseSizeGuard:
-    """累计解码后字节数并在超过上限时抛出稳定 FrameError。
+    """Accumulate decoded bytes and raise a stable FrameError when the limit is exceeded.
 
-    在 base64 展开前先用 decoded_size 判断，避免为超限响应构造完整副本。
+    Use decoded_size before base64 expansion so oversized responses never build a full copy.
     """
 
     def __init__(self, limit: int):
@@ -124,10 +126,10 @@ class ResponseSizeGuard:
 
 
 def decoded_size(encoded: str) -> int:
-    """不分配解码结果，精确计算标准 base64 字符串的解码字节数。
+    """Compute the exact decoded byte count of a standard base64 string without allocating.
 
-    用于在 base64 展开前判断大小上限——仅凭编码长度无法区分 3 字节边界
-    （如 8192 与 8193 字节会编码成同样长度）。
+    Used to judge size limits before base64 expansion: encoded length alone cannot
+    distinguish 3-byte boundaries (e.g. 8192 and 8193 bytes encode to the same length).
     """
     if not encoded:
         return 0
@@ -144,13 +146,13 @@ def decoded_size(encoded: str) -> int:
 
 
 def frame(message_id: str, sequence: int, data: bytes, final: bool) -> dict[str, Any]:
-    """构造统一分片信封 {message_id, sequence, data, final}。"""
+    """Build the uniform fragment envelope {message_id, sequence, data, final}."""
     return {"message_id": str(message_id), "sequence": int(sequence),
             "data": base64.b64encode(data or b"").decode("ascii"), "final": bool(final)}
 
 
 def iter_frames(message_id: str, data: bytes, chunk_size: int = CHUNK_SIZE):
-    """把一段字节拆分为分片信封，最后一个信封 final=True（空数据也有一帧）。"""
+    """Split bytes into fragment envelopes; the last envelope has final=True (empty data still yields one frame)."""
     payload = data or b""
     if len(payload) <= chunk_size:
         yield frame(message_id, 0, payload, True)
@@ -163,15 +165,18 @@ def iter_frames(message_id: str, data: bytes, chunk_size: int = CHUNK_SIZE):
 
 
 class ChunkAssembler:
-    """按 message_id 隔离的有界分片重组器。
+    """Bounded chunk reassembler isolated per message_id.
 
-    契约：同一 message_id 的 sequence 必须从 0 严格递增；重复、跳号、超限、
-    重复 final 以及非法编码都产生有界错误；不同 message_id 互不影响。
+    Contract: sequences for the same message_id must increase strictly from 0;
+    duplicates, gaps, overflow, repeated final, and invalid encoding all produce
+    a bounded error state, and different message_ids never interfere.
 
-    资源边界：残缺装配受 `max_assemblies`（数量，超出淘汰最旧）与 `ttl`
-    （时间，过期清理）约束；所有并行装配的累计缓冲字节受全局 `budget`
-    （默认与单条消息上限一致）约束，超出时返回 ASSEMBLY_BUDGET_REASON 稳定错误；
-    `trace` 仅用于测试/调试，默认关闭以避免无界增长。
+    Resource bounds: incomplete assemblies are constrained by `max_assemblies`
+    (count, evicts the oldest) and `ttl` (time, purged when expired); the
+    cumulative buffered bytes of all parallel assemblies are constrained by the
+    global `budget` (defaults to the per-message limit), exceeded by returning
+    the stable ASSEMBLY_BUDGET_REASON error; `trace` is for tests/debugging only
+    and defaults to off so it cannot grow unboundedly.
     """
 
     def __init__(self, limit: int = MAX_RESPONSE_BYTES, trace: bool = False,
@@ -183,11 +188,11 @@ class ChunkAssembler:
         self.max_assemblies = max(1, int(max_assemblies))
         self.ttl = ttl
         self.clock = clock or time.monotonic
-        # 全局字节预算：所有并行装配 buffered 字节之和的上限（真正低且全局有界）。
+        # Global byte budget: cap on the sum of buffered bytes across parallel assemblies (genuinely low and globally bounded).
         self.budget = int(budget) if budget is not None else int(limit)
         self._used_bytes = 0
         self._assemblies: dict[str, dict[str, Any]] = {}
-        # 到达帧轨迹：(message_id, sequence)，仅 trace_enabled 时记录。
+        # Arrival frame trace: (message_id, sequence), recorded only while trace_enabled.
         self.trace: list[tuple[str | None, int | None]] = []
 
     def _purge(self, now: float, incoming: str | None = None) -> None:
@@ -202,13 +207,13 @@ class ChunkAssembler:
                 self._used_bytes -= self._assemblies.pop(oldest)["total"]
 
     def _free(self, asm: dict[str, Any]) -> None:
-        """释放该装配已缓冲的字节，把它从全局预算中剔除。"""
+        """Release this assembly's buffered bytes and remove them from the global budget."""
         self._used_bytes -= asm["total"]
         asm["total"] = 0
         asm["parts"] = []
 
     def feed(self, chunk: dict[str, Any]) -> str | None:
-        """送入一帧，返回 "accepted"/"error" 或 None（继续等待）。"""
+        """Feed one frame; return "accepted"/"error", or None (keep waiting)."""
         message_id = chunk.get("message_id")
         sequence = chunk.get("sequence")
         if self.trace_enabled:
@@ -219,7 +224,7 @@ class ChunkAssembler:
             message_id, {"parts": [], "total": 0, "accepted": False, "error": None,
                          "reason": None, "next": 0, "updated": now})
         asm["updated"] = now
-        # 错误/已完成墓碑保留到 TTL：同一 message_id 的重放一律拒绝，不重新装配。
+        # Error/completed tombstones last until TTL: replays of the same message_id are always rejected, never reassembled.
         if asm["error"] is not None:
             return "error"
         if asm["accepted"]:
@@ -238,14 +243,14 @@ class ChunkAssembler:
             asm["reason"] = INVALID_ENCODING_REASON
             self._free(asm)
             return "error"
-        # 先按解码后长度判断上限，再解码，避免为超限分片构造完整副本。
+        # Check the limit against the decoded length first, then decode, so oversized fragments never build a full copy.
         size = decoded_size(encoded)
         if asm["total"] + size > self.limit:
             asm["error"] = PAYLOAD_TOO_LARGE_REASON
             asm["reason"] = PAYLOAD_TOO_LARGE_REASON
             self._free(asm)
             return "error"
-        # 全局字节预算：本次分片会导致累计缓冲超过总预算时，拒绝并稳定报错。
+        # Global byte budget: when this fragment would push the cumulative buffer past the total budget, reject with a stable error.
         if self._used_bytes + size > self.budget:
             asm["error"] = ASSEMBLY_BUDGET_REASON
             asm["reason"] = ASSEMBLY_BUDGET_REASON
@@ -261,9 +266,9 @@ class ChunkAssembler:
         return None
 
     def complete(self, message_id: str) -> None:
-        """标记装配完成并释放分片内存，但保留墓碑直到 TTL，阻止同 id 重放。
+        """Mark the assembly complete and release its fragment memory, but keep a tombstone until TTL to block same-id replays.
 
-        调用方须先读取 result()；之后该 message_id 的帧一律视为完成后的重放。
+        Callers must read result() first; later frames for this message_id are treated as post-completion replays.
         """
         asm = self._assemblies.get(message_id)
         if asm is None:
@@ -277,7 +282,7 @@ class ChunkAssembler:
             self._used_bytes -= asm["total"]
 
     def pending_count(self) -> int:
-        """当前未完成/未释放的装配数量，用于资源边界断言。"""
+        """Number of incomplete/unreleased assemblies, used for resource-boundary assertions."""
         return len(self._assemblies)
 
     def result(self, message_id: str) -> bytes:
@@ -296,12 +301,12 @@ class ChunkAssembler:
         return self._assemblies.get(message_id, {}).get("error")
 
     def reason_of(self, message_id: str):
-        """返回该 message_id 的稳定错误种类（供上层区分 400/413）。"""
+        """Return the stable error kind for this message_id (so callers can distinguish 400/413)."""
         return self._assemblies.get(message_id, {}).get("reason")
 
 
 async def read_bounded(chunks: AsyncIterator[bytes], limit: int) -> bytes:
-    """流式读取响应体并在超过上限时立即报错，避免构造超限副本。"""
+    """Stream the response body and fail immediately past the limit, avoiding an oversized copy."""
     buffer = bytearray()
     async for chunk in chunks:
         if not chunk:
@@ -321,15 +326,17 @@ def load_aiortc():
 
 
 def enable_loopback_candidate() -> None:
-    """让 aiortc/aioice 把 127.0.0.1 作为 host candidate 发布。
+    """Make aiortc/aioice publish 127.0.0.1 as a host candidate.
 
-    aioice 的 get_host_addresses 默认排除 loopback（ip.ip != "127.0.0.1"）。
-    但在 WSL mirrored 等场景下，宿主机浏览器只能通过共享 loopback 到达本机
-    Agent，其余 host candidate（LAN/Docker/链路本地）对宿主机都不可达，
-    导致 ICE 永远失败、只能走 Relay。这里在进程内幂等地补充 127.0.0.1。
+    aioice's get_host_addresses excludes loopback by default (ip.ip != "127.0.0.1").
+    In WSL mirrored and similar setups the host browser can only reach this Agent
+    over the shared loopback; the other host candidates (LAN/Docker/link-local)
+    are unreachable from the host, so ICE would always fail and fall back to Relay.
+    This adds 127.0.0.1 in-process and idempotently.
 
-    对远程浏览器无害：远端浏览器的 127.0.0.1 指向它自己，该候选只是
-    多一个必然失败的 candidate pair，其余候选不受影响。
+    Harmless for remote browsers: there 127.0.0.1 points at the browser itself, so
+    the candidate is just one more inevitably failing pair and other candidates
+    are unaffected.
     """
     try:
         import aioice.ice as ice

@@ -1,4 +1,4 @@
-"""同机实例注册保持独立身份，显示名不参与身份计算。"""
+"""Same-host instances keep distinct identities; display names never participate in identity computation."""
 
 import asyncio
 import json

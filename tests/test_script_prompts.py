@@ -1,4 +1,4 @@
-"""真实控制终端验证交互取消发生在服务变更之前。"""
+"""Verify with a real controlling terminal that interactive cancellation happens before any service change."""
 import os
 import pty
 import select
@@ -68,13 +68,13 @@ else: sys.exit(97)
         (location / 'pyproject.toml').write_text('')
     monkeypatch.setenv('PATH', str(tmp_path)+os.pathsep+os.environ['PATH'])
     monkeypatch.chdir(tmp_path)
-    answers = [('请选择', 'bad'), ('请选择', '2')] if multiple else []
-    test_interactive_cancel('upgrade.sh', answers+[('是否升级', 'n')])
+    answers = [('Select an installation', 'bad'), ('Select an installation', '2')] if multiple else []
+    test_interactive_cancel('upgrade.sh', answers+[('Proceed with upgrade?', 'n')])
 
 
 @pytest.mark.parametrize('scope,ref,message', [
-    ('opencode', 'HEAD', '不是用户名'),
-    ('user', 'missing-reference-for-test', '找不到 Git 引用'),
+    ('opencode', 'HEAD', 'not a username'),
+    ('user', 'missing-reference-for-test', 'Git reference not found'),
 ])
 def test_invalid_arguments_explain_error(scope, ref, message):
     import subprocess

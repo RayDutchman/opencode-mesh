@@ -1,4 +1,4 @@
-"""V2 启动适配：独立资源命名空间隔离原生缓存，只替换已验证的入口契约。"""
+"""V2 bootstrap adapter: an isolated resource namespace separates the native cache; only the verified entry contract is replaced."""
 
 import re
 import base64
@@ -9,7 +9,7 @@ ASSET_ROOT = '/_mesh/ui/1/'
 
 
 def legacy_server_redirect(path: str, origin: str, device_id: str | None) -> str | None:
-    """只迁移当前 Gateway origin 的旧页面书签，不改外部 Server 身份。"""
+    """Migrate only old page bookmarks for the current Gateway origin; external Server identity is left untouched."""
     match = re.fullmatch(r'/server/([^/]+)(/.*)?', path)
     if not match or not device_id:
         return None
@@ -39,7 +39,8 @@ def parse_asset_route(path: str) -> tuple[str, str]:
 def adapt_entry(path: str, body: bytes) -> bytes:
     if not re.fullmatch(r'/_assets/index-[\w-]+\.js', path):
         return body
-    # 对照真实 V2.0.6 产物确认 getter 唯一；升级后结构变化必须显式失败，不能猜测替换。
+    # The getter must be unique in a real V2.0.6 bundle; if a newer build changes
+    # the structure, fail explicitly instead of guessing a replacement.
     getter = rb'(function [\w$]+\(\)\{return )location\.origin(\})'
     if b'currentServerUrl' not in body or b'defaultServerUrl' not in body or len(re.findall(getter, body)) != 1:
         raise ValueError('Unsupported OpenCode bootstrap contract')

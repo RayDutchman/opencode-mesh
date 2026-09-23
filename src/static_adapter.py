@@ -8,7 +8,7 @@ TRANSPORT_ADAPTER = r"""
   const nativeFetch = window.fetch.bind(window);
   const nativeWebSocket = window.WebSocket;
   const NativeURL = window.URL;
-  // V2 SDK 用绝对 /api 路径构造 URL；在基址尚未丢失时保留明确的设备作用域。
+  // The V2 SDK builds URLs from absolute /api paths; keep the explicit device scope while the base URL is not yet lost.
   window.URL = class extends NativeURL {
     constructor(input, base) {
       super(input, base);
@@ -179,7 +179,7 @@ TRANSPORT_ADAPTER = r"""
     } catch (_) { return null; }
   };
   const scopeNativeRequest = (input, init) => {
-    // 裸 origin 是默认 Server；切换页面不能改变它的后台请求归属。
+    // A bare origin is the default Server; switching pages must not change where its background requests go.
     const deviceId = state.defaultDevice;
     if (!deviceId) return [input, init];
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);
@@ -234,7 +234,7 @@ TRANSPORT_ADAPTER = r"""
       const original = Array.isArray(store.list) ? store.list : [];
       const alias = original.find(entry => entry.http?.url?.replace(/\/+$/, '') === location.origin);
       store.list = original.filter(entry => entry.http?.url?.replace(/\/+$/, '') !== location.origin);
-      // 原生 Server 列表由用户管理，只补充新发现的 V2 入口，不覆盖名称和外部地址。
+      // The native server list is user-managed; only add newly discovered V2 entries without overwriting names or external addresses.
       const existing = new Set((store.list || []).map(entry => entry.http?.url?.replace(/\/+$/, '')));
       const candidates = devices.some(device => device.device_id === primary.device_id) ? devices : [primary, ...devices];
       const added = candidates.filter(device => !existing.has(serverTabUrl(device.device_id))).map(device =>
@@ -261,12 +261,12 @@ TRANSPORT_ADAPTER = r"""
           }
         }
       }
-      // canonicalLocalServer 同时改为明确设备，原有 local 项目/窗口状态继续由原生迁移保留。
+      // Point canonicalLocalServer at the explicit device too; existing local project/window state stays preserved by the native migration.
       window.__ocmBootstrap.serverUrl = primaryUrl;
   }
 
   async function bootstrapServers() {
-    // 启动失败可见且自动重试；保持同一个 ready Promise，让入口模块在恢复后继续初始化。
+    // Startup failures are visible and auto-retried; keep the same ready Promise so the entry module continues initializing after recovery.
     for (;;) {
       try {
         await syncNativeServers();
@@ -319,7 +319,7 @@ TRANSPORT_ADAPTER = r"""
     state.streams.clear();
     state.incoming.clear();
     for (const socket of state.sockets.values()) {
-      // 标记终止，防止排队中的 send 任务随后 fail() 重复触发 error/close。
+      // Mark as terminated so queued send tasks cannot later fail() and emit error/close again.
       socket._done = true;
       socket.readyState = MeshWebSocket.CLOSED;
       socket.dispatch('error', error);
@@ -348,7 +348,7 @@ TRANSPORT_ADAPTER = r"""
           socket.dispatch('open', {});
         }
       } else if (message.type === 'ws_data') {
-        // 关闭已发起或尚未打开时丢弃迟到数据（规范：CLOSING 后不再投递数据帧）。
+        // Drop late data when close is pending or the socket never opened (spec: no data frames after CLOSING).
         if (socket.readyState !== MeshWebSocket.OPEN) return;
         let data;
         if (message.kind === 'bytes') {
@@ -359,7 +359,7 @@ TRANSPORT_ADAPTER = r"""
         }
         socket.dispatch('message', { data });
       } else if (message.type === 'ws_closed' || message.type === 'ws_error') {
-        // Agent 侧终止同样标记 socket 已终止，防止排队任务的 fail() 重复触发事件。
+        // Agent-side termination also marks the socket terminated so queued tasks cannot re-emit events via fail().
         socket._done = true;
         socket.readyState = MeshWebSocket.CLOSED;
         if (message.type === 'ws_error') socket.dispatch('error', new Error(message.error || 'WebSocket failed'));
@@ -414,9 +414,9 @@ TRANSPORT_ADAPTER = r"""
         state.streams.delete(message.id);
         state.pending.delete(message.id);
         if (entry.timer) clearTimeout(entry.timer);
-        // 首帧前的代理错误与 Relay 保持相同 HTTP/JSON 语义；已开始的流只能中断。
+        // Pre-first-frame proxy errors keep the same HTTP/JSON semantics as Relay; an already-started stream can only be aborted.
         if (message.type === 'stream_error' && !entry.resolved) {
-          // 镜像 src/p2p.py 的 INVALID_ENCODING_REASON，识别为 400；其余代理错误按 502。
+          // Mirror INVALID_ENCODING_REASON from src/p2p.py, mapped to 400; other proxy errors map to 502.
           const reason = message.reason || message.error || 'stream failed';
           entry.resolve({ status: reason === 'invalid base64 encoding' ? 400 : 502,
             headers: { 'content-type': 'application/json' } });
@@ -588,7 +588,7 @@ TRANSPORT_ADAPTER = r"""
   window.addEventListener('popstate', reconnectForDevice);
 
   async function send(message, channel = state.channel) {
-    // 调用方在异步读取之前固定通道，设备切换不能改变请求的目标。
+    // Callers fix the channel before async reads; a device switch must not retarget the request.
     if (!channel || channel.readyState !== 'open') throw new Error('p2p channel unavailable');
     const messageId = ['ws_data', 'ws_close'].includes(message.type) ? makeId() : String(message.id || makeId());
     const payload = enc.encode(JSON.stringify(message.id ? message : { ...message, id: messageId }));
@@ -619,9 +619,11 @@ TRANSPORT_ADAPTER = r"""
     finally { release(); }
   }
 
-  // 有界读取请求体探测：小体量返回完整字节供 P2P 发送；超限不消费源流，交由 Relay 转发。
-  // 非流式体（content-length 已知）零读取判超限，原 Request 原样用于 Relay；
-  // 未知大小流用唯一 reader 有界读取，读到上限即暂停，避免 clone/tee 单分支取消挂死。
+  // Bounded request-body probing: small bodies return full bytes for P2P; oversized bodies
+  // do not consume the source stream and are handed to Relay.
+  // Known-size (content-length) bodies are rejected with zero reads and the original
+  // Request is used for Relay; unknown-size streams are read with a single bounded reader
+  // and paused at the limit so a cancelled clone/tee branch cannot hang.
   const decodeContentLength = request => {
     const header = request.headers.get('content-length');
     if (header == null || header === '') return null;
@@ -635,7 +637,7 @@ TRANSPORT_ADAPTER = r"""
     const reader = request.body.getReader();
     const chunks = [];
     let total = 0;
-    // 探测期间取消立即打断 pending read，避免全量缓冲时无法响应 abort。
+    // Abort during probing must interrupt the pending read so a fully buffered body can still respond to abort.
     const onAbort = () => { reader.cancel(request.signal.reason).catch(() => {}); };
     request.signal.addEventListener('abort', onAbort, { once: true });
     return (async () => {
@@ -648,7 +650,7 @@ TRANSPORT_ADAPTER = r"""
           chunks.push(value);
           total += value.length;
           if (total > limit) {
-            // 超限：暂停源 reader 并移交所有权，由 Relay 重建流续读剩余部分。
+            // Over limit: pause the source reader and hand over ownership; Relay rebuilds the stream and keeps reading the remainder.
             return { kind: 'relay-stream', reader, chunks };
           }
         }
@@ -664,7 +666,7 @@ TRANSPORT_ADAPTER = r"""
       }
     })();
   };
-  // 把探测已读前置块与续读剩余部分按序重建为 Relay 请求体，不丢不重。
+  // Rebuild the Relay request body by concatenating the probed prefix and the streamed remainder, without loss or duplication.
   const relayStreamBody = (request, reader, chunks) => {
     let released = false;
     let index = 0;
@@ -712,11 +714,11 @@ TRANSPORT_ADAPTER = r"""
     if (requestedDevice && requestedDevice !== state.manifest?.device_id) return nativeFetch(request);
     path = serverRoutePath(path) || devicePath(path);
     const id = makeId();
-    // 有界探测请求体：大上传零读取转 Relay（保留原 Request），未知大小流超限后续读重建。
+    // Bounded body probe: large uploads turn to Relay with zero reads (original Request kept); an unknown-size stream that exceeds the limit is rebuilt for continued reading.
     const probe = await probeBody(request, MAX_P2P_BODY);
     if (probe.kind === 'relay') return nativeFetch(request);
     if (probe.kind === 'relay-stream') {
-      // Relay 请求体 = 探测已读前置块 + 源流剩余部分；signal 随请求传播，abort 会释放源流。
+      // Relay body = probed prefix + remaining source stream; signal propagates with the request, and abort releases the source stream.
       return nativeFetch(new Request(request, { body: relayStreamBody(request, probe.reader, probe.chunks), duplex: 'half', signal: request.signal }));
     }
     request.signal.throwIfAborted();
@@ -766,17 +768,17 @@ TRANSPORT_ADAPTER = r"""
       this.binaryType = 'blob';
       this._listeners = new Map();
       this._channel = state.channel;
-      // Serialize frames so text cannot overtake a queued binary frame; close 帧也排在其后。
+      // Serialize frames so text cannot overtake a queued binary frame; close frames are queued behind them too.
       this._sendQueue = Promise.resolve();
       this.id = makeId();
-      this._opened = false; // ws_open 已发出（Agent 已被告知该 socket）
-      this._done = false;   // 已到达终止态：至多一次 close 事件、禁止后续帧
+      this._opened = false; // ws_open was sent (the Agent has been told about this socket)
+      this._done = false;   // Reached the terminal state: at most one close event, no further frames
       state.sockets.set(this.id, this);
       Promise.resolve(state.ready).then(() => {
         if (this._done || this.readyState !== MeshWebSocket.CONNECTING) return;
         if (!this._channel || this._channel.readyState !== 'open') return this.fail(new Error('P2P unavailable'));
-        // ws_open 排入发送队列，保证任何已排队帧（含 close）不会超过它，
-        // 也避免 CONNECTING 期 close 后仍向 Agent 发出 ws_open。
+        // Queue ws_open behind the send queue so no queued frame (including close) can overtake it,
+        // and a close during CONNECTING never emits ws_open to the Agent afterwards.
         this._sendQueue = this._sendQueue.then(async () => {
           if (this._done || this.readyState !== MeshWebSocket.CONNECTING) return;
           this._opened = true;
@@ -789,7 +791,7 @@ TRANSPORT_ADAPTER = r"""
     dispatch(type, event) { this['on' + type]?.(event); for (const fn of this._listeners.get(type) || []) fn.call(this, event); }
     // Expose shared DataChannel backpressure to callers.
     get bufferedAmount() { return this._channel && this._channel.readyState === 'open' ? this._channel.bufferedAmount : 0; }
-    // 唯一终止出口：幂等、清理 state.sockets、至多一次 close 事件。
+    // Single termination exit: idempotent, clears state.sockets, at most one close event.
     terminate(code, reason, error) {
       if (this._done) return;
       this._done = true;
@@ -809,7 +811,7 @@ TRANSPORT_ADAPTER = r"""
       };
       // Serialize all frames so text cannot overtake a queued binary frame.
       this._sendQueue = this._sendQueue.then(async () => {
-        if (this._done) return; // 已终止：丢弃排队中的陈旧帧，不再触发 fail
+        if (this._done) return; // Terminated: drop stale queued frames, never trigger fail again
         if (typeof data === 'string') {
           await send({ type: 'ws_data', id: this.id, kind: 'text', data }, this._channel);
           return;
@@ -819,17 +821,19 @@ TRANSPORT_ADAPTER = r"""
       }).catch(error => { this.fail(error); });
     }
     close(code = 1000, reason = '') {
-      // CLOSING/CLOSED 中的重复 close 是空操作（与浏览器语义一致）。
+      // A repeated close while CLOSING/CLOSED is a no-op (matches browser semantics).
       if (this.readyState !== MeshWebSocket.CONNECTING && this.readyState !== MeshWebSocket.OPEN) return;
       this.readyState = MeshWebSocket.CLOSING;
       if (!this._opened) {
-        // ws_open 尚未发出：连接从未建立，视为建立失败，本地确定终止（close 1006），
-        // 不向 Agent 发送任何帧，Agent 也不会为这个 id 建桥。
+        // ws_open was not sent: the connection never established; treat as a failed setup and
+        // terminate locally (close 1006) without sending any frames to the Agent, which
+        // will not bridge this id either.
         this.terminate(1006, '');
         return;
       }
-      // ws_open 已发出：close 帧排在所有已排队数据帧之后（有界 DataChannel 保序），
-      // 由 Agent 关闭上游并回 ws_closed 完成握手；发送失败同样确定终止。
+      // ws_open was sent: the close frame is queued after all pending data frames (a bounded
+      // DataChannel keeps order), the Agent closes the upstream and replies ws_closed to
+      // complete the handshake; a failed send also terminates.
       this._sendQueue = this._sendQueue.then(async () => {
         if (this._done) return;
         await send({ type: 'ws_close', id: this.id, code, reason }, this._channel);
@@ -845,7 +849,7 @@ TRANSPORT_ADAPTER = r"""
   let relayTick = 0;
   setInterval(() => { reconnectForDevice(); renderBar(); if (++relayTick % 5 === 0) measureRelayRtt(); }, 2000);
   setTimeout(measureRelayRtt, 1500);
-  // 原生入口模块等待发现完成后才启动；不再在用户开始输入后刷新整页。
+  // The native entry module waits for discovery to finish before starting; the page is no longer refreshed once the user starts typing.
   window.__ocmBootstrap = { serverUrl: null, ready: null };
   window.__ocmBootstrap.ready = bootstrapServers();
   window.__ocmBootstrap.ready.catch(error => { console.error('Mesh bootstrap:', error); });

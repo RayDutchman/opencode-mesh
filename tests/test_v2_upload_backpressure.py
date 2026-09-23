@@ -4,7 +4,7 @@ from src.static_adapter import TRANSPORT_ADAPTER
 
 
 def test_large_relay_upload_obeys_consumer_backpressure():
-    """切换 Relay 后也不能由 start 循环把源流一口气读完。"""
+    """Switching to Relay must not let the start loop drain the source stream in one go."""
     adapter=TRANSPORT_ADAPTER.split('<script id="ocm-transport-adapter">',1)[1].split('</script>',1)[0].replace('__OCM_VERSION_JSON__','"test"')
     script=r'''
     const assert=require('node:assert/strict');

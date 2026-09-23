@@ -1,17 +1,22 @@
-"""共享源码升级（upgrade.sh --apply）的多实例行为测试。
+"""Shared-source upgrade (upgrade.sh --apply) multi-instance behavior tests.
 
-真实执行脚本（基于行为断言，不是检查输出字符串），用临时安装目录 +
-mock systemctl/python 验证：
-- list-unit-files + list-units 联合发现同 scope、同 WorkingDirectory 的
-  Agent 默认单元/具名实例及 Gateway（共享源码同样影响它）；
-- 升级前记录运行状态，只 stop/restart 升级前运行的单元，原 inactive 保持；
-- 其它安装目录的单元一律排除，模板单元（@.service 无实例）不操作；
-- 安装失败回滚恢复全部原 active（含部分 stop 失败的安全处理）；
-- 目标角色没有任何已安装服务时拒绝，避免静默成功；
-- 默认单实例（含 --user scope）兼容。
+Runs the script for real (behavior-based assertions, not output string checks),
+using a temp install dir + mock systemctl/python:
+- list-unit-files + list-units jointly discover the Agent default unit/named
+  instances and the Gateway sharing the same scope and WorkingDirectory
+  (shared source affects the Gateway too);
+- running state is recorded before the upgrade; only units running before the
+  upgrade are stopped/restarted, originally inactive ones stay;
+- units in other install dirs are always excluded; template units (@.service
+  with no instance) are never touched;
+- install failure rolls back and restores all originally active units
+  (including safe handling of partial stop failure);
+- refusing when the target role has no installed services avoids silent success;
+- default single instance (including --user scope) is compatible.
 
-脚本部署会自替换安装目录内的 scripts/；被测脚本在执行前复制到临时目录之外，
-保证多场景用同一份原版本，且不被 --apply 的自替换污染。
+Deploy self-replaces scripts/ inside the install dir; the script under test is
+copied outside the temp dir before running so all scenarios use the same
+original version, unpolluted by --apply's self-replacement.
 """
 
 import hashlib
@@ -34,8 +39,8 @@ pytestmark = pytest.mark.skipif(
     reason="需要 bash/tar/sha256sum/realpath 才能真实执行 upgrade.sh",
 )
 
-# 安装目录 .venv/bin/python 的 mock：验证阶段打印版本行，
-# pip install 可注入失败（对应“安装失败回滚”场景）。
+# Mock for the install dir's .venv/bin/python: prints a version line during the verify stage,
+# pip install can be made to fail (the "install failure rollback" scenario).
 MOCK_PYTHON = """#!/usr/bin/env bash
 if [[ -n "${MOCK_PYTHON_LOG:-}" ]]; then
   printf '%s\\n' "$*" >> "$MOCK_PYTHON_LOG"
@@ -51,8 +56,8 @@ fi
 exit 0
 """
 
-# systemctl 的 mock：按 scope（system/user）维护单元表，记录每次调用的行为，
-# 支持注入单个单元的 stop 失败（MOCK_STOP_FAIL），状态在调用间持久化。
+# systemctl mock: keeps a unit table per scope (system/user), logs every call's behavior,
+# supports injecting a single unit's stop failure (MOCK_STOP_FAIL); state persists between calls.
 MOCK_SYSTEMCTL = r'''#!/usr/bin/env python3
 import json
 import os
@@ -146,8 +151,7 @@ sys.exit(1)
 
 @pytest.fixture(scope="session")
 def deploy_script():
-    """被测脚本复制到临时目录之外：各场景安装目录内的 scripts/ 会被部署自替换，
-    执行副本保持原样，多场景共用同一版本。"""
+    """The script under test is copied outside the temp dir: the install dir's scripts/ gets self-replaced during deploy, the copy stays pristine and is shared by all scenarios."""
     scratch = Path(tempfile.mkdtemp(prefix="ocm-deploy-script-"))
     target = scratch / "upgrade.sh"
     shutil.copy(DEPLOY_SCRIPT, target)
@@ -157,7 +161,7 @@ def deploy_script():
 
 @pytest.fixture()
 def mock_env(tmp_path):
-    """mock systemctl（PATH 前置）+ 状态文件 + 行为日志。"""
+    """mock systemctl (prepended to PATH) + state file + behavior log."""
     bin_dir = tmp_path / "mock-bin"
     bin_dir.mkdir()
     systemctl = bin_dir / "systemctl"
@@ -169,8 +173,8 @@ def mock_env(tmp_path):
 
 
 def make_install_root(base: Path) -> Path:
-    """构造旧版本安装目录：src/scripts/pyproject.toml/.venv/bin/python +
-    旧 revision 与旧源码标识。"""
+    """Build an old-version install dir: src/scripts/pyproject.toml/.venv/bin/python +
+old revision and old source markers."""
     root = base / "install"
     (root / "src").mkdir(parents=True)
     (root / "src" / "MARKER").write_text("OLD", encoding="utf-8")
@@ -186,12 +190,12 @@ def make_install_root(base: Path) -> Path:
 
 
 def make_release_archive(base: Path) -> tuple[Path, str]:
-    """构造新版发布归档：新源码标识 + 新版本 pyproject + scripts 自替换标记。"""
+    """Build a new-version release archive: new source marker + new-version pyproject + self-replacement marker for scripts."""
     stage = base / "release"
     (stage / "src").mkdir(parents=True)
     (stage / "src" / "MARKER").write_text("NEW", encoding="utf-8")
     (stage / "scripts").mkdir()
-    # 升级会自替换 scripts/，归档里的脚本用于验证自替换行为。
+    # upgrade self-replaces scripts/; the archive's script verifies the self-replacement behavior.
     (stage / "scripts" / "upgrade.sh").write_text("# archive-script-v2\n", encoding="utf-8")
     (stage / "pyproject.toml").write_text(
         '[project]\nname = "opencode-mesh"\nversion = "new"\n', encoding="utf-8"
@@ -231,7 +235,7 @@ def run_apply(script: Path, root: Path, archive: Path, digest: str, role: str, s
 
 
 def read_ops(log_path: Path) -> list[tuple[str, str]]:
-    """行为日志 -> [(verb, unit), ...]，stop/restart 等对每个单元一行。"""
+    """Behavior log -> [(verb, unit), ...], one line per unit for stop/restart etc."""
     if not log_path.exists():
         return []
     ops = []
@@ -270,8 +274,7 @@ def test_partial_restart_stops_new_processes_before_rollback(tmp_path, mock_env,
 def test_apply_restarts_running_same_root_agent_instances_and_gateway(
     tmp_path, mock_env, deploy_script,
 ):
-    """两个 active + 一个 inactive + 其它目录 active：只 stop/restart 升级前运行、
-    同目录的单元（含 Gateway，共享源码同样受影响）；inactive、其它目录及模板不碰。"""
+    """Two active + one inactive + active unit in another dir: only stop/restart the same-dir units running before upgrade (Gateway included, shared source affects it too); inactive, other-dir and template units are left alone."""
     bin_dir, state_path, log_path = mock_env
     root = make_install_root(tmp_path)
     write_state(state_path, "system", {
@@ -280,7 +283,7 @@ def test_apply_restarts_running_same_root_agent_instances_and_gateway(
         "opencode-mesh-agent@offline.service": {"state_file": "disabled", "active": "inactive", "wd": str(root)},
         "opencode-mesh-agent@wrongdir.service": {"state_file": "disabled", "active": "active", "wd": "/elsewhere/install"},
         "opencode-mesh-gateway.service": {"state_file": "enabled", "active": "active", "wd": str(root)},
-        # 模板单元没有实例：不参与发现，也不操作
+        # template unit has no instance: not discovered, never touched
         "opencode-mesh-agent@.service": {"state_file": "disabled", "active": "inactive", "wd": str(root)},
     })
     archive, digest = make_release_archive(tmp_path)
@@ -292,24 +295,24 @@ def test_apply_restarts_running_same_root_agent_instances_and_gateway(
     ops = read_ops(log_path)
     assert subjects(ops, "stop") == expected
     assert subjects(ops, "restart") == expected
-    # inactive 与其它目录的单元从未被 stop/restart，其它目录也没被探测存活状态
+    # inactive and other-dir units were never stopped/restarted; other dirs were not even probed for liveness
     assert "opencode-mesh-agent@offline.service" not in subjects(ops, "stop") | subjects(ops, "restart")
     assert "opencode-mesh-agent@wrongdir.service" not in subjects(ops, "stop") | subjects(ops, "restart") | subjects(ops, "is-active")
-    # 模板被完整排除（连 show/is-active 都不出现）
+    # template fully excluded (not even in show/is-active)
     assert "opencode-mesh-agent@.service" not in subjects(ops, "show") | subjects(ops, "is-active")
-    # 升级前运行状态确实记录了 inactive 单元（保持记录语义，但绝不重启它）
+    # the pre-upgrade running state did record the inactive unit (keeps recording semantics, but never restarts it)
     assert "opencode-mesh-agent@offline.service" in subjects(ops, "is-active")
 
-    # 新代码、新 revision 落盘，scripts/ 被自替换为归档版本；
-    # 回滚备份保留旧源码与旧 revision（含旧身份文件不改动）
+    # new code and new revision land on disk, scripts/ self-replaced with the archive version;
+    # rollback backup keeps old source and old revision (old identity files untouched)
     assert (root / "src" / "MARKER").read_text(encoding="utf-8") == "NEW"
     assert (root / ".mesh-revision").read_text(encoding="utf-8") == f"{REVISION}\n"
     assert (root / "scripts" / "upgrade.sh").read_text(encoding="utf-8") == "# archive-script-v2\n"
     assert not (root / ".mesh-backups").exists()
     assert not list(root.glob('.mesh-stage.*'))
 
-    # 最终状态：两个 agent 实例与 gateway 都在运行（已重启），inactive 保持 inactive，
-    # 其它目录单元保持 active 且从未被碰
+    # final state: both agent instances and the gateway are running (restarted), inactive stays inactive,
+    # other-dir units stay active and were never touched
     state = read_state(state_path, "system")
     assert state["opencode-mesh-agent.service"]["active"] == "active"
     assert state["opencode-mesh-agent@windows.service"]["active"] == "active"
@@ -317,7 +320,7 @@ def test_apply_restarts_running_same_root_agent_instances_and_gateway(
     assert state["opencode-mesh-agent@offline.service"]["active"] == "inactive"
     assert state["opencode-mesh-agent@wrongdir.service"]["active"] == "active"
 
-    # 归档校验阶段确实执行（mock python 记录 -c 调用）
+    # the archive verify stage really ran (mock python records the -c call)
     py_log = Path(log_path.parent / "mock-python.log")
     assert py_log.exists() and any(line.startswith("-c ") for line in py_log.read_text().splitlines())
 
@@ -325,7 +328,7 @@ def test_apply_restarts_running_same_root_agent_instances_and_gateway(
 def test_apply_pip_failure_rolls_back_source_and_restores_all_originally_active(
     tmp_path, mock_env, deploy_script,
 ):
-    """安装（pip）失败：回滚恢复旧源码与旧 revision，并重启全部原 active。"""
+    """Install (pip) failure: rollback restores old source and old revision and restarts all originally active units."""
     bin_dir, state_path, log_path = mock_env
     root = make_install_root(tmp_path)
     write_state(state_path, "system", {
@@ -339,11 +342,11 @@ def test_apply_pip_failure_rolls_back_source_and_restores_all_originally_active(
                      bin_dir, state_path, log_path, env_extra={"MOCK_PIP_FAIL": "1"})
     assert proc.returncode == 1
 
-    # 行为：源码回滚为旧内容，revision 保留旧值
+    # behavior: source rolled back to old content, revision keeps the old value
     assert (root / "src" / "MARKER").read_text(encoding="utf-8") == "OLD"
     assert (root / ".mesh-revision").read_text(encoding="utf-8") == "rev-old\n"
 
-    # 原 active 的两个同目录单元：被 stop 且回滚后被重启恢复；inactive/其它目录不被碰
+    # the two originally active same-dir units: stopped, and restarted after rollback; inactive/other-dir untouched
     ops = read_ops(log_path)
     active_set = {"opencode-mesh-agent.service", "opencode-mesh-agent@windows.service"}
     assert subjects(ops, "stop") == active_set
@@ -355,18 +358,17 @@ def test_apply_pip_failure_rolls_back_source_and_restores_all_originally_active(
     assert state["opencode-mesh-agent@windows.service"]["active"] == "active"
     assert state["opencode-mesh-agent@offline.service"]["active"] == "inactive"
 
-    # 安装步骤与回滚都尝试了 pip（行为证据：部署确实走到安装、回滚确实重装）
+    # both the install step and the rollback tried pip (behavior evidence: deploy reached install, rollback reinstalled)
     py_log = Path(log_path.parent / "mock-python.log")
     pip_calls = [line for line in py_log.read_text(encoding="utf-8").splitlines() if "pip install" in line]
     assert len(pip_calls) >= 2
     recovery = list(root.glob('.mesh-stage.*/rollback.tar.gz'))
     assert len(recovery) == 1
-    assert '恢复未完全成功' in proc.stderr
+    assert 'Recovery incomplete' in proc.stderr
 
 
 def test_apply_partial_stop_failure_restores_every_originally_active(tmp_path, mock_env, deploy_script):
-    """部分 stop 失败的安全处理：先停成功的单元保持停止，失败仍在运行的单元，
-    回滚按“全部原 active”整体重启，保证运行状态恢复且 inactive 不启动。"""
+    """Partial stop failure safe handling: units stopped successfully stay stopped, the still-running failed unit and all originally active units are restarted as a whole on rollback, restoring running state without starting inactive ones."""
     bin_dir, state_path, log_path = mock_env
     root = make_install_root(tmp_path)
     write_state(state_path, "system", {
@@ -381,14 +383,14 @@ def test_apply_partial_stop_failure_restores_every_originally_active(tmp_path, m
     assert proc.returncode == 1
 
     ops = read_ops(log_path)
-    # 批量 stop 中 agent.service 已停、windows 的 stop 失败
+    # in the batch stop, agent.service was stopped, windows' stop failed
     assert subjects(ops, "stop") == {"opencode-mesh-agent.service"}
     assert subjects(ops, "stop-fail") == {"opencode-mesh-agent@windows.service"}
-    # 回滚把全部原 active 一并重启（含 stop 失败、仍在运行的单元）
+    # rollback restarts all originally active units together (including the one whose stop failed and is still running)
     assert subjects(ops, "restart") == {"opencode-mesh-agent.service", "opencode-mesh-agent@windows.service"}
     assert "opencode-mesh-agent@offline.service" not in subjects(ops, "restart")
 
-    # 源码已回滚，运行状态全部恢复
+    # source rolled back, running state fully restored
     assert (root / "src" / "MARKER").read_text(encoding="utf-8") == "OLD"
     state = read_state(state_path, "system")
     assert state["opencode-mesh-agent.service"]["active"] == "active"
@@ -397,8 +399,8 @@ def test_apply_partial_stop_failure_restores_every_originally_active(tmp_path, m
 
 
 def test_apply_default_single_instance_user_scope(tmp_path, mock_env, deploy_script):
-    """默认单实例兼容性：仅 opencode-mesh-agent.service，user scope；
-    若 --user 未转发给 systemctl，mock 会在空的 system 表上找不到单元而拒绝。"""
+    """Default single-instance compatibility: only opencode-mesh-agent.service, user scope;
+if --user is not forwarded to systemctl, the mock finds no unit in the empty system table and refuses."""
     bin_dir, state_path, log_path = mock_env
     root = make_install_root(tmp_path)
     write_state(state_path, "user", {
@@ -429,9 +431,9 @@ def test_same_revision_does_not_restart(tmp_path, mock_env, deploy_script):
 
 
 @pytest.mark.parametrize("role,units", [
-    # 目标 role=gateway，但目录上只有 Agent 服务：拒绝，防止静默成功
+    # target role=gateway but the dir only has Agent services: refuse to avoid silent success
     ("gateway", {"opencode-mesh-agent.service": {"state_file": "enabled", "active": "active", "wd": None}}),
-    # 目标 role=agent，但只有模板单元（无实例）：同样拒绝
+    # target role=agent but only template units (no instance): also refused
     ("agent", {"opencode-mesh-agent@.service": {"state_file": "disabled", "active": "inactive", "wd": None}}),
 ])
 def test_apply_refuses_when_target_role_has_no_installed_service(
@@ -447,7 +449,7 @@ def test_apply_refuses_when_target_role_has_no_installed_service(
     assert proc.returncode == 1
     assert "refusing" in proc.stderr.lower()
 
-    # 没有任何服务操作、任何源码变更，连备份目录都不会创建
+    # no service operation, no source change, not even a backup dir is created
     ops = read_ops(log_path)
     assert not [v for v, _ in ops if v in ("stop", "restart", "stop-fail", "is-active")]
     assert (root / "src" / "MARKER").read_text(encoding="utf-8") == "OLD"

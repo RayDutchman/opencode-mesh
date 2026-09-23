@@ -1,15 +1,19 @@
-"""Mesh 可靠性回归基线。
+"""Mesh reliability regression baseline.
 
-本文件把浏览器端 P2P 帧合并器（忠实移植 src/static_adapter.py 的 settle()）
-与当前未加守卫的分片语义建模为可本地运行的协议 reducer，从而无需真实浏览器
-或在线 Relay/P2P 连接即可复现 79b0d5d 基线上的协议数据完整性缺陷。
+This file models the browser-side P2P frame merger (a faithful port of
+src/static_adapter.py's settle()) together with the current unguarded chunk
+semantics as a locally runnable protocol reducer, so the protocol data-integrity
+defects on the 79b0d5d baseline can be reproduced without a real browser or a
+live Relay/P2P connection.
 
-基线期望（Task 1 红灯基线）：
-- 描述既有缺陷的回归用例必须失败：状态帧之后 chunk/end 被丢弃、
-  error 帧无法关闭流、分片无 message_id/sequence/大小守卫、超限请求未被 413 拒绝。
-- 文档性用例保持绿灯：合法序列（同一 message_id、sequence 递增、恰好达上限）、
-  Agent 对恰好达上限的请求体放行。
-Task 2/3 实现真实守卫后，这些红灯用例应转为绿灯。
+Baseline expectation (Task 1 red-light baseline):
+- Regression cases describing existing defects must fail: chunk/end dropped
+  after a status frame, error frames unable to close a stream, frames without
+  message_id/sequence/size guards, and over-limit requests not rejected with 413.
+- Documentation cases stay green: legal sequences (same message_id, increasing
+  sequence, exactly at the limit) and the Agent passing through a request body
+  that is exactly at the limit.
+- Once Task 2/3 implement real guards, these red-light cases should turn green.
 """
 
 from __future__ import annotations
@@ -41,8 +45,8 @@ from src.p2p import (ASSEMBLY_BUDGET_REASON, CONNECTION_FAILED_REASON,
                      request_limit, response_limit, ws_frame_limit)
 
 
-# 测试本地配置的较小限制，让边界用例运行快且精确。
-# Gateway 生产默认值为 max_request_bytes = 64 * 1024 * 1024（见 src/main.py）。
+# Small local limits for tests, keeping boundary cases fast and precise.
+# Gateway production default is max_request_bytes = 64 * 1024 * 1024 (see src/main.py).
 LIMIT_BYTES = 8192
 
 
@@ -51,12 +55,12 @@ def b64(payload: bytes) -> str:
 
 
 def unb64(payload: str) -> bytes:
-    """镜像浏览器端 atob()，空串视为空字节。"""
+    """Mirror the browser's atob(), treating an empty string as empty bytes."""
     return base64.b64decode(payload or "")
 
 
 class Controller:
-    """镜像浏览器端 ReadableStream controller 的可观测部分。"""
+    """Mirror the observable parts of the browser's ReadableStream controller."""
 
     def __init__(self):
         self.enqueued: list[bytes] = []
@@ -74,13 +78,13 @@ class Controller:
 
 
 class BrowserState:
-    """保存 settle() 依赖的 pending/streams/sockets 状态与解析记录。"""
+    """Hold the pending/streams/sockets state and settlement records settle() depends on."""
 
     def __init__(self):
         self.pending: dict[str, dict] = {}
         self.streams: dict[str, dict] = {}
         self.sockets: dict[str, object] = {}
-        # 形如 ("resolve"|"reject", 载荷) 的顺序记录。
+        # Chronological records shaped like ("resolve"|"reject", payload).
         self.settled: list[tuple[str, object]] = []
 
 
@@ -102,7 +106,7 @@ class FakeSocket:
 
 
 def open_stream(state: BrowserState, stream_id: str) -> Controller:
-    """模拟 p2pFetch 的 SSE 分支：先建立 pending 入口，再登记 stream controller。"""
+    """Simulate p2pFetch's SSE branch: create the pending entry first, then register the stream controller."""
     state.pending[stream_id] = {"response": None}
     controller = Controller()
     state.streams[stream_id] = {"controller": controller}
@@ -110,7 +114,7 @@ def open_stream(state: BrowserState, stream_id: str) -> Controller:
 
 
 def browser_settle(state: BrowserState, message: dict) -> None:
-    """模拟修复后的浏览器流状态机，验证状态帧不会夺走流的所有权。"""
+    """Simulate the fixed browser stream state machine, verifying a status frame does not steal the stream's ownership."""
     if message.get("type") == "pong":
         return
     socket = state.sockets.get(message.get("id"))
@@ -189,15 +193,15 @@ def browser_settle(state: BrowserState, message: dict) -> None:
 
 
 def make_chunk(message_id: str, sequence: int, data: bytes, final: bool = False) -> dict:
-    """构造 Task 2/3 定义的分片信封帧 {message_id, sequence, data, final}。"""
+    """Build a framed envelope {message_id, sequence, data, final} as defined by Task 2/3."""
     return {"message_id": message_id, "sequence": sequence,
             "data": b64(data), "final": final}
 
 
-# ---------- Step 1: P2P 流状态机（浏览器帧合并） ----------
+# ---------- Step 1: P2P stream state machine (browser frame merging) ----------
 
 def test_status_frame_then_two_chunks_and_end_yields_one_response_both_chunks_and_close():
-    """状态帧 + 两个 chunk + end 帧 → 恰好一次 response、两个 chunk 和一个 close。"""
+    """Status frame + two chunks + end frame -> exactly one response, two chunks and one close."""
     state = BrowserState()
     sid = "stream-1"
     controller = open_stream(state, sid)
@@ -219,7 +223,7 @@ def test_status_frame_then_two_chunks_and_end_yields_one_response_both_chunks_an
 
 
 def test_error_frame_after_status_closes_stream_with_error():
-    """状态帧之后到达的 error 帧必须让流以错误关闭并清理状态。"""
+    """An error frame arriving after the status frame must close the stream with an error and clean up state."""
     state = BrowserState()
     sid = "stream-2"
     controller = open_stream(state, sid)
@@ -233,10 +237,10 @@ def test_error_frame_after_status_closes_stream_with_error():
     assert sid not in state.streams
 
 
-# ---------- Step 2: 大小与序列守卫 ----------
+# ---------- Step 2: size and sequence guards ----------
 
 def test_payload_at_limit_is_accepted():
-    """同一 message_id、sequence 递增、恰好等于配置上限的载荷应被完整接收。"""
+    """A payload with the same message_id, increasing sequence, exactly at the configured limit must be fully received."""
     assembler = ChunkAssembler(limit=LIMIT_BYTES, trace=True)
     half = LIMIT_BYTES // 2
     assembler.feed(make_chunk("m", 0, b"a" * half))
@@ -249,7 +253,7 @@ def test_payload_at_limit_is_accepted():
 
 
 def test_distinct_message_ids_remain_isolated():
-    """不同 message_id 的交错分片必须各自独立装配、互不混入。"""
+    """Interleaved chunks of different message_ids must assemble independently without mixing."""
     assembler = ChunkAssembler(limit=LIMIT_BYTES)
     assembler.feed(make_chunk("msg-a", 0, b"alpha"))
     assembler.feed(make_chunk("msg-b", 0, b"beta", final=True))
@@ -262,7 +266,7 @@ def test_distinct_message_ids_remain_isolated():
 
 
 def test_payload_one_byte_over_limit_is_rejected():
-    """超过配置上限一个字节就必须得到有界错误，不得静默接收。"""
+    """One byte over the configured limit must produce a bounded error, never be silently received."""
     assembler = ChunkAssembler(limit=LIMIT_BYTES)
     assembler.feed(make_chunk("m", 0, b"a" * (LIMIT_BYTES + 1), final=True))
 
@@ -271,11 +275,11 @@ def test_payload_one_byte_over_limit_is_rejected():
 
 
 def test_duplicate_sequence_is_rejected():
-    """重复 sequence 的数据必须作为有界错误拒绝，而不是被重复拼接。"""
+    """Duplicate sequence data must be rejected as a bounded error instead of being appended twice."""
     assembler = ChunkAssembler(limit=LIMIT_BYTES, trace=True)
     assembler.feed(make_chunk("m", 0, b"x"))
     assembler.feed(make_chunk("m", 1, b"y"))
-    assembler.feed(make_chunk("m", 1, b"y"))  # 重复 sequence
+    assembler.feed(make_chunk("m", 1, b"y"))  # duplicate sequence
     assembler.feed(make_chunk("m", 2, b"z", final=True))
 
     assert assembler.trace == [("m", 0), ("m", 1), ("m", 1), ("m", 2)]
@@ -284,17 +288,17 @@ def test_duplicate_sequence_is_rejected():
 
 
 def test_missing_sequence_is_rejected():
-    """缺失中间 sequence（跳号）必须作为残缺序列拒绝，不能以残缺数据完成。"""
+    """A missing middle sequence (gap) must be rejected as an incomplete sequence, never completed with missing data."""
     assembler = ChunkAssembler(limit=LIMIT_BYTES)
     assembler.feed(make_chunk("m", 0, b"head"))
-    assembler.feed(make_chunk("m", 2, b"tail", final=True))  # 缺 seq 1
+    assembler.feed(make_chunk("m", 2, b"tail", final=True))  # missing seq 1
 
     assert assembler.error_of("m") is not None
     assert not assembler.is_accepted("m")
 
 
 def test_repeated_end_frame_is_rejected():
-    """重复的结束帧不得被静默忽略，必须产生有界错误。"""
+    """A repeated end frame must not be silently ignored; it must produce a bounded error."""
     assembler = ChunkAssembler(limit=LIMIT_BYTES)
     assembler.feed(make_chunk("m", 0, b"x", final=True))
     outcome = assembler.feed(make_chunk("m", 1, b"y", final=True))
@@ -303,7 +307,7 @@ def test_repeated_end_frame_is_rejected():
     assert assembler.error_of("m") is not None
 
 
-# ---------- Step 2（真实代码）：Agent 侧请求体大小守卫 ----------
+# ---------- Step 2 (real code): Agent-side request body size guard ----------
 
 def _fake_p2p_channel(sink):
     class FakeChannel:
@@ -421,7 +425,7 @@ def test_agent_accepts_consecutive_ws_data_frames_for_one_socket():
 
 
 def test_agent_guard_accepts_request_body_at_limit():
-    """真实 Agent.p2p_message 对恰好等于上限的请求体不应拒绝，应继续转发。"""
+    """The real Agent.p2p_message must not reject a request body exactly at the limit; it must forward it."""
     sent = []
 
     async def scenario():
@@ -441,7 +445,7 @@ def test_agent_guard_accepts_request_body_at_limit():
 
 
 def test_agent_guard_rejects_request_body_one_byte_over_limit():
-    """真实 Agent.p2p_message 对超过上限一个字节的请求体必须返回有界 413 错误。"""
+    """The real Agent.p2p_message must return a bounded 413 for a request body one byte over the limit."""
     sent = []
 
     async def scenario():
@@ -459,16 +463,16 @@ def test_agent_guard_rejects_request_body_one_byte_over_limit():
     assert sent and sent[0]["type"] == "response" and sent[0]["status"] == 413
 
 
-# ---------- Step 3（真实代码）：base64 边界与双向分片重组 ----------
+# ---------- Step 3 (real code): base64 boundaries and two-way frame split/reassembly ----------
 
 def test_decoded_size_matches_actual_base64_for_boundaries():
-    """decoded_size 必须精确到 3 字节边界，不依赖 base64 编码长度。"""
+    """decoded_size must be exact to the 3-byte boundary, independent of base64 encoding length."""
     for size in (0, 1, 2, 3, 4, 5, 8192, 8193, 8194, 65536):
         assert decoded_size(b64(b"x" * size)) == size
 
 
 def test_frame_round_trip_reassembles_multi_frame_payload():
-    """iter_frames → ChunkAssembler 双向分片/重组必须无损。"""
+    """iter_frames -> ChunkAssembler two-way split/reassembly must be lossless."""
     payload = bytes(range(64)) * 4
     assembler = ChunkAssembler(limit=LIMIT_BYTES)
     frames = list(iter_frames("round-trip", payload, chunk_size=32))
@@ -482,7 +486,7 @@ def test_frame_round_trip_reassembles_multi_frame_payload():
 
 
 def test_frame_round_trip_empty_payload_has_single_final_frame():
-    """空载荷也必须以一个 final 帧完成装配。"""
+    """An empty payload must still complete assembly with a single final frame."""
     assembler = ChunkAssembler(limit=LIMIT_BYTES)
     frames = list(iter_frames("empty", b""))
     assert len(frames) == 1 and frames[0]["final"] is True
@@ -490,7 +494,7 @@ def test_frame_round_trip_empty_payload_has_single_final_frame():
     assert assembler.result("empty") == b""
 
 
-# ---------- Step 4：响应大小上限（base64 展开前拦截） ----------
+# ---------- Step 4: response size limit (intercepted before base64 expansion) ----------
 
 class _AsyncChunks:
     def __init__(self, chunks):
@@ -506,7 +510,7 @@ class _AsyncChunks:
 
 
 def test_read_bounded_accepts_exact_limit_and_rejects_one_over():
-    """流式读取恰好达上限放行，超一字节立刻有界报错。"""
+    """Streaming read passes exactly at the limit and reports a bounded error one byte over."""
     async def scenario():
         ok = await read_bounded(_AsyncChunks([b"a" * 40, b"b" * 24]), 64)
         try:
@@ -520,10 +524,10 @@ def test_read_bounded_accepts_exact_limit_and_rejects_one_over():
     assert rejected is True
 
 
-# ---------- Step 5：Relay 流溢出显式错误（不驱逐旧分片） ----------
+# ---------- Step 5: explicit Relay stream overflow error (no eviction of old chunks) ----------
 
 def test_stream_overflow_emits_single_explicit_error_without_evicting():
-    """队列满时保留已缓冲分片，仅产生一条稳定原因的 stream_error。"""
+    """When the queue is full, buffered chunks stay and exactly one stream_error with a stable reason is emitted."""
     async def scenario():
         state = StreamState(maxsize=2)
         assert Gateway.enqueue_stream(state, {"type": "stream_chunk", "body": b64(b"a")})
@@ -540,7 +544,7 @@ def test_stream_overflow_emits_single_explicit_error_without_evicting():
 
 
 def test_stream_terminal_frame_is_delivered_after_buffered_chunks():
-    """队列满时 end 帧被延迟投递，先排空已缓冲分片再结束。"""
+    """When the queue is full, the end frame is delivered late, after buffered chunks drain."""
     async def scenario():
         state = StreamState(maxsize=1)
         assert Gateway.enqueue_stream(state, {"type": "stream_chunk", "body": b64(b"a")})
@@ -551,7 +555,7 @@ def test_stream_terminal_frame_is_delivered_after_buffered_chunks():
     assert [m["type"] for m in messages] == ["stream_chunk", "stream_end"]
 
 
-# ---------- Step 1/2：控制发送超时 ----------
+# ---------- Step 1/2: control send timeout ----------
 
 class _HangingControlWS:
     def __init__(self):
@@ -565,7 +569,7 @@ class _HangingControlWS:
 
 
 def test_gateway_control_send_timeout_closes_device_and_raises(tmp_path):
-    """控制发送超时必须关闭设备连接并抛出连接级错误。"""
+    """A control send timeout must close the device connection and raise a connection-level error."""
     async def scenario():
         gateway = Gateway({"state_file": str(tmp_path / "gateway.json")})
         ws = _HangingControlWS()
@@ -591,7 +595,7 @@ def test_gateway_control_send_timeout_closes_connection(tmp_path):
     assert asyncio.run(scenario()) == [1011]
 
 
-# ---------- Step 6：同 device_id 连接与断线清理 ----------
+# ---------- Step 6: same-device_id connections and disconnect cleanup ----------
 
 class _FakeControlWS:
     def __init__(self):
@@ -605,7 +609,7 @@ class _FakeControlWS:
 
 
 def test_attach_device_replaces_old_control_and_fails_pending(tmp_path):
-    """同 device_id 重连：关闭旧连接、失败其挂起请求/流/P2P 回答，且清理幂等。"""
+    """Reconnect with the same device_id: close the old connection, fail its pending requests/streams/P2P answers, and keep cleanup idempotent."""
     async def scenario():
         gateway = Gateway({"state_file": str(tmp_path / "gateway.json")})
         old = _FakeControlWS()
@@ -634,7 +638,7 @@ def test_attach_device_replaces_old_control_and_fails_pending(tmp_path):
         assert "r1" not in gateway.owners and "r1" not in gateway.pending
         assert "s1" not in gateway.p2p_answers
         assert answer.done() and answer.exception() is not None
-        # 幂等：重复清理不得抛错或影响新连接
+        # idempotent: repeated cleanup must not raise or affect the new connection
         await gateway.cleanup_device(old)
         await gateway.cleanup_device(old)
         assert device["ws"] is new
@@ -643,7 +647,7 @@ def test_attach_device_replaces_old_control_and_fails_pending(tmp_path):
 
 
 def test_old_control_connection_cannot_update_last_seen(tmp_path):
-    """被替换的旧连接不得再更新 last_seen。"""
+    """A replaced old connection must not update last_seen anymore."""
     async def scenario():
         gateway = Gateway({"state_file": str(tmp_path / "gateway.json")})
         old = _FakeControlWS()
@@ -653,14 +657,14 @@ def test_old_control_connection_cannot_update_last_seen(tmp_path):
         await gateway.attach_device(device, new)
         before = device["last_seen"]
         assert device.get("ws") is new
-        # 旧连接在接收循环中会用身份检查提前退出；此处直接验证身份归属。
+        # The old connection would exit early via the identity check in its receive loop; here we verify identity ownership directly.
         assert gateway.registry.devices["dev"]["ws"] is not old
         assert device["last_seen"] == before
 
     asyncio.run(scenario())
 
 
-# ---------- Step 7：429 退避与身份恢复 ----------
+# ---------- Step 7: 429 backoff and identity recovery ----------
 
 def test_backoff_delay_is_bounded_and_respects_retry_after():
     assert backoff_delay(1, base=1.0, cap=60.0, jitter=0.0) == 1.0
@@ -676,7 +680,7 @@ def test_backoff_delay_is_bounded_and_respects_retry_after():
 
 
 def test_register_rotates_token_with_valid_enroll_token(tmp_path):
-    """持久化 token 与 Gateway 不一致时，可凭 enroll_token 轮换身份恢复。"""
+    """When the persisted token no longer matches the Gateway, identity can be recovered by rotating with the enroll_token."""
     async def scenario():
         gateway = Gateway({"state_file": str(tmp_path / "gateway.json"),
                            "enroll_token": "enroll",
@@ -695,10 +699,10 @@ def test_register_rotates_token_with_valid_enroll_token(tmp_path):
     asyncio.run(scenario())
 
 
-# ---------- Step 3（真实代码）：Agent 侧分片请求重组 ----------
+# ---------- Step 3 (real code): Agent-side framed request reassembly ----------
 
 def test_agent_reassembles_framed_request_over_p2p():
-    """Agent.p2p_message 必须能重组浏览器分片信封并转发完整请求。"""
+    """Agent.p2p_message must reassemble browser-framed envelopes and forward the complete request."""
     sent = []
 
     async def scenario():
@@ -721,7 +725,7 @@ def test_agent_reassembles_framed_request_over_p2p():
 
 
 def test_p2p_send_chunks_large_response_into_reassemblable_envelope():
-    """大响应必须拆成 {message_id, sequence, data, final} 信封且可无损重组。"""
+    """Large responses must be split into {message_id, sequence, data, final} envelopes and be reassembled losslessly."""
     sent = []
 
     async def scenario():
@@ -744,13 +748,13 @@ def test_p2p_send_chunks_large_response_into_reassemblable_envelope():
 
 
 # ================================================================
-# 审查修订（Task 2 revision）：Critical/Important 修复的回归覆盖
+# Review revisions (Task 2 revision): regression coverage for Critical/Important fixes
 # ================================================================
 
-# ---------- item 4/5：统一上限 helper ----------
+# ---------- item 4/5: unified limit helper ----------
 
 def test_p2p_message_limit_inherits_request_limit_by_default():
-    """未显式配置 max_p2p_message_bytes 时必须继承 max_request_bytes，避免 64 倍分叉。"""
+    """Without an explicit max_p2p_message_bytes, it must inherit max_request_bytes to avoid a 64x split."""
     assert request_limit({}) == MAX_REQUEST_BYTES
     assert p2p_message_limit({}) == MAX_REQUEST_BYTES
     assert p2p_message_limit({"max_request_bytes": str(LIMIT_BYTES)}) == LIMIT_BYTES
@@ -763,16 +767,16 @@ def test_response_limit_reads_single_helper():
 
 
 def test_ws_frame_limit_covers_app_level_request_limit():
-    """uvicorn ws_max_size 必须不小于应用层上限的两倍（base64 + JSON 开销）。"""
+    """uvicorn ws_max_size must be at least twice the app-level limit (base64 + JSON overhead)."""
     assert ws_frame_limit({"max_request_bytes": str(LIMIT_BYTES)}) >= LIMIT_BYTES * 2
     big = 64 * 1024 * 1024
     assert ws_frame_limit({"max_request_bytes": str(big)}) >= big * 2
 
 
-# ---------- item 3/4：响应大小守卫 ----------
+# ---------- item 3/4: response size guard ----------
 
 def test_response_guard_rejects_oversized_single_chunk_before_decode():
-    """单片超限必须在解码前拦截，不构造超限副本。"""
+    """An oversized single chunk must be intercepted before decoding, without building an oversized copy."""
     guard = ResponseSizeGuard(100)
     raised = False
     try:
@@ -801,10 +805,10 @@ def test_response_guard_accepts_exact_limit():
     assert guard.total == 100
 
 
-# ---------- item 6/7/10：组装器边界 ----------
+# ---------- item 6/7/10: assembler boundaries ----------
 
 def test_assembler_trace_disabled_by_default():
-    """生产环境默认不记录无界 trace。"""
+    """Production defaults to no unbounded trace recording."""
     assembler = ChunkAssembler(limit=LIMIT_BYTES)
     assembler.feed(make_chunk("m", 0, b"x", final=True))
     assert assembler.trace == []
@@ -844,7 +848,7 @@ def test_assembler_bounds_incomplete_assemblies_by_count():
     assembler.feed(make_chunk("c", 0, b"3"))
 
     assert assembler.pending_count() == 2
-    assert assembler.total_of("a") == 0  # 最旧的不完整装配被释放
+    assert assembler.total_of("a") == 0  # oldest incomplete assembly released
     assert assembler.total_of("b") == 1
     assert assembler.total_of("c") == 1
 
@@ -862,7 +866,7 @@ def test_assembler_expires_incomplete_assemblies_by_ttl():
 
 
 def test_agent_cancel_releases_incomplete_assembly():
-    """取消必须释放该 message_id 的残缺装配，避免无限增长。"""
+    """A cancel must release that message_id's incomplete assembly to avoid unbounded growth."""
     async def scenario():
         agent = _agent()
         channel = _fake_p2p_channel([])
@@ -875,7 +879,7 @@ def test_agent_cancel_releases_incomplete_assembly():
     asyncio.run(scenario())
 
 
-# ---------- item 10：message_id 与内层 id 校验 ----------
+# ---------- item 10: message_id vs inner id validation ----------
 
 def test_agent_rejects_outer_inner_message_id_mismatch():
     sent = []
@@ -916,7 +920,7 @@ def test_agent_rejects_invalid_base64_request_body():
     assert sent and sent[0]["status"] == 400
 
 
-# ---------- item 9：Agent 控制发送有界 ----------
+# ---------- item 9: bounded Agent control sends ----------
 
 class _HangingAgentWS:
     def __init__(self):
@@ -944,7 +948,7 @@ def test_agent_control_send_timeout_closes_and_raises():
     assert closed == [1011]
 
 
-# ---------- item 2：Agent 控制连接重建清理 ----------
+# ---------- item 2: Agent control connection rebuild cleanup ----------
 
 class _FakePeer:
     def __init__(self):
@@ -978,10 +982,10 @@ def test_agent_reset_p2p_state_closes_peers_and_clears_state():
     assert agent.ws_queues == {}
 
 
-# ---------- item 8：P2P 流协议统一信封 ----------
+# ---------- item 8: unified P2P stream protocol envelope ----------
 
 def test_p2p_stream_error_uses_unified_envelope():
-    """终止性 stream_error 也必须是信封帧，前端无需裸消息特判。"""
+    """Terminal stream_error must also be an envelope frame; the frontend needs no bare-message special case."""
     sent = []
 
     async def scenario():
@@ -1000,7 +1004,7 @@ def test_p2p_stream_error_uses_unified_envelope():
 
 
 def test_p2p_stream_lifecycle_is_fully_enveloped():
-    """头帧、数据帧、结束帧全部使用 {message_id, sequence, data, final} 信封。"""
+    """Head, data and end frames all use the {message_id, sequence, data, final} envelope."""
     sent = []
 
     async def scenario():
@@ -1020,7 +1024,7 @@ def test_p2p_stream_lifecycle_is_fully_enveloped():
     assert sent[2]["type"] == "stream_end" and sent[2]["final"] is True
 
 
-# ---------- item 1：attach_device 关闭旧连接且不污染新状态 ----------
+# ---------- item 1: attach_device closes the old connection without polluting new state ----------
 
 def test_attach_device_closes_replaced_control_connection(tmp_path):
     async def scenario():
@@ -1064,7 +1068,7 @@ def test_cleanup_of_old_connection_does_not_touch_new_state(tmp_path):
     assert device["ws"] is not None
 
 
-# ---------- item 3：stream_proxy 大小上限（集成） ----------
+# ---------- item 3: stream_proxy size limit (integration) ----------
 
 class _FakeRequest:
     method = "GET"
@@ -1135,7 +1139,7 @@ def test_stream_proxy_aborts_on_cumulative_overflow(tmp_path):
         raised = False
         try:
             await _run_asgi(response)
-        except BaseException as exc:  # Starlette 可能用 TaskGroup 包装
+        except BaseException as exc:  # Starlette may wrap it in a TaskGroup
             candidates = [exc] + list(getattr(exc, "exceptions", []))
             raised = any(isinstance(candidate, FrameError) for candidate in candidates)
         return raised
@@ -1144,23 +1148,23 @@ def test_stream_proxy_aborts_on_cumulative_overflow(tmp_path):
 
 
 # ================================================================
-# 第二轮审查修订：Important 1/2/3 与 Minor 4/5/6/7/8
+# Second review round: Important 1/2/3 and Minor 4/5/6/7/8
 # ================================================================
 
 def _decode_error_body(result: dict) -> dict:
-    """兼容裸 response 与统一信封：body 或信封 data 均可。"""
+    """Compatible with both bare responses and unified envelopes: body or envelope data works."""
     encoded = result.get("body")
     if encoded is None:
         encoded = result.get("data", "")
     return json.loads(base64.b64decode(encoded).decode("utf-8"))
 
 
-# ---------- item 1：P2P WebSocket 消息统一信封 ----------
+# ---------- item 1: unified envelope for P2P WebSocket messages ----------
 
 def test_p2p_ws_data_uses_unified_envelope():
-    """ws_data（含大二进制）必须走 {message_id, sequence, data, final} 分片，不得裸发。"""
+    """ws_data (including large binaries) must be chunked into {message_id, sequence, data, final} frames, never sent bare."""
     sent = []
-    raw = bytes(range(256)) * 160  # 40960 字节，强制多帧
+    raw = bytes(range(256)) * 160  # 40960 bytes, forcing multiple frames
 
     async def scenario():
         agent = _agent()
@@ -1182,7 +1186,7 @@ def test_p2p_ws_data_uses_unified_envelope():
 
 
 def test_p2p_ws_lifecycle_messages_are_enveloped():
-    """ws_opened/ws_closed/ws_error 也必须是信封帧，前端无需裸消息特判。"""
+    """ws_opened/ws_closed/ws_error must also be envelope frames; the frontend needs no bare-message special case."""
     sent = []
 
     async def scenario():
@@ -1202,7 +1206,7 @@ def test_p2p_ws_lifecycle_messages_are_enveloped():
 
 
 def test_agent_reassembles_framed_ws_data_into_ws_queue():
-    """浏览器以完整 JSON 分片发送的 ws_data 必须被重组并投递到 WS 队列。"""
+    """ws_data sent by the browser as framed full-JSON must be reassembled and delivered to the WS queue."""
     async def scenario():
         agent = _agent()
         queue = asyncio.Queue()
@@ -1219,10 +1223,10 @@ def test_agent_reassembles_framed_ws_data_into_ws_queue():
     assert item["type"] == "ws_data" and item["data"] == b64(b"hello")
 
 
-# ---------- item 2：流首帧 body 不得丢弃 ----------
+# ---------- item 2: first stream frame body must not be dropped ----------
 
 def test_stream_proxy_preserves_first_frame_body(tmp_path):
-    """首帧同时含 status/headers/body 时，body 必须作为响应内容输出而非丢弃。"""
+    """When the first frame carries status/headers/body together, the body must be output as response content rather than dropped."""
     async def scenario():
         gateway = Gateway({"state_file": str(tmp_path / "g.json"),
                            "max_response_bytes": "1000"})
@@ -1239,7 +1243,7 @@ def test_stream_proxy_preserves_first_frame_body(tmp_path):
     assert asyncio.run(scenario()) == b"first"
 
 
-# ---------- item 3：非法 base64 统一 400 ----------
+# ---------- item 3: invalid base64 uniformly 400 ----------
 
 def test_agent_local_request_rejects_invalid_base64_with_400():
     async def scenario():
@@ -1271,7 +1275,7 @@ def test_agent_local_stream_rejects_invalid_base64_with_stable_reason():
 
 
 def test_p2p_message_invalid_encoding_reports_stable_reason():
-    """P2P 请求体非法 base64 必须 400，并携带稳定 reason。"""
+    """A P2P request body with invalid base64 must be 400 and carry a stable reason."""
     sent = []
 
     async def scenario():
@@ -1290,7 +1294,7 @@ def test_p2p_message_invalid_encoding_reports_stable_reason():
     assert _decode_error_body(sent[0]).get("reason") == INVALID_ENCODING_REASON
 
 
-# ---------- item 4：退避 jitter 不超过 cap ----------
+# ---------- item 4: backoff jitter never exceeds the cap ----------
 
 def test_backoff_jitter_never_exceeds_cap():
     for attempt in (1, 2, 5, 10, 50):
@@ -1300,13 +1304,13 @@ def test_backoff_jitter_never_exceeds_cap():
             assert delay <= 10.0
 
 
-# ---------- item 5：错误墓碑阻止重放 ----------
+# ---------- item 5: error tombstones block replay ----------
 
 def test_assembler_error_tombstone_blocks_replay():
     clock = _FakeClock()
     assembler = ChunkAssembler(limit=LIMIT_BYTES, ttl=10, clock=clock)
     assert assembler.feed(make_chunk("m", 0, b"x" * (LIMIT_BYTES + 1), final=True)) == "error"
-    # 错误后同一 message_id 的重放必须仍被拒绝，而不是重新开始装配。
+    # Replay of the same message_id after an error must still be rejected instead of restarting assembly.
     assert assembler.feed(make_chunk("m", 0, b"ok", final=True)) == "error"
     assert assembler.pending_count() == 1
     clock.advance(11)
@@ -1342,7 +1346,7 @@ def test_agent_does_not_replay_failed_message_id():
     assert sent and all(message["status"] in (400, 413) for message in sent)
 
 
-# ---------- item 6：稳定错误原因常量 ----------
+# ---------- item 6: stable error reason constants ----------
 
 def test_error_reason_constants_are_distinct_and_stable():
     reasons = {REQUEST_TOO_LARGE_REASON, RESPONSE_TOO_LARGE_REASON,
@@ -1351,7 +1355,7 @@ def test_error_reason_constants_are_distinct_and_stable():
     assert all(isinstance(reason, str) and reason for reason in reasons)
     assert STREAM_OVERFLOW_REASON == StreamState.OVERFLOW_REASON
     assert read_bounded.__doc__ is not None
-    # read_bounded 超限必须使用稳定响应原因常量。
+    # read_bounded over the limit must use the stable response reason constant.
     async def scenario():
         try:
             await read_bounded(_AsyncChunks([b"a" * 5]), 4)
@@ -1362,7 +1366,7 @@ def test_error_reason_constants_are_distinct_and_stable():
     assert asyncio.run(scenario()) == RESPONSE_TOO_LARGE_REASON
 
 
-# ---------- item 7：send_control 对已关闭 socket 统一 ConnectionError ----------
+# ---------- item 7: send_control maps closed sockets to a common ConnectionError ----------
 
 class _ClosedControlWS:
     def __init__(self):
@@ -1416,7 +1420,7 @@ def test_agent_send_control_on_closed_socket_raises_connection_error():
     assert closed == [1011]
 
 
-# ---------- item 8：流溢出保持首个稳定原因 ----------
+# ---------- item 8: stream overflow keeps the first stable reason ----------
 
 def test_stream_proxy_overflow_keeps_stable_reason(tmp_path):
     async def scenario():
@@ -1442,13 +1446,13 @@ def test_stream_proxy_overflow_keeps_stable_reason(tmp_path):
 
 
 # ================================================================
-# 第三轮（最终）审查修订
+# Third (final) review round
 # ================================================================
 
-# ---------- item 1：分片路径错误种类区分（400/413/乱序） ----------
+# ---------- item 1: framed-path error kinds (400/413/out-of-order) ----------
 
 def test_p2p_message_framed_error_kinds_are_distinct():
-    """分片路径按错误种类区分：超限→413，非法编码→400，乱序/重放→400 协议错误。"""
+    """Framed path distinguishes error kinds: over-limit -> 413, invalid encoding -> 400, out-of-order/replay -> 400 protocol error."""
     sent = []
 
     async def scenario():
@@ -1460,19 +1464,19 @@ def test_p2p_message_framed_error_kinds_are_distinct():
 
         agent.local_request = forwarded
         channel = _fake_p2p_channel(sent)
-        # 单帧超限 → 413。
+        # single frame over the limit -> 413.
         await agent.p2p_message(channel, frame("f-over", 0, b"x" * (LIMIT_BYTES + 1), True))
-        # 非法帧编码 → 400。
+        # invalid frame encoding -> 400.
         await agent.p2p_message(channel, {"message_id": "f-enc", "sequence": 0,
                                           "data": "!!!!", "final": True})
-        # 乱序（跳跃序列号）→ 400 稳定的协议错误。
+        # out-of-order (skipped sequence) -> 400 stable protocol error.
         await agent.p2p_message(channel, frame("f-seq", 1, b"x", True))
-        # 完成后的重放 → 400 稳定的协议错误。
+        # replay after completion -> 400 stable protocol error.
         await agent.p2p_message(channel, frame("f-rep", 0, b'{"id":"f-rep","type":"ping"}', True))
         await agent.p2p_message(channel, frame("f-rep", 0, b"x", True))
 
     asyncio.run(scenario())
-    # 去掉 ping 对应的 pong，只关注按触发顺序产生的错误响应。
+    # drop the pong answering ping; only look at error responses in trigger order.
     errors = [m for m in sent if _decode_error_body(m).get("error")]
     assert [e["status"] for e in errors] == [413, 400, 400, 400]
     assert _decode_error_body(errors[0])["reason"] == PAYLOAD_TOO_LARGE_REASON
@@ -1482,7 +1486,7 @@ def test_p2p_message_framed_error_kinds_are_distinct():
 
 
 def test_assembler_reason_of_returns_stable_kind():
-    """ChunkAssembler 必须按错误种类暴露稳定 reason，供上层区分 400/413。"""
+    """ChunkAssembler must expose a stable reason per error kind so callers can distinguish 400/413."""
     assembler = ChunkAssembler(limit=LIMIT_BYTES)
     assert assembler.feed(make_chunk("a", 0, b"x" * (LIMIT_BYTES + 1), True)) == "error"
     assert assembler.reason_of("a") == PAYLOAD_TOO_LARGE_REASON
@@ -1490,20 +1494,20 @@ def test_assembler_reason_of_returns_stable_kind():
     assert assembler.reason_of("b") == INVALID_SEQUENCE_REASON
     assert assembler.feed({"message_id": "c", "sequence": 0, "data": "!!!!", "final": True}) == "error"
     assert assembler.reason_of("c") == INVALID_ENCODING_REASON
-    # 完成后的重放也归类为协议乱序。
+    # Replay after completion is also classified as protocol out-of-order.
     assert assembler.feed(make_chunk("d", 0, b"ok", True)) == "accepted"
     assembler.complete("d")
     assert assembler.feed(make_chunk("d", 0, b"x", True)) == "error"
     assert assembler.reason_of("d") == INVALID_SEQUENCE_REASON
 
 
-# ---------- item 2：transient 502/stream_error 统一稳定 reason ----------
+# ---------- item 2: transient 502/stream_error unified stable reason ----------
 
 def test_transient_connection_failure_uses_connection_failed_reason():
-    """连接级失败（无持久 reason）必须统一使用 CONNECTION_FAILED_REASON。"""
+    """Connection-level failures (no persistent reason) must uniformly use CONNECTION_FAILED_REASON."""
     async def scenario():
         agent = _agent()
-        # 目标不可达，local_request 应返回带稳定 reason 的 502 响应。
+        # target unreachable; local_request must return a 502 with a stable reason.
         result = await agent.local_request({"type": "request", "id": "r-conn",
                                             "method": "GET", "path": "/", "headers": {},
                                             "body": b64(b"")}, timeout=0.05)
@@ -1515,7 +1519,7 @@ def test_transient_connection_failure_uses_connection_failed_reason():
 
 
 def test_local_request_follows_redirects():
-    """Agent 代理必须跟随重定向（与原生 fetch 默认 redirect:'follow' 一致）。"""
+    """The Agent proxy must follow redirects (matching native fetch's default redirect:'follow')."""
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1555,7 +1559,7 @@ def test_local_request_follows_redirects():
 
 
 def test_p2p_message_502_carries_stable_reason():
-    """run_request 抛出的连接级错误必须映射为带稳定 reason 的 502。"""
+    """A connection-level error raised by run_request must map to a 502 with a stable reason."""
     sent = []
 
     async def scenario():
@@ -1575,10 +1579,10 @@ def test_p2p_message_502_carries_stable_reason():
                                                           UPSTREAM_ERROR_REASON}
 
 
-# ---------- item 3：非字符串 response body 不得发悬挂帧 ----------
+# ---------- item 3: non-string response body must not send a dangling frame ----------
 
 def test_p2p_send_response_missing_body_raises_protocol_error():
-    """response 缺 body 属于协议错误，必须抛错，不得发送 final=False 悬挂帧。"""
+    """A response missing body is a protocol error: raise instead of sending a final=False dangling frame."""
     sent = []
     async def scenario():
         agent = _agent()
@@ -1592,13 +1596,13 @@ def test_p2p_send_response_missing_body_raises_protocol_error():
 
     raised, sent_count = asyncio.run(scenario())
     assert raised is True
-    assert sent_count == 0  # 不得发出任何悬挂帧
+    assert sent_count == 0  # no dangling frame may be sent
 
 
-# ---------- item 5：ChunkAssembler 全局字节预算 ----------
+# ---------- item 5: ChunkAssembler global byte budget ----------
 
 def test_assembler_rejects_frame_exceeding_global_byte_budget():
-    """并行装配累计字节超过总预算时拒绝并保留错误墓碑，返回稳定原因。"""
+    """Reject when the cumulative bytes of parallel assemblies exceed the total budget, keep an error tombstone, and return a stable reason."""
     assembler = ChunkAssembler(limit=LIMIT_BYTES, budget=8)
     assert assembler.feed(make_chunk("a", 0, b"a" * 5)) is None
     outcome = assembler.feed(make_chunk("b", 0, b"b" * 4))
@@ -1609,27 +1613,27 @@ def test_assembler_rejects_frame_exceeding_global_byte_budget():
 
 
 def test_assembler_complete_releases_global_byte_budget():
-    """完成后释放占用，使预算回到可以再容纳新装配的水平。"""
+    """Completion releases the occupancy so the budget can fit new assemblies again."""
     assembler = ChunkAssembler(limit=LIMIT_BYTES, budget=8)
     assert assembler.feed(make_chunk("a", 0, b"a" * 4)) is None
     assert assembler.feed(make_chunk("a", 1, b"a" * 1, True)) == "accepted"
-    # 已占用 5/8，再装配 5 字节必然超过预算。
+    # 5/8 already used; assembling 5 more bytes must exceed the budget.
     assert assembler.feed(make_chunk("b", 0, b"b" * 5)) == "error"
     assembler.complete("a")
-    # 完成后应释放预算，允许新的装配继续。
+    # completion must release budget so new assemblies can proceed.
     assert assembler.feed(make_chunk("c", 0, b"c" * 5)) is None
 
 
 def test_p2p_total_budget_is_low_and_configurable():
-    """总预算默认不超过单条消息上限，且可用 max_p2p_total_bytes 配置。"""
+    """The total budget defaults to at most the single-message limit and is configurable via max_p2p_total_bytes."""
     assert p2p_total_budget({}) <= p2p_message_limit({})
     assert p2p_total_budget({"max_p2p_total_bytes": "12345"}) == 12345
 
 
-# ---------- item 6：p2p_channel_send 缓冲退避必须有时限 ----------
+# ---------- item 6: p2p_channel_send buffer backoff must have a deadline ----------
 
 def test_p2p_channel_send_times_out_instead_of_looping_forever():
-    """通道持续缓冲不回位时，p2p_channel_send 必须在配置超时内失败，而不是永久循环。"""
+    """When the channel stays backed up without draining, p2p_channel_send must fail within the configured timeout instead of looping forever."""
     class BlockedChannel:
         bufferedAmount = 1 << 30
         readyState = "open"
@@ -1648,18 +1652,18 @@ def test_p2p_channel_send_times_out_instead_of_looping_forever():
 
     raised, elapsed = asyncio.run(scenario())
     assert raised is True
-    assert elapsed < 2.0  # 配置的超时应在短时间内生效
+    assert elapsed < 2.0  # the configured timeout must take effect quickly
 
 
 def test_p2p_channel_send_drains_then_sends_within_timeout():
-    """缓冲回位正常时，退避后继续发送，且行为与超时无关。"""
+    """When the buffer drains normally, keep sending after backoff, with behavior independent of the timeout."""
     sent = []
     class DrainingChannel:
         _ba = 2 * 1024 * 1024
         readyState = "open"
         @property
         def bufferedAmount(self):
-            self._ba //= 2  # 每次探测模拟浏览器逐步回位
+            self._ba //= 2  # each probe simulates the browser draining gradually
             return self._ba
         def send(self, payload: str) -> None:
             sent.append(json.loads(payload))
@@ -1673,16 +1677,16 @@ def test_p2p_channel_send_drains_then_sends_within_timeout():
 
 
 def test_enable_loopback_candidate_adds_loopback_and_is_idempotent():
-    """开启 loopback candidate 后 127.0.0.1 进入 host 候选，且 patch 幂等。"""
+    """After enabling the loopback candidate, 127.0.0.1 joins the host candidates, and the patch is idempotent."""
     import aioice.ice as ice
     original = ice.get_host_addresses
     try:
         enable_loopback_candidate()
         patched = ice.get_host_addresses
-        assert patched is not original  # 已替换为补丁函数
+        assert patched is not original  # replaced by the patched function
         addresses = patched(True, False)
         assert "127.0.0.1" in addresses
-        # 幂等：再次开启不重复 patch，也不重复叠加 loopback
+        # idempotent: enabling again does not re-patch or stack loopback twice
         enable_loopback_candidate()
         assert ice.get_host_addresses is patched
         assert patched(True, False).count("127.0.0.1") == 1
@@ -1691,7 +1695,7 @@ def test_enable_loopback_candidate_adds_loopback_and_is_idempotent():
 
 
 def test_enable_loopback_candidate_preserves_ipv6_and_other_hosts():
-    """patch 只补充 IPv4 loopback，保留原有 host 地址与 IPv6 行为。"""
+    """The patch only adds IPv4 loopback, preserving existing host addresses and IPv6 behavior."""
     import aioice.ice as ice
     original = ice.get_host_addresses
     try:
@@ -1699,14 +1703,14 @@ def test_enable_loopback_candidate_preserves_ipv6_and_other_hosts():
         enable_loopback_candidate()
         after = set(ice.get_host_addresses(True, False))
         assert "127.0.0.1" in after
-        assert before <= after  # 原有地址全部保留
+        assert before <= after  # all original addresses preserved
         assert after - before == {"127.0.0.1"}
     finally:
         ice.get_host_addresses = original
 
 
 # ================================================================
-# 前端适配层健壮性修订：响应头过滤（set-cookie 跨信任边界）
+# Frontend adapter robustness revisions: response header filtering (set-cookie across trust boundary)
 # ================================================================
 
 def test_filter_response_headers_strips_set_cookie_and_hop_headers():
@@ -1733,7 +1737,7 @@ def test_filter_response_headers_is_case_insensitive():
 
 
 # ================================================================
-# 前端适配层健壮性修订：WebSocket 状态机单调性
+# Frontend adapter robustness revisions: WebSocket state machine monotonicity
 # ================================================================
 
 def test_ws_opened_moves_connecting_socket_to_open():
@@ -1768,7 +1772,7 @@ def test_ws_opened_empty_protocol_clears_requested_protocol():
 
 
 # ================================================================
-# 前端适配层健壮性修订：cancelled 不得伪装成 200 空流
+# Frontend adapter robustness revisions: cancelled must not masquerade as an empty 200 stream
 # ================================================================
 
 def test_cancelled_before_first_frame_errors_stream():
@@ -1781,7 +1785,7 @@ def test_cancelled_before_first_frame_errors_stream():
     assert sid not in state.streams
     rejects = [payload for kind, payload in state.settled if kind == "reject"]
     assert rejects  # The pending request must reject instead of resolving cancelled.
-# ---------- item 4：浏览器 CSRF 标记不得穿透到本地 OpenCode ----------
+# ---------- item 4: browser CSRF markers must not leak to local OpenCode ----------
 
 def test_forwarding_headers_strip_credentials_and_csrf_markers():
     """Gateway-to-agent forwarding strips credentials and browser CSRF markers."""

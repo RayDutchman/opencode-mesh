@@ -1,4 +1,4 @@
-"""通过实际 ASGI 请求验证认证边界，不访问生产服务。"""
+"""Verify authentication boundaries through real ASGI requests without touching production services."""
 import asyncio
 import json
 import stat

@@ -23,7 +23,7 @@ from .static_adapter import TRANSPORT_ADAPTER
 
 
 def parse_retry_after(value: str | None) -> float | None:
-    """解析 Retry-After 头（仅支持秒数形式），无有效值时返回 None。"""
+    """Parse a Retry-After header (seconds only); return None when there is no valid value."""
     if not value:
         return None
     value = value.strip()
@@ -35,12 +35,12 @@ def parse_retry_after(value: str | None) -> float | None:
 def backoff_delay(attempt: int, base: float = 1.0, cap: float = 60.0,
                   jitter: float = 0.5, retry_after: float | None = None,
                   rng: random.Random | None = None) -> float:
-    """有界指数退避：attempt 从 1 起算，叠加 jitter，并尊重 Retry-After。"""
+    """Bounded exponential backoff: attempt starts at 1, jitter is added, and Retry-After is respected."""
     generator = rng or random.Random()
     exponent = max(0, int(attempt) - 1)
     delay = base * (2 ** exponent)
     delay += generator.uniform(0, delay * jitter)
-    # jitter 叠加后再统一截断，保证最终 delay 永不超过 cap。
+    # Clamp after adding jitter so the final delay never exceeds cap.
     delay = min(cap, delay)
     if retry_after is not None:
         delay = max(delay, min(cap, float(retry_after)))
@@ -73,7 +73,7 @@ def harden_permissions(path: Path) -> None:
 
 
 def parse_server_route(path: str) -> tuple[str | None, str]:
-    """解析 OpenCode 的 ``/server/<key>`` 路由并恢复设备上游路径。"""
+    """Parse an OpenCode ``/server/<key>`` route and recover the device upstream path."""
     match = re.match(r"^/server/([^/]+)(/.*)?$", path)
     if not match:
         return None, path
@@ -97,7 +97,7 @@ def parse_server_route(path: str) -> tuple[str | None, str]:
 
 
 def rewrite_device_html(body: bytes, device_id: str, bootstrap: bool = False) -> bytes:
-    """把设备 HTML 中的根相对静态资源改成设备作用域路径。"""
+    """Rewrite root-relative static assets in device HTML to device-scoped paths."""
     prefix = "/_mesh/device/" + quote(device_id, safe="")
     pattern = re.compile(rb"((?:src|href)\s*=\s*[\"'])/(?!/|_mesh/)", re.IGNORECASE)
     result = pattern.sub(lambda match: match.group(1) + prefix.encode("ascii") + b"/", body)
@@ -113,7 +113,7 @@ def forwarding_headers(headers) -> dict[str, str]:
                'x-forwarded-port', 'x-real-ip', 'origin', 'referer', 'accept-encoding',
                'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding',
                'te', 'trailer', 'upgrade'}
-    # 请求体已经解码，逐跳帧头和 Connection 指定的头不能进入下一跳。
+    # The request body is already decoded; hop-by-hop frame headers and headers named by Connection must not cross to the next hop.
     for key, value in headers.items():
         if key.lower() == 'connection':
             blocked.update(token.strip().lower() for token in value.split(','))
@@ -227,7 +227,7 @@ class Registry:
 
 
 class StreamState:
-    """有界流缓冲：溢出时产生一条显式 stream_error 并关闭，不驱逐已缓冲分片。"""
+    """Bounded stream buffer: overflow produces an explicit stream_error and closes, without evicting buffered fragments."""
 
     OVERFLOW_REASON = STREAM_OVERFLOW_REASON
 
@@ -256,7 +256,7 @@ class StreamState:
             return False
 
     def fail(self, reason: str) -> None:
-        """幂等地注入一条终止性 stream_error。"""
+        """Inject one terminal stream_error idempotently."""
         if self.closed:
             return
         self.closed = True
@@ -330,7 +330,7 @@ class Gateway:
 
     async def send_control(self, ws: WebSocket, message: dict[str, Any],
                            timeout: float = CONTROL_SEND_TIMEOUT) -> None:
-        """有界控制帧发送：超时或对端已关闭都统一抛出连接级错误。"""
+        """Bounded control frame send: timeout or a closed peer both raise a connection-level error."""
         try:
             await asyncio.wait_for(self.send_to_device(ws, message), timeout)
         except asyncio.TimeoutError:
@@ -338,16 +338,16 @@ class Gateway:
                 await ws.close(code=1011)
             raise ConnectionError("Agent control send timed out")
         except Exception as exc:
-            # 对已关闭 socket 写入会抛 RuntimeError/ConnectionError，统一转换为连接级错误。
+            # Writing to a closed socket raises RuntimeError/ConnectionError; normalize both to a connection-level error.
             with contextlib.suppress(Exception):
                 await ws.close(code=1011)
             raise ConnectionError("Agent control connection closed") from exc
 
     async def attach_device(self, device: dict[str, Any], ws: WebSocket) -> None:
-        """绑定控制连接；同 device_id 重连时关闭旧连接并清理其挂起状态。"""
+        """Bind a control connection; on a reconnect with the same device_id, close the old connection and clean up its pending state."""
         old = device.get("ws")
         if old is not None and old is not ws:
-            # 先真正关闭旧连接，unblock 其 receive 循环，再清理它持有的状态。
+            # Fully close the old connection first to unblock its receive loop, then clean up the state it holds.
             with contextlib.suppress(Exception):
                 await old.close(code=1011)
             await self.cleanup_device(old)
@@ -355,7 +355,7 @@ class Gateway:
         device["last_seen"] = int(time.time())
 
     async def cleanup_device(self, ws: WebSocket) -> None:
-        """幂等地清理某控制连接持有的请求、流、P2P 回答与浏览器桥接。"""
+        """Idempotently clean up requests, streams, P2P answers, and browser bridges held by a control connection."""
         self.device_send_locks.pop(id(ws), None)
         for device in self.registry.devices.values():
             if device.get("ws") is ws:
@@ -606,7 +606,7 @@ class Gateway:
             if existing and not hmac.compare_digest(str(data.get('agent_token', '')).encode(), str(existing.get('auth_token', '')).encode()):
                 if not data.get("rotate_token"):
                     return JSONResponse({"error": "Device ownership proof required"}, status_code=403)
-                # enroll_token 已验证：允许轮换与 Gateway 状态不一致的持久化设备 token。
+                # enroll_token was verified: allow rotating the persisted device token that is out of sync with Gateway state.
                 existing["auth_token"] = secrets.token_urlsafe(32)
             d = self.registry.devices.setdefault(device_id, {"device_id": device_id})
             d.update({"name": data.get("name") or "Unnamed device", "platform": data.get("platform", "unknown"),
@@ -641,7 +641,7 @@ class Gateway:
                     if msg.get("type") == "websocket.disconnect":
                         break
                     if d.get("ws") is not ws:
-                        # 旧连接已被同 device_id 的新连接替换，不得再更新 last_seen 或解析请求。
+                        # The old connection was replaced by a new one with the same device_id; never update last_seen or resolve requests on it.
                         break
                     if "text" not in msg:
                         continue
@@ -786,7 +786,7 @@ class Gateway:
                     body = adapt_entry('/' + path, body)
                 except ValueError as exc:
                     return JSONResponse({'error': str(exc)}, status_code=502)
-                # 新命名空间隔离旧版本 immutable 缓存；入口适配只在该命名空间生效。
+                # The new namespace isolates the old versions' immutable cache; the entry adapter applies only within that namespace.
                 headers.pop('etag', None)
             headers["content-length"] = str(len(body))
             return Response(body, status_code=int(result.get("status", 502)), headers=headers)
@@ -812,12 +812,13 @@ class Gateway:
                 self.streams.pop(request_id, None)
                 self.owners.pop(request_id, None)
                 reason = first.get("reason") or first.get("error", "stream failed")
-                # 非法请求编码属于协议错误，返回 400 而非 502。
+                # Invalid request encoding is a protocol error: return 400 instead of 502.
                 status_code = 400 if reason == INVALID_ENCODING_REASON else 502
                 return JSONResponse({"error": reason, "reason": reason}, status_code=status_code)
             first_body = ""
             if first.get("type") == "stream_chunk":
-                # 首帧携带的 body（如有）也计入上限，避免单片超限绕过；且必须原样输出。
+                # The first frame's body (if any) also counts toward the limit so a single oversized
+                # fragment cannot bypass it; it must be relayed verbatim.
                 first_body = first.get("body") or ""
                 guard.add_encoded(first_body)
             headers = filter_response_headers(first.get("headers", {}))
@@ -835,8 +836,8 @@ class Gateway:
                             raise ConnectionError(msg.get("error", "Event stream disconnected"))
                         if msg.get("type") == "stream_chunk":
                             encoded = msg.get("body") or ""
-                            # 超限时抛出的 FrameError 携带稳定原因，必须原样向上传播，
-                            # 不能被 finally 中的 cancel 或后续断连错误覆盖。
+                            # The FrameError raised on overflow carries a stable reason and must propagate
+                            # untouched, not be masked by the cancel in finally or a later disconnect error.
                             guard.add_encoded(encoded)
                             yield decode_strict(encoded)
                 finally:
@@ -865,12 +866,12 @@ class Gateway:
 
     @staticmethod
     def enqueue_stream(state: StreamState, item: dict[str, Any]) -> bool:
-        """向有界流缓冲推送一帧；溢出时产生显式 stream_error 而非驱逐旧分片。"""
+        """Push one frame into the bounded stream buffer; overflow yields an explicit stream_error instead of evicting old fragments."""
         return state.push(item)
 
     @staticmethod
     async def stream_messages(state: StreamState):
-        """消费有界流缓冲：正常排空、溢出或终止帧都恰好结束一次。"""
+        """Consume the bounded stream buffer: normal drain, overflow, or a terminal frame each end exactly once."""
         while True:
             while True:
                 try:
@@ -977,7 +978,7 @@ class Agent:
 
     async def local_stream(self, item: dict[str, Any], ws):
         if not is_valid_base64(item.get("body") or ""):
-            # 非法编码是协议错误，返回稳定 stream_error 原因而非后续解码异常。
+            # Invalid encoding is a protocol error: return a stable stream_error reason instead of a later decode exception.
             await self.stream_send(ws, {"type": "stream_error", "id": item["id"],
                                         "error": INVALID_ENCODING_REASON,
                                         "reason": INVALID_ENCODING_REASON})
@@ -998,7 +999,7 @@ class Agent:
                     out_headers = filter_response_headers(r.headers)
                     await self.stream_send(ws, {"type":"stream_chunk","id":item["id"],"status":r.status_code,"headers":out_headers})
                     async for chunk in r.aiter_bytes():
-                        # 逐片累计上限：单片与累计超限都以稳定 stream_error 终止。
+                        # Per-fragment cumulative limit: both a single oversized chunk and an over-budget stream end with a stable stream_error.
                         guard.add_bytes(chunk)
                         await self.stream_send(ws, {"type":"stream_chunk","id":item["id"],"body":base64.b64encode(chunk).decode()})
                     await self.stream_send(ws, {"type":"stream_end","id":item["id"]})
@@ -1028,7 +1029,7 @@ class Agent:
             await control.send(json.dumps(message))
 
     async def _p2p_error(self, channel: Any, message_id: str, status: int, reason: str) -> None:
-        """以统一信封回一条带稳定 reason 的协议错误响应。"""
+        """Reply with a protocol error response carrying a stable reason in the uniform envelope."""
         payload = json.dumps({"error": reason, "reason": reason}).encode()
         await self.p2p_send(channel, {"type": "response", "id": message_id, "status": status,
                                       "headers": {"content-type": "application/json"},
@@ -1037,7 +1038,7 @@ class Agent:
     async def p2p_message(self, channel: Any, item: dict[str, Any]) -> None:
         """Handle HTTP/SSE requests sent by the browser over the WebRTC DataChannel."""
         if "message_id" in item and "sequence" in item and "final" in item:
-            # 浏览器发来的分片信封：按 channel 隔离重组为完整请求后再分发。
+            # Fragment envelopes from the browser: reassemble per channel into a complete request before dispatching.
             assembler = self.p2p_assemblers.setdefault(
                 id(channel), ChunkAssembler(limit=p2p_message_limit(self.cfg),
                                             budget=p2p_total_budget(self.cfg)))
@@ -1053,19 +1054,19 @@ class Agent:
                     except Exception:
                         await self._p2p_error(channel, message_id, 400, INVALID_ENCODING_REASON)
                         return
-                    # HTTP 请求必须保持外层传输 ID 与内层逻辑 ID 一致；WebSocket
-                    # 数据帧则使用每帧独立的传输 ID，并按 socket ID 路由。
+                    # HTTP requests must keep the outer transport ID consistent with the inner logical ID;
+                    # WebSocket data frames use a fresh transport ID per frame and are routed by socket ID.
                     if restored.get("type") not in {"ws_data", "ws_close"} and str(restored.get("id", "")) != message_id:
                         await self._p2p_error(channel, message_id, 400, "message_id mismatch")
                         return
                     await self.p2p_message(channel, restored)
                 finally:
-                    # 完成后保留墓碑到 TTL，阻止同 message_id 重放。
+                    # Keep a tombstone until TTL after completion to block replays of the same message_id.
                     assembler.complete(message_id)
             else:
-                # 错误墓碑保留到 TTL：重放同一 message_id 继续得到相同的稳定错误。
+                # Error tombstones last until TTL: replaying the same message_id keeps returning the same stable error.
                 reason = assembler.reason_of(message_id) or "reassembly error"
-                # 非法编码与乱序/重放是协议错误（400）；超限与缓冲区耗尽是容量错误（413）。
+                # Invalid encoding and out-of-order/replay are protocol errors (400); overflow and buffer exhaustion are capacity errors (413).
                 status = 400 if reason in {INVALID_ENCODING_REASON, INVALID_SEQUENCE_REASON} else 413
                 await self._p2p_error(channel, message_id, status, reason)
             return
@@ -1079,7 +1080,7 @@ class Agent:
             task = self.p2p_tasks.get(key)
             if task:
                 task.cancel()
-            # 取消也必须释放该 message_id 的残缺装配。
+            # A cancel must also release this message_id's partial assembly.
             assembler = self.p2p_assemblers.get(id(channel))
             if assembler is not None:
                 assembler.discard(str(item.get("id", "")))
@@ -1092,7 +1093,7 @@ class Agent:
 
         encoded_body = item.get("body")
         if isinstance(encoded_body, str):
-            # 用精确解码长度判断，避免 base64 3 字节边界误差放行超限请求；非法编码直接 400。
+            # Judge limits by the exact decoded length so base64 3-byte boundary rounding cannot admit an oversized request; invalid encoding is 400 directly.
             if not is_valid_base64(encoded_body):
                 await self._p2p_error(channel, item.get("id", ""), 400, INVALID_ENCODING_REASON)
                 return
@@ -1144,25 +1145,26 @@ class Agent:
         return value
 
     async def p2p_send(self, channel: Any, message: dict[str, Any]) -> None:
-        """使用统一 {message_id, sequence, data, final} 信封发送响应与流生命周期消息。
+        """Send responses and stream lifecycle messages in a uniform {message_id, sequence, data, final} envelope.
 
-        流协议：头帧（status/headers）、数据帧（stream_chunk）、终止帧
-        （stream_end/stream_error/cancelled）全部为信封帧，终止帧 final=True 且
-        在首帧携带 type/error 等元数据，浏览器无需裸消息特判。
+        Stream protocol: header frames (status/headers), data frames (stream_chunk),
+        and terminal frames (stream_end/stream_error/cancelled) are all envelope
+        frames; terminal frames have final=True and carry type/error metadata on
+        the first frame, so the browser never needs special handling for bare messages.
         """
         message_type = message.get("type")
         message_id = str(message.get("id", ""))
         key = (id(channel), message_id)
         metadata = {k: v for k, v in message.items() if k not in {"body", "data"}}
-        # 流生命周期终止帧：单帧 final=True，携带 type/error 元数据。
+        # Stream lifecycle terminal frames: a single frame with final=True carrying type/error metadata.
         if message_type in {"stream_end", "stream_error", "cancelled", "cancel"}:
             sequence = self.p2p_sequence.pop(key, 0)
             terminal = frame(message_id, sequence, b"", True)
             terminal.update(metadata)
             await self.p2p_channel_send(channel, terminal)
             return
-        # 其它控制/WS 消息（ws_open/ws_data/ws_closed/ws_error/pong 等）：
-        # 统一把完整 JSON 作为 data 分片，前端无需判断裸消息。
+        # Other control/WS messages (ws_open/ws_data/ws_closed/ws_error/pong etc.):
+        # always send the full JSON as a data fragment so the frontend never has to inspect bare messages.
         if message_type not in {"response", "stream_chunk"}:
             payload = json.dumps(message, ensure_ascii=False).encode("utf-8")
             await self._p2p_send_payload(channel, message_id, message_type, payload, {},
@@ -1171,9 +1173,9 @@ class Agent:
         body = message.get("body")
         if not isinstance(body, str):
             if message_type == "response":
-                # response 缺 body 属于协议错误：必须抛错，绝不发送 final=False 悬挂帧。
+                # A response missing its body is a protocol error: raise, never send a hanging final=False frame.
                 raise FrameError("response body must be a base64-encoded string")
-            # 无 body 的流头帧（stream_chunk）同样使用信封（final=False），保证前端统一处理。
+            # Header frames without a body (stream_chunk) also use the envelope so the frontend handles them uniformly.
             sequence = self._p2p_next_sequence(channel, message_id)
             header = frame(message_id, sequence, b"", True)
             header.update(metadata)
@@ -1195,14 +1197,14 @@ class Agent:
     async def _p2p_send_payload(self, channel: Any, message_id: str, message_type: str,
                                 payload: bytes, metadata: dict[str, Any],
                                 streaming: bool) -> None:
-        """按信封发送一段载荷；streaming 时复用同一 message_id 的递增 sequence。"""
+        """Send a payload in the envelope; while streaming, reuse an increasing sequence for the same message_id."""
         key = (id(channel), message_id)
         for index, chunk in enumerate(iter_frames(message_id, payload, CHUNK_SIZE)):
             frame_message = dict(chunk)
             if streaming:
                 frame_message["sequence"] = self._p2p_next_sequence(channel, message_id)
-                # 每次 stream_chunk 调用都是一个可交付的逻辑消息；多帧时只让
-                # 最后一帧 final=True，浏览器才能在同一 message_id 上区分消息边界。
+                # Every stream_chunk call is one deliverable logical message; across multiple frames
+                # only the last frame is final=True so the browser can tell message boundaries apart on the same message_id.
             if index == 0 and metadata:
                 frame_message.update(metadata)
             await self.p2p_channel_send(channel, frame_message)
@@ -1212,8 +1214,9 @@ class Agent:
     async def p2p_channel_send(self, channel: Any, message: dict[str, Any]) -> None:
         """Await the DataChannel buffer serially within a configured timeout.
 
-        若缓冲在 `p2p_send_timeout` 内未回位到阈值以下，则视为通道卡死：
-        关闭通道并抛 ConnectionError，而不是永久退避等待。
+        If the buffer does not fall back below the threshold within
+        `p2p_send_timeout`, the channel is considered stalled: close it and raise
+        ConnectionError instead of backing off forever.
         """
         payload = json.dumps(message)
         timeout = float(self.cfg.get("p2p_send_timeout", 10.0))
@@ -1230,7 +1233,7 @@ class Agent:
         channel.send(payload)
 
     async def reset_p2p_state(self) -> None:
-        """控制连接重建时关闭旧 P2P peer，并清空 tasks/assemblers/sequence/ws 队列。"""
+        """When the control connection is rebuilt, close old P2P peers and clear tasks/assemblers/sequence/ws queues."""
         tasks = list(self.p2p_tasks.values())
         for task in tasks:
             task.cancel()
@@ -1300,7 +1303,7 @@ class Agent:
 
     async def local_request(self, item: dict[str, Any], timeout: float = 120) -> dict[str, Any]:
         if not is_valid_base64(item.get("body") or ""):
-            # 非法 base64 是协议错误：返回 400 而不是让 decode_strict 抛异常变成 502。
+            # Invalid base64 is a protocol error: return 400 instead of letting decode_strict raise and become a 502.
             payload = json.dumps({"error": INVALID_ENCODING_REASON,
                                   "reason": INVALID_ENCODING_REASON}).encode()
             return {"type": "response", "id": item["id"], "status": 400, "headers": {"content-type": "application/json"},
@@ -1346,14 +1349,14 @@ class Agent:
             try:
                 await self.send_control(ws, {"type": "pong"})
             except Exception:
-                # 心跳超时/失败：关闭连接让 run() 进入重建，而不是永久阻塞。
+                # Heartbeat timeout/failure: close the connection so run() rebuilds instead of blocking forever.
                 with contextlib.suppress(Exception):
                     await ws.close(code=1011)
                 return
 
     async def send_control(self, ws, message: dict[str, Any],
                            timeout: float = CONTROL_SEND_TIMEOUT) -> None:
-        """有界控制发送：串行化写入；超时或对端已关闭都统一抛连接级错误以触发重建。"""
+        """Bounded control send: serialize writes; timeout or a closed peer both raise a connection-level error to trigger a rebuild."""
         try:
             async with self.control_send_lock:
                 await asyncio.wait_for(ws.send(json.dumps(message)), timeout)
@@ -1362,7 +1365,7 @@ class Agent:
                 await ws.close(code=1011)
             raise ConnectionError("Agent control send timed out")
         except Exception as exc:
-            # 对已关闭 socket 写入会抛 RuntimeError/ConnectionError，统一转换为连接级错误。
+            # Writing to a closed socket raises RuntimeError/ConnectionError; normalize both to a connection-level error.
             with contextlib.suppress(Exception):
                 await ws.close(code=1011)
             raise ConnectionError("Agent control connection closed") from exc
@@ -1394,7 +1397,7 @@ class Agent:
                         await asyncio.sleep(delay)
                         continue
                     if r.status_code == 403 and "ownership" in r.text.lower():
-                        # 本地持久化 token 与 Gateway 状态不一致：用 enroll_token 轮换身份后重试。
+                        # The locally persisted token is out of sync with Gateway state: rotate the identity with enroll_token and retry.
                         data["rotate_token"] = True
                         attempt += 1
                         delay = backoff_delay(attempt)
@@ -1458,7 +1461,7 @@ class Agent:
                         await asyncio.gather(*remaining, return_exceptions=True)
                         with contextlib.suppress(asyncio.CancelledError):
                             await heartbeat
-                        # 连接断开/重建：关闭旧 P2P peer 并清空所有关联状态。
+                        # Connection dropped/rebuild: close old P2P peers and clear all associated state.
                         await self.reset_p2p_state()
             except Exception as exc:
                 attempt += 1
@@ -1469,9 +1472,9 @@ class Agent:
 
 
 def inject_mesh_bar(body: bytes) -> bytes:
-    """仅向 V2 页面注入适配器，V1 页面保留原生传输实现。"""
-    # V1 使用 /assets，V2 使用 /_assets。两者的 API、事件流和 WebSocket
-    # 协议不同，把 V2 适配器注入 V1 会导致健康检查返回 HTML 并拖垮整个前端。
+    """Inject the adapter only into V2 pages; V1 pages keep the native transport implementation."""
+    # V1 uses /assets, V2 uses /_assets. Their APIs, event streams, and WebSocket
+    # protocols differ; injecting the V2 adapter into V1 would make health checks return HTML and break the whole frontend.
     if b"/assets/" in body and b"/_assets/" not in body:
         return body
     adapter = TRANSPORT_ADAPTER.replace(
@@ -1485,7 +1488,7 @@ def inject_mesh_bar(body: bytes) -> bytes:
 
 
 def resolve_agent_config(path: str | Path, cfg: dict[str, Any], instance: str | None) -> dict[str, Any]:
-    """统一配置只保存人工设置，身份路径由安装目录与实例名确定。"""
+    """The shared configuration stores only manual settings; identity paths are derived from the install directory and instance name."""
     if "agents" not in cfg:
         if instance is not None:
             raise ValueError("--instance requires a shared agents configuration")
@@ -1515,8 +1518,8 @@ def main():
     if args.mode == "gateway":
         if args.instance is not None:
             parser.error("--instance is only supported in agent mode")
-        # ws_max_size 必须覆盖应用层请求上限（base64 展开 + JSON 开销），
-        # 否则默认 16MiB 会在应用层限制生效前提前断开大响应。
+        # ws_max_size must cover the application request limit (base64 expansion + JSON overhead);
+        # otherwise the default 16MiB would disconnect large responses before the application limit applies.
         uvicorn.run(Gateway(cfg).app, host=cfg.get("listen_host", "127.0.0.1"), port=int(cfg.get("listen_port", 8090)),
                     log_level="info", timeout_graceful_shutdown=5, ws_max_size=ws_frame_limit(cfg))
     else:

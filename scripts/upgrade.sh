@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Update an existing installation from a committed Git ref, preserving config/data.
-# 用法：bash scripts/upgrade.sh HOST DIR agent|gateway user|system [REF]
+# Usage: bash scripts/upgrade.sh HOST DIR agent|gateway user|system [REF]
 # HOST=local runs the same deployment steps without SSH. REF defaults to HEAD.
 
 if [[ "${1:-}" == --apply ]]; then
@@ -26,10 +26,12 @@ if [[ "${1:-}" == --apply ]]; then
   manager=(systemctl)
   [[ "$scope" != user ]] || manager+=(--user)
 
-  # 共享源码升级是整个安装目录的操作：收集同 scope 下所有 Mesh 服务单元
-  # （默认 Agent、具名 Agent 实例、Gateway），随后用 WorkingDirectory 归并到本目录。
-  # list-unit-files 覆盖 enabled/disabled 的已安装单元，list-units 覆盖正在运行的单元；
-  # 模板单元（@.service，无实例）不参与发现与守卫。
+  # A shared-source upgrade targets the whole install directory: collect every Mesh
+  # service unit under the same scope (default Agent, named Agent instances,
+  # Gateway), then fold them into this directory by WorkingDirectory.
+  # list-unit-files covers installed units regardless of enable state, list-units
+  # covers running units; template units (@.service, no instance) are excluded
+  # from discovery and guarding.
   declare -A candidates=()
   while read -r name _; do
     case "$name" in
@@ -46,7 +48,8 @@ if [[ "${1:-}" == --apply ]]; then
     esac
   done < <("${manager[@]}" list-units --all --plain --no-legend --type=service 2>/dev/null || true)
 
-  # WorkingDirectory 必须是本安装目录（realpath 消除符号链接后比较），其他目录的单元一律排除。
+  # WorkingDirectory must point at this install directory (compared after realpath
+  # strips symlinks); units in other directories are always excluded.
   managed=()
   for name in "${!candidates[@]}"; do
     wd=$("${manager[@]}" show "$name" -p WorkingDirectory --value 2>/dev/null) || true
@@ -56,7 +59,8 @@ if [[ "${1:-}" == --apply ]]; then
   done
   mapfile -t managed < <(printf '%s\n' "${managed[@]}" | LC_ALL=C sort)
 
-  # 目标角色没有任何已安装服务时拒绝，避免“部署成功但没有对应服务可更新”的静默成功。
+  # Refuse when the target role has no installed service, avoiding a silent
+  # "deployed but nothing to update" success.
   role_found=0
   for name in "${managed[@]}"; do
     if [[ "$role" == gateway ]]; then
@@ -73,7 +77,8 @@ if [[ "${1:-}" == --apply ]]; then
     exit 1
   }
 
-  # 记录升级前的运行状态：只 stop/restart 升级前运行的单元，原 inactive 保持停止。
+  # Record pre-upgrade run state: only units running before the upgrade are
+  # stopped/restarted; originally inactive units stay stopped.
   declare -A was_active=()
   for name in "${managed[@]}"; do
     if "${manager[@]}" is-active --quiet "$name"; then
@@ -84,10 +89,10 @@ if [[ "${1:-}" == --apply ]]; then
   done
 
   if [[ -f "$root/.mesh-revision" && $(cat "$root/.mesh-revision") == "$revision" ]]; then
-    printf '已是目标提交 %.12s，无需升级或重启。\n' "$revision"
+    printf 'Already at target commit %.12s; no upgrade or restart needed.\n' "$revision"
     exit 0
   fi
-  # 恢复资料仅在本次操作期间存在；恢复失败时保留供人工处理。
+  # Recovery data exists only for this operation; on failure it is kept for manual handling.
   backup="$stage/rollback.tar.gz"
   files=(src scripts pyproject.toml)
   [[ ! -f "$root/.mesh-revision" ]] || files+=(.mesh-revision)
@@ -100,29 +105,31 @@ if [[ "${1:-}" == --apply ]]; then
     recovery_failed=0
     printf 'Deployment failed; restoring source from %s\n' "$backup" >&2
     if [[ "$source_changed" == 1 ]]; then
-      # 启动新版本可能只成功了一部分，恢复源码前必须再次停止这些服务。
+      # The new version may have started only partially; stop these services again
+      # before restoring source.
       if [[ ${#stop_targets[@]} -gt 0 ]]; then
         "${manager[@]}" stop "${stop_targets[@]}" || {
           printf 'Cannot safely restore running services; backup: %s\n' "$backup" >&2
           exit 1
         }
       fi
-      rm -rf -- "$root/src" "$root/scripts" || { printf '恢复失败，资料保留于 %s\n' "$stage" >&2; exit 1; }
+      rm -rf -- "$root/src" "$root/scripts" || { printf 'Restore failed; recovery data kept at %s\n' "$stage" >&2; exit 1; }
       rm -f -- "$root/.mesh-revision"
-      tar -xzf "$backup" -C "$root" || { printf '恢复失败，资料保留于 %s\n' "$stage" >&2; exit 1; }
+      tar -xzf "$backup" -C "$root" || { printf 'Restore failed; recovery data kept at %s\n' "$stage" >&2; exit 1; }
       "$python" -m pip install -e "$root" --quiet || recovery_failed=1
     fi
-    # 恢复所有升级前运行的服务；部分 stop 失败时仍在运行的单元同样重启，
-    # 保证原 active 集合整体恢复原状。
+    # Restore every service that ran before the upgrade; units still running after
+    # a partial stop are restarted too, so the original active set is fully
+    # restored.
     for name in "${managed[@]}"; do
       if [[ "${was_active[$name]}" == 1 ]]; then
         "${manager[@]}" restart "$name" || recovery_failed=1
         "${manager[@]}" is-active --quiet "$name" || recovery_failed=1
       fi
     done
-    [[ "$recovery_failed" == 0 ]] || { printf '恢复未完全成功，资料保留于 %s\n' "$stage" >&2; exit 1; }
+    [[ "$recovery_failed" == 0 ]] || { printf 'Recovery incomplete; recovery data kept at %s\n' "$stage" >&2; exit 1; }
     rm -rf -- "$stage"
-    printf '已恢复原版本和原运行服务。\n' >&2
+    printf 'Restored the original version and running services.\n' >&2
     exit 1
   }
   trap rollback ERR
@@ -134,7 +141,8 @@ if [[ "${1:-}" == --apply ]]; then
     fi
   done
   if [[ ${#stop_targets[@]} -gt 0 ]]; then
-    # 一次调用停掉全部原运行单元；任一失败进入回滚，回滚按原 active 集合整体恢复。
+    # Stop all originally running units in one call; any failure enters rollback,
+    # which restores the original active set as a whole.
     "${manager[@]}" stop "${stop_targets[@]}"
   fi
 
@@ -147,13 +155,14 @@ if [[ "${1:-}" == --apply ]]; then
   if [[ ${#stop_targets[@]} -gt 0 ]]; then
     "${manager[@]}" restart "${stop_targets[@]}"
   fi
-  # 健康检查等待窗口可用 MESH_DEPLOY_HEALTH_SLEEP 覆盖（测试置 0，默认保持原行为）。
+  # The health-check sleep window can be overridden with MESH_DEPLOY_HEALTH_SLEEP
+  # (tests set it to 0; the default preserves the original behavior).
   sleep "${MESH_DEPLOY_HEALTH_SLEEP:-2}"
   for name in "${stop_targets[@]}"; do
     "${manager[@]}" is-active --quiet "$name"
   done
   trap - ERR
-  printf '升级成功（%.12s），已恢复运行服务：%s\n' "$revision" "${stop_targets[*]:-无（原服务均未运行）}"
+  printf 'Upgrade succeeded (%.12s); running services restored: %s\n' "$revision" "${stop_targets[*]:-none (no services were running)}"
   exit 0
 fi
 
@@ -187,31 +196,31 @@ if [[ $# == 0 ]] && { : >/dev/tty; } 2>/dev/null; then
       services[$key]="${services[$key]:-} $name"
     done < <({ "${manager[@]}" list-unit-files --no-legend --type=service 2>/dev/null || true; "${manager[@]}" list-units --all --plain --no-legend --type=service 2>/dev/null || true; } | LC_ALL=C sort -u)
   done
-  [[ ${#keys[@]} -gt 0 ]] || { printf '未发现本机 Mesh 安装；请先运行 install.sh，或通过位置参数指定远程安装。\n' >&2; exit 1; }
+  [[ ${#keys[@]} -gt 0 ]] || { printf 'No local Mesh installation found; run install.sh first, or pass a remote installation via positional arguments.\n' >&2; exit 1; }
   choice=1
   if [[ ${#keys[@]} -gt 1 ]]; then
     for i in "${!keys[@]}"; do printf '%s) %s\n' "$((i+1))" "${keys[$i]}"; done
     while true; do
-      choice=$(ask '请选择安装编号' 1)
+      choice=$(ask 'Select an installation' 1)
       [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && ((choice<=${#keys[@]})) && break
-      printf '编号无效，请重新选择。\n' >&2
+      printf 'Invalid number; please choose again.\n' >&2
     done
   fi
   key=${keys[$((choice-1))]}; scope=${key%%|*}; root=${key#*|}; role=${roles[$key]}
-  [[ -x "$root/.venv/bin/python" && -d "$root/src" && -d "$root/scripts" && -f "$root/pyproject.toml" ]] || { printf '发现的服务目录不是有效的 Mesh 安装：%s；请检查服务配置。\n' "$root" >&2; exit 1; }
+  [[ -x "$root/.venv/bin/python" && -d "$root/src" && -d "$root/scripts" && -f "$root/pyproject.toml" ]] || { printf 'The discovered service directory is not a valid Mesh installation: %s; please check the service configuration.\n' "$root" >&2; exit 1; }
   host=local; ref=HEAD
   repo=$(git -C "$(dirname "$(realpath "$0")")" rev-parse --show-toplevel)
   target=$(git -C "$repo" rev-parse HEAD)
   current=$(cat "$root/.mesh-revision" 2>/dev/null || true)
-  if [[ "$current" == "$target" ]]; then printf '已是当前源码提交 %.12s，无需升级或重启。\n' "$target"; exit 0; fi
-  [[ "$scope" != system || $EUID == 0 ]] || { printf '这是系统级安装，请使用 sudo 及明确位置参数执行升级。\n' >&2; exit 1; }
+  if [[ "$current" == "$target" ]]; then printf 'Already at current source commit %.12s; no upgrade or restart needed.\n' "$target"; exit 0; fi
+  [[ "$scope" != system || $EUID == 0 ]] || { printf 'This is a system-scope installation; run the upgrade with sudo and explicit positional arguments.\n' >&2; exit 1; }
   version=$(git -C "$repo" show HEAD:src/__init__.py | sed -n 's/^__version__ = "\(.*\)"/\1/p')
   current_version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$root/src/__init__.py" 2>/dev/null || true)
-  printf '当前版本：%s\n' "${current_version:-未知}"
-  printf '安装位置：%s\n服务作用域：%s\n当前提交：%.12s\n目标版本：%s（%.12s，当前源码仓库）\n关联服务：%s\n升级仅重启原先运行的服务，保留配置与身份。\n' "$root" "$scope" "${current:-未知}" "$version" "$target" "${services[$key]}"
+  printf 'Current version: %s\n' "${current_version:-unknown}"
+  printf 'Install location: %s\nService scope: %s\nCurrent commit: %.12s\nTarget version: %s (%.12s, current source repo)\nServices: %s\nUpgrade restarts only previously running services and preserves config and identity.\n' "$root" "$scope" "${current:-unknown}" "$version" "$target" "${services[$key]}"
   while true; do
-    answer=$(ask '是否升级？(Y/n)' Y)
-    case "$answer" in y|Y) break ;; n|N) printf '已取消。\n'; exit 0 ;; *) printf '请输入 y 或 n。\n' >&2 ;; esac
+    answer=$(ask 'Proceed with upgrade? (Y/n)' Y)
+    case "$answer" in y|Y) break ;; n|N) printf 'Cancelled.\n'; exit 0 ;; *) printf 'Please enter y or n.\n' >&2 ;; esac
   done
   set -- "$host" "$root" "$role" "$scope" "$ref"
 fi
@@ -226,12 +235,12 @@ if [[ "$host" == local ]]; then
   case "$root" in '~') root=$HOME ;; '~/'*) root="$HOME/${root:2}" ;; esac
   root=$(realpath -m "$root")
 fi
-[[ "$root" == /* && "$root" != / ]] || { printf '安装目录必须为绝对路径（远程路径不展开 ~）。\n' >&2; exit 2; }
-[[ "$role" == agent || "$role" == gateway ]] || { printf '角色只能是 agent 或 gateway。\n' >&2; exit 2; }
-[[ "$scope" == user || "$scope" == system ]] || { printf 'Scope 是服务层级，只能是 user 或 system，不是用户名。\n' >&2; exit 2; }
+[[ "$root" == /* && "$root" != / ]] || { printf 'Install directory must be an absolute path (remote paths are not ~-expanded).\n' >&2; exit 2; }
+[[ "$role" == agent || "$role" == gateway ]] || { printf 'Role must be agent or gateway.\n' >&2; exit 2; }
+[[ "$scope" == user || "$scope" == system ]] || { printf 'Scope is a service level and must be user or system, not a username.\n' >&2; exit 2; }
 script=$(realpath "$0")
 repo=$(git -C "$(dirname "$script")" rev-parse --show-toplevel)
-revision=$(git -C "$repo" rev-parse --verify "${ref}^{commit}" 2>/dev/null) || { printf '找不到 Git 引用 %s；使用 HEAD 表示当前仓库提交，或指定已有发布标签（例如 v0.3.0）。\n' "$ref" >&2; exit 2; }
+revision=$(git -C "$repo" rev-parse --verify "${ref}^{commit}" 2>/dev/null) || { printf 'Git reference not found: %s; use HEAD for the current repo commit, or specify an existing release tag (e.g. v0.3.0).\n' "$ref" >&2; exit 2; }
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
 git -C "$repo" archive --format=tar.gz "$revision" src scripts pyproject.toml > "$tmp/release.tar.gz"
