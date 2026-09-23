@@ -4,6 +4,7 @@
 
 本文是架构总览，不替代具体协议和部署手册：
 
+- 当前维护范围、已知限制与交接方法见 [maintenance.md](maintenance.md)。本文及协议描述当前行为，历史 plans/specs 仅作有日期和版本的证据。
 - 传输消息、分片信封和错误语义见 [`protocol.md`](./protocol.md)。
 - V2 设计边界见 [`V2 最小传输适配设计`](./superpowers/specs/2026-09-23-v2-minimal-transport-design.md)，实测结果与限制见 [`执行与验收记录`](./superpowers/plans/2026-09-23-v2-minimal-transport.md)。
 - [`opencode-web-capability-matrix.md`](./opencode-web-capability-matrix.md) 和路由目录保留历史资料，不代表当前 V2 的完整验收范围。
@@ -62,7 +63,7 @@ Gateway 由 FastAPI/uvicorn 托管；Agent 是 asyncio 常驻进程。Agent 不�
 
 本节为部署设计边界，本轮未在 VPS 上安装 OpenCode 或同机独立 Agent。
 
-同一 VPS 可以同时运行 Gateway 和一套 OpenCode，但两者仍是独立角色：另起一个 Agent，将 `opencode_url` 指向该 VPS 的本地 OpenCode，例如 `http://127.0.0.1:40960`，再注册到 Gateway。浏览器以该 Agent 的明确 `device_id` 访问，不将 Gateway 的 origin 当作此 OpenCode 的身份，也不为 VPS 增加特殊业务路由。
+同一 VPS 可以同时运行 Gateway 和一套 OpenCode，但两者仍是独立角色：另起一个 Agent，将 `opencode_url` 指向该 VPS 的本地 OpenCode，例如 `http://127.0.0.1:4096`（按实际监听端口配置），再注册到 Gateway。浏览器以该 Agent 的明确 `device_id` 访问，不将 Gateway 的 origin 当作此 OpenCode 的身份，也不为 VPS 增加特殊业务路由。
 
 每个 Agent 必须使用独立 `state_file`，因为设备身份和 Agent token 保存在其中；同机多个 Agent 不能共享它。设备显示名用于辨认，不用于判断身份。Gateway 浏览器认证与本地 OpenCode 认证分别配置。
 

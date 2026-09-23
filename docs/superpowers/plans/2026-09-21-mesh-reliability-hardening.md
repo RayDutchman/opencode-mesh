@@ -1,5 +1,7 @@
 # Mesh Reliability Hardening Implementation Plan
 
+> **历史状态声明：** 本文是特定时期的历史记录，不是当前实施指令；当前以 [`../../../README.md`](../../../README.md)、[`../../architecture.md`](../../architecture.md)、[`../../protocol.md`](../../protocol.md) 和 [`../../maintenance.md`](../../maintenance.md) 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. This plan is being executed inline by the primary agent; no sub-agent will modify code.
 
 **Goal:** 修复 Mesh 的流数据丢失、连接永久阻塞、P2P 大帧和浏览器适配问题，并统一安装卸载行为与文档，使 Relay 和 P2P 在本地及现网部署中保持可验证、可恢复。
@@ -11,7 +13,7 @@
 ## Global Constraints
 
 - 现有 WSL 到 Windows 的 Relay 路径必须继续可用。
-- ehang-box 的局域网 P2P 路径必须继续可用。
+- Device B 的局域网 P2P 路径必须继续可用。
 - 不修改 Lucky、Xray、Hysteria、FRP、防火墙或真实 OpenCode。
 - 所有批次先在本地验证，全部完成后才部署公网和设备。
 - 不提交真实凭据、token、设备身份或运行时状态。
@@ -248,8 +250,8 @@
 
 - [ ] **Step 4: Deploy once after all local checks pass**
 
-  Update VPS Gateway, WSL Agent, and ehang-box Agent using the existing deployment paths. Do not alter unrelated VPS services or real OpenCode configuration.
+  Update VPS Gateway, WSL Agent, and Device B Agent using the existing deployment paths. Do not alter unrelated VPS services or real OpenCode configuration.
 
 - [ ] **Step 5: Perform live acceptance**
 
-  Verify Gateway authentication, public mobile Relay access, WSL online state, ehang-box P2P state and RTT, SSE/WebSocket/PTY behavior, device switching, reconnects, and offline page behavior. Record any residual issue before claiming completion.
+  Verify Gateway authentication, public mobile Relay access, WSL online state, Device B P2P state and RTT, SSE/WebSocket/PTY behavior, device switching, reconnects, and offline page behavior. Record any residual issue before claiming completion.

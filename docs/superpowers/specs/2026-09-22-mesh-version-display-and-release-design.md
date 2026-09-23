@@ -1,5 +1,7 @@
 # OpenCode Mesh 版本展示与版本控制设计
 
+> **历史状态声明：** 本文是特定时期的历史记录，不是当前实施指令；当前以 [`../../../README.md`](../../../README.md)、[`../../architecture.md`](../../architecture.md)、[`../../protocol.md`](../../protocol.md) 和 [`../../maintenance.md`](../../maintenance.md) 为准。
+
 ## 背景
 
 OpenCode Mesh 当前在 `pyproject.toml` 中声明了 `0.1.0`，但运行时代码没有统一版本入口，Git 也没有发布 tag，安装脚本固定从 `main` 分支下载。Gateway 注入浏览器的 Mesh 状态栏目前只显示传输状态和设备信息，无法判断浏览器实际加载的是哪个 Mesh 版本。

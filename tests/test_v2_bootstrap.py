@@ -12,8 +12,8 @@ from src.static_adapter import TRANSPORT_ADAPTER
 
 
 def test_asset_namespace_preserves_device_and_rejects_api():
-    prefix = asset_prefix('gti')
-    assert parse_asset_route(prefix + '/_assets/index-a.js') == ('gti', '/_assets/index-a.js')
+    prefix = asset_prefix('device-a')
+    assert parse_asset_route(prefix + '/_assets/index-a.js') == ('device-a', '/_assets/index-a.js')
     with pytest.raises(ValueError):
         parse_asset_route(prefix + '/api/session')
 
@@ -37,7 +37,7 @@ def test_gateway_serves_adapted_assets_and_rejects_implicit_api(tmp_path):
     async def scenario():
         gateway = Gateway({'registry_file': str(tmp_path / 'devices.json'),
                            'auth': {'username': 'test', 'password': 'test'}})
-        gateway.registry.devices['gti'] = {'device_id': 'gti', 'name': 'gti', 'last_seen': time.time(), 'ws': object()}
+        gateway.registry.devices['device-a'] = {'device_id': 'device-a', 'name': 'Device A', 'last_seen': time.time(), 'ws': object()}
         paths = []
         async def respond(ws, item, **kwargs):
             paths.append(item['path'])
@@ -58,11 +58,11 @@ def test_gateway_serves_adapted_assets_and_rejects_implicit_api(tmp_path):
             old_key = base64.urlsafe_b64encode(b'http://test').decode().rstrip('=')
             response = await client.get('/server/' + old_key + '/session/ses_old', headers={'accept': 'text/html'})
             assert response.status_code == 307
-            new_key = base64.urlsafe_b64encode(b'http://test/_mesh/device/gti').decode().rstrip('=')
+            new_key = base64.urlsafe_b64encode(b'http://test/_mesh/device/device-a').decode().rstrip('=')
             assert response.headers['location'] == '/server/' + new_key + '/session/ses_old'
             response = await client.get('/')
-            assert asset_prefix('gti') + '/_assets/index-test.js' in response.text
-            response = await client.get(asset_prefix('gti') + '/_assets/index-test.js')
+            assert asset_prefix('device-a') + '/_assets/index-test.js' in response.text
+            response = await client.get(asset_prefix('device-a') + '/_assets/index-test.js')
             assert response.status_code == 200
             assert response.text.startswith('await window.__ocmBootstrap.ready;')
             assert paths[-1] == '/_assets/index-test.js'
@@ -75,7 +75,7 @@ def test_bootstrap_removes_origin_alias_without_late_reload(default_probe_fails)
     import json
     script = 'const defaultProbeFails=' + json.dumps(default_probe_fails) + ';\n' + r'''
     const assert=require('node:assert/strict');
-    const origin='https://mesh.test', target=origin+'/_mesh/device/gti';
+    const origin='https://mesh.test', target=origin+'/_mesh/device/device-a';
     const store=new Map([
       ['opencode.global.dat:server',JSON.stringify({list:[
         {type:'http',displayName:'old alias',http:{url:origin}},
@@ -94,15 +94,15 @@ def test_bootstrap_removes_origin_alias_without_late_reload(default_probe_fails)
     const encodeServer=s=>Buffer.from(s).toString('base64url');
     const renderBar=()=>{};
     const nativeFetch=async url=>{if(defaultProbeFails&&url===target+'/api/info')throw Error('timeout');return url==='/_mesh/devices'?{
-      ok:true,json:async()=>({default_device:defaultProbeFails==='offline'?'ehang':'gti',configured_default_device:'gti',devices:[
-        {device_id:'gti',name:'new name',online:defaultProbeFails!=='offline'},{device_id:'ehang',online:true}
+      ok:true,json:async()=>({default_device:defaultProbeFails==='offline'?'device-b':'device-a',configured_default_device:'device-a',devices:[
+        {device_id:'device-a',name:'new name',online:defaultProbeFails!=='offline'},{device_id:'device-b',online:true}
       ]})
     }:{ok:true,headers:new Headers({'content-type':'application/json'}),json:async()=>({version:'2.0.6'})}};
     ''' + function + r'''
     let complete=false;process.on('beforeExit',()=>assert.ok(complete));
     syncNativeServers().then(()=>{
       assert.equal(window.__ocmBootstrap.serverUrl,target);
-      assert.equal(store.get('opencode.settings.dat:defaultServerUrl'),defaultProbeFails==='offline'?origin+'/_mesh/device/ehang':target);
+      assert.equal(store.get('opencode.settings.dat:defaultServerUrl'),defaultProbeFails==='offline'?origin+'/_mesh/device/device-b':target);
       const result=JSON.parse(store.get('opencode.global.dat:server'));
       assert.equal(result.list.length,3);
       assert.equal(result.list.find(x=>x.http.url===target).displayName,'my desktop');
@@ -137,7 +137,7 @@ def test_bootstrap_retries_failed_discovery_before_starting_ui():
     global.fetch=async url=>{
       if(url==='/_mesh/devices'){
         if(++attempts===1)throw Error('temporary network failure');
-        return {ok:true,json:async()=>({default_device:'gti',devices:[{device_id:'gti',online:true}]})};
+        return {ok:true,json:async()=>({default_device:'device-a',devices:[{device_id:'device-a',online:true}]})};
       }
       if(String(url).endsWith('/api/info'))return {ok:true,headers:new Headers({'content-type':'application/json'}),json:async()=>({version:'2.0.6'})};
       return new Promise(()=>{});
@@ -146,7 +146,7 @@ def test_bootstrap_retries_failed_discovery_before_starting_ui():
     window.__ocmBootstrap.ready.then(()=>{
       assert.equal(attempts,2);assert.ok(retryVisible);
       assert.equal(window.__ocmBootstrap.error,null);
-      assert.equal(window.__ocmBootstrap.serverUrl,'https://mesh.test/_mesh/device/gti');process.exit(0);
+      assert.equal(window.__ocmBootstrap.serverUrl,'https://mesh.test/_mesh/device/device-a');process.exit(0);
     }).catch(error=>{console.error(error);process.exit(1)});
     '''
     result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
@@ -164,8 +164,8 @@ def test_home_relay_measurement_never_probes_gateway_as_server():
     ''' + function + r'''
     (async()=>{
       await measureRelayRtt();assert.deepEqual(urls,[]);
-      device='ehang';await measureRelayRtt();
-      assert.deepEqual(urls,['/_mesh/device/ehang/api/info']);
+      device='device-b';await measureRelayRtt();
+      assert.deepEqual(urls,['/_mesh/device/device-b/api/info']);
     })().catch(error=>{console.error(error);process.exitCode=1});
     '''
     result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)

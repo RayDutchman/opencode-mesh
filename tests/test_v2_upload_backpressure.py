@@ -32,13 +32,13 @@ def test_large_relay_upload_obeys_consumer_backpressure():
     '''+adapter+r'''
     process.on('beforeExit',()=>assert.ok(complete));
     (async()=>{
-      const s=window.__ocmTransport;s.manifest={device_id:'gti'};
+      const s=window.__ocmTransport;s.manifest={device_id:'device-a'};
       s.channel={readyState:'open',bufferedAmount:0,send(){assert.fail('large body sent P2P')}};
       const body=new ReadableStream({pull(c){
         if(produced===80){c.close();return}
         const chunk=new Uint8Array(512*1024);chunk[0]=produced++;c.enqueue(chunk);
       }});
-      const response=await fetch('https://mesh.test/_mesh/device/gti/api/upload',{method:'POST',body,duplex:'half'});
+      const response=await fetch('https://mesh.test/_mesh/device/device-a/api/upload',{method:'POST',body,duplex:'half'});
       assert.equal(response.status,204);
     })().then(()=>{complete=true}).catch(e=>{complete=true;console.error(e);process.exitCode=1});
     '''

@@ -1,5 +1,7 @@
 # V2 稳定性与 Gateway 身份分离实施记录
 
+> **历史状态声明：** 本文是特定时期的历史记录，不是当前实施指令；当前以 [`../../../README.md`](../../../README.md)、[`../../architecture.md`](../../architecture.md)、[`../../protocol.md`](../../protocol.md) 和 [`../../maintenance.md`](../../maintenance.md) 为准。
+
 **目标：** 修复已审查的上传、取消、WebSocket 和错误响应边界；Gateway 仅为入口，真实 OpenCode 实例均使用明确设备身份；弱网终端行为可追踪。
 
 **授权：** 用户确认认证是误判，关闭该问题；其余按已给出的计划自主实施、验证及部署，独立任务可后台委派。
@@ -36,11 +38,11 @@
 
 ## 公网候选版本验收
 
-- `7cb43f3`：三端部署成功。真实浏览器首个设备发现请求故意返回 503 后自动恢复，Server 列表仅 GTi15-Ultra 与 ehang-box 两条明确设备地址。
-- GTi15 P2P：助手返回唯一标记 `MESH_6410babfc62c`，终端 `printf` 和 `hostname` 返回正确结果；成功 ICE 对收发 51041/724234 字节。
-- 关闭 DataChannel 并禁止新建 RTC 后，后续明确设备请求经 Relay 返回 200；原生首页切换 ehang-box 并打开其 OTG 会话、再切回 GTi15 均成功。
-- ehang-box：0.2.1 的 resize、P2P 断开与恢复画面仍为单行 shell 提示符。该测试以预置认证头驱动浏览器，ServiceWorker 注册出现 401，PWA 不在本轮验收结论内。
+- `7cb43f3`：三端部署成功。真实浏览器首个设备发现请求故意返回 503 后自动恢复，Server 列表仅 Device A 与 Device B 两条明确设备地址。
+- Device A P2P：助手返回唯一标记 `MESH_6410babfc62c`，终端 `printf` 和 `hostname` 返回正确结果；成功 ICE 对收发 51041/724234 字节。
+- 关闭 DataChannel 并禁止新建 RTC 后，后续明确设备请求经 Relay 返回 200；原生首页切换 Device B 并打开其已有会话、再切回 Device A 均成功。
+- Device B：0.2.1 的 resize、P2P 断开与恢复画面仍为单行 shell 提示符。该测试以预置认证头驱动浏览器，ServiceWorker 注册出现 401，PWA 不在本轮验收结论内。
 - 浏览器验收暴露首页 RTT 探测残留裸 `/api/info`；Node 测试先失败后通过，`41e9dac` 改为明确当前设备地址，无设备时不探测。全套测试增至 139 项并通过，已部署三端。
 - 首次强制 Relay 测试未确认消息提交（未观察到 prompt POST，模型目录尚未就绪），终端输入输出通过；补充模型目录响应就绪条件后重新验证，不将这次未提交当作成功。
-- `41e9dac` 最终 Relay 复测：模型目录 200 后，原生 UI 实际发送 agent/model/prompt 请求，收到唯一助手回复 `MESH_a69d4fe4fe24`；终端输出 `MESH_TERMINAL_OK` 和 `GTi15-Ultra`，RTC channel 不存在。未再出现裸 API 400；测试脚本在页面销毁时有 Playwright Target closed 回调告警，不是产品 pageerror。
+- `41e9dac` 最终 Relay 复测：模型目录 200 后，原生 UI 实际发送 agent/model/prompt 请求，收到唯一助手回复 `MESH_a69d4fe4fe24`；终端输出 `MESH_TERMINAL_OK` 和 `Device A`，RTC channel 不存在。未再出现裸 API 400；测试脚本在页面销毁时有 Playwright Target closed 回调告警，不是产品 pageerror。
 - 最终自动化：139 passed；Python 编译、JavaScript 语法与 diff 空白检查通过。独立产品审阅及文档审阅均完成，重要发现以回归测试验证修复；保留以上未复现现象与低风险边界。

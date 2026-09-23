@@ -354,21 +354,21 @@ def test_parse_server_route_resolves_device_and_upstream_path():
     """OpenCode server routes resolve to the encoded Mesh device scope."""
     import base64
 
-    server_url = "https://mesh.example/_mesh/device/device-ehang"
+    server_url = "https://mesh.example.com/_mesh/device/device-b"
     key = base64.urlsafe_b64encode(server_url.encode()).decode().rstrip("=")
 
-    assert parse_server_route(f"/server/{key}/session/s-1") == ("device-ehang", "/session/s-1")
-    assert parse_server_route(f"/server/{key}/") == ("device-ehang", "/")
+    assert parse_server_route(f"/server/{key}/session/s-1") == ("device-b", "/session/s-1")
+    assert parse_server_route(f"/server/{key}/") == ("device-b", "/")
 
 
 def test_rewrite_device_html_scopes_root_assets():
     """Device HTML keeps static assets bound to the device that served it."""
     body = b'<script src="/_assets/index.js"></script><link href="/assets/app.css">'
 
-    result = rewrite_device_html(body, "device-ehang")
+    result = rewrite_device_html(body, "device-b")
 
-    assert b"/_mesh/device/device-ehang/_assets/index.js" in result
-    assert b"/_mesh/device/device-ehang/assets/app.css" in result
+    assert b"/_mesh/device/device-b/_assets/index.js" in result
+    assert b"/_mesh/device/device-b/assets/app.css" in result
 
 
 def test_adapter_scopes_servers_and_relay_fallback_to_active_device():
@@ -1787,7 +1787,7 @@ def test_forwarding_headers_strip_credentials_and_csrf_markers():
     """Gateway-to-agent forwarding strips credentials and browser CSRF markers."""
     out = {k.lower(): v for k, v in forwarding_headers({
         "Authorization": "Bearer secret", "Cookie": "session=1",
-        "Origin": "https://oc.252327.xyz:8443", "Referer": "https://oc.252327.xyz:8443/",
+        "Origin": "https://mesh.example.com:8443", "Referer": "https://mesh.example.com:8443/",
         "Accept": "application/json", "x-opencode-ticket": "1"}).items()}
     assert "authorization" not in out
     assert "cookie" not in out
@@ -1842,8 +1842,8 @@ def test_agent_local_request_strips_browser_csrf_markers(monkeypatch):
         return await agent.local_request({
             "type": "request", "id": "r-csrf", "method": "POST",
             "path": "/pty/x/connect-token",
-            "headers": {"origin": "https://oc.252327.xyz:8443",
-                        "referer": "https://oc.252327.xyz:8443/",
+            "headers": {"origin": "https://mesh.example.com:8443",
+                        "referer": "https://mesh.example.com:8443/",
                         "x-opencode-ticket": "1",
                         "accept": "application/json"},
             "body": b64(b"{}")})

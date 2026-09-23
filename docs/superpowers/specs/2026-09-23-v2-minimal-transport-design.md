@@ -1,5 +1,7 @@
 # V2 最小传输适配设计
 
+> **历史状态声明：** 本文是特定时期的历史记录，不是当前实施指令；当前以 [`../../../README.md`](../../../README.md)、[`../../architecture.md`](../../architecture.md)、[`../../protocol.md`](../../protocol.md) 和 [`../../maintenance.md`](../../maintenance.md) 为准。
+
 用户已授权自主完成设计、实现、验证和部署，无需中途确认。V1 历史基线见 README。
 
 ## 目标与边界

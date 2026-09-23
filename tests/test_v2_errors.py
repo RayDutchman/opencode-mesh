@@ -23,7 +23,7 @@ def test_mesh_errors_have_json_content_type(monkeypatch, kind):
         **kwargs, transport=httpx.MockTransport(handle)))
 
     async def scenario():
-        agent = Agent({'opencode_url': 'http://localhost:40960', 'max_response_bytes': 10})
+        agent = Agent({'opencode_url': 'http://localhost:4096', 'max_response_bytes': 10})
         item = {'id': 'error', 'method': 'POST', 'path': '/api/pty',
                 'headers': {}, 'body': '!!!' if kind == 'invalid' else ''}
         if kind != 'protocol':
@@ -65,14 +65,14 @@ def test_p2p_stream_error_boundary(after_headers, reason):
     process.on('beforeExit',()=>assert.ok(completed));
     (async()=>{
       const s=window.__ocmTransport;
-      s.manifest={device_id:'gti'};
+      s.manifest={device_id:'device-a'};
       s.channel={readyState:'open',bufferedAmount:0,send(frame){
         const message=JSON.parse(Buffer.from(JSON.parse(frame).data,'base64'));
         if(message.type!=='stream_request') return;
         if(afterHeaders) deliver({type:'stream_chunk',id:message.id,status:200,headers:{'content-type':'text/event-stream'}});
         deliver({type:'stream_error',id:message.id,reason,error:'private diagnostic'});
       }};
-      const response=await fetch('https://mesh.test/_mesh/device/gti/api/event',{headers:{accept:'text/event-stream'}});
+      const response=await fetch('https://mesh.test/_mesh/device/device-a/api/event',{headers:{accept:'text/event-stream'}});
       if(afterHeaders){
         assert.equal(response.status,200);
         await assert.rejects(response.text(),/private diagnostic/);

@@ -1,5 +1,7 @@
 # OpenCode Web 完整兼容与快速数据面实施计划
 
+> **历史状态声明：** 本文是特定时期的历史记录，不是当前实施指令；当前以 [`../../../README.md`](../../../README.md)、[`../../architecture.md`](../../architecture.md)、[`../../protocol.md`](../../protocol.md) 和 [`../../maintenance.md`](../../maintenance.md) 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 在保持可配置公网 Gateway 作为统一访问入口的前提下，完整兼容当前 OpenCode Web 实际使用的数据面，并按局域网直连、P2P、VPS Relay 的顺序选择最快可用路径。

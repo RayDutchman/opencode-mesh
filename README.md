@@ -6,9 +6,8 @@
 
 - **V1 稳定基线**：`852668b01a51d38b3f38c827f3ca2e64fe614080`。
 - 提交时间：北京时间 **2026-09-22 17:19:16（UTC+8）**；标题：`chore: ignore deployment metadata`。
-- 确认依据：用户回溯聊天记录，确认 2026-09-22 18:11 之前的版本为实测可用、尚未考虑 V2 的版本；Git 历史核实上述提交是该时间点之前 main 上的最后一次提交。
-- 这是历史实测基线记录，不代表本次重新完成 V1 端到端测试。现有 `v0.1.0` 标签早于此提交，不能代替这个精确基线。
-- 后续 V2 调整以原生多 Server 为基础，目标是最小传输适配、P2P 优先、Relay 兜底，优先复用成熟库。本记录不执行回滚或部署。
+- 该提交为历史人工验收确认的 V1 基线；`v0.1.0` 标签更早，不能代替这个精确基线。它不代表当前版本对 V1 的兼容承诺。
+- 当前维护方向为 V2 原生多 Server、最小传输适配、P2P 优先与 Relay 兜底。
 
 ## 架构
 
@@ -148,7 +147,10 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 
 ## 更多文档
 
+- [`AGENTS.md`](AGENTS.md)：AI 与维护者的工作入口、约束和交接要求。
+- [`docs/maintenance.md`](docs/maintenance.md)：事实来源、开发验证、已知限制及持续维护方法。
 - [`docs/architecture.md`](docs/architecture.md)：原理、架构、数据流和文件结构说明。
 - [`docs/protocol.md`](docs/protocol.md)：控制消息与 P2P 分片协议规格。
-- [`docs/opencode-web-capability-matrix.md`](docs/opencode-web-capability-matrix.md)：OpenCode Web 路径能力与验收矩阵。
-- [`docs/opencode-web-route-catalog.json`](docs/opencode-web-route-catalog.json)：机器可读的 OpenCode 路由目录。
+- [`docs/opencode-web-capability-matrix.md`](docs/opencode-web-capability-matrix.md)：历史能力矩阵，不代表当前 V2 的完整验收范围。
+- [`docs/opencode-web-route-catalog.json`](docs/opencode-web-route-catalog.json)：历史路由目录。
+- `docs/superpowers/`：按日期保留的历史设计与执行证据；当前工作以维护入口和现行架构、协议为准。

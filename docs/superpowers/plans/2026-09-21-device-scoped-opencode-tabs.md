@@ -1,5 +1,7 @@
 # Device-Scoped OpenCode Tabs Implementation Plan
 
+> **历史状态声明：** 本文是特定时期的历史记录，不是当前实施指令；当前以 [`../../../README.md`](../../../README.md)、[`../../architecture.md`](../../architecture.md)、[`../../protocol.md`](../../protocol.md) 和 [`../../maintenance.md`](../../maintenance.md) 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Give every Mesh device a stable virtual OpenCode Server URL so the unmodified OpenCode Web frontend keeps separate native localStorage tabs, projects, and sessions per device.
@@ -146,7 +148,7 @@ Keep ordinary public URLs working for existing bookmarks. If a URL has no device
 
 - [ ] **Step 2: Validate both current devices**
 
-Verify separately for `GTi15-Ultra` and `ehang-box`: login, project list, session list, provider response, SSE, P2P candidate pair, and Relay fallback.
+Verify separately for `Device A` and `Device B`: login, project list, session list, provider response, SSE, P2P candidate pair, and Relay fallback.
 
 - [ ] **Step 3: Validate session switching**
 

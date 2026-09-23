@@ -46,12 +46,12 @@ P2P 上所有浏览器请求、响应 body、流数据和 WebSocket 控制/数�
 - 控制消息的完整 JSON 放在 `data` 中；带响应元数据的首帧额外携带 `type`、`id`、`status` 或 `headers`。
 - 接收端必须限制单消息、总装配和响应大小，并在取消、超时、断线和错误时释放装配状态。
 
-默认请求和响应有效上限为 64 MiB，可由配置收紧。DataChannel 背压等待有超时，超过后关闭当前 P2P 通道并回退 Relay。
+默认协议消息/响应限制为 64 MiB，具体预算以配置和实现为准。浏览器 P2P 请求体另有 32 MiB 门限，为 base64 和 JSON 信封留出空间；超限在发送前转 Relay。DataChannel 背压等待有超时，超过后关闭当前 P2P 通道，后续请求可回退 Relay，已发 mutation 不自动重放。
 
 ## HTTP、SSE 和 WebSocket
 
 - Gateway 保留 method、path、query、body、OpenCode 业务 headers、状态码和原始响应字节；Gateway Basic Auth/Cookie/Host 等边界凭据不会转发给 Agent。
-- SSE 必须保留空闲心跳、事件 ID、事件顺序和取消语义。浏览器断线时使用 `Last-Event-ID` 重连；不可重试的认证错误直接关闭。
+- SSE 通过 fetch 响应流转发首帧状态、响应头及原始数据顺序，并传播取消。事件解析与业务重连由 V2 SDK 负责；Mesh 不模拟 EventSource，也不自行承诺 `Last-Event-ID` 重连策略。
 - WebSocket 单 writer 负责底层发送；文本和二进制帧均保持原始内容，subprotocol 和关闭码透传。
 - P2P 不可用或协商失败时，单个请求可以回退 Relay，不应让旧设备的 P2P 状态污染当前设备。
 - 带副作用的请求不因 P2P/Relay 切换自动重复提交，除非上层明确允许重试。
@@ -64,4 +64,4 @@ P2P 上所有浏览器请求、响应 body、流数据和 WebSocket 控制/数�
 
 ## 验收
 
-完整的 OpenCode Web 路径、生命周期和三路径验收要求见 `docs/opencode-web-capability-matrix.md`。验收至少覆盖 HTTP、SSE、WebSocket、PTY、取消、P2P、Relay、P2P 初始失败重试、设备切换和 Gateway 重启恢复。
+当前验收方法和覆盖边界见 [maintenance.md](maintenance.md)，旧能力矩阵仅作历史参考。受影响的变更应验证 HTTP、SSE、WebSocket、PTY、取消、P2P、Relay、设备切换及对应故障恢复，不将计划中的验收项当作已经通过的证据。

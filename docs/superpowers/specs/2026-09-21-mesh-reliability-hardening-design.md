@@ -1,11 +1,13 @@
 # Mesh Reliability Hardening Design
 
+> **历史状态声明：** 本文是特定时期的历史记录，不是当前实施指令；当前以 [`../../../README.md`](../../../README.md)、[`../../architecture.md`](../../architecture.md)、[`../../protocol.md`](../../protocol.md) 和 [`../../maintenance.md`](../../maintenance.md) 为准。
+
 ## 背景
 
 代码审查基于 `79b0d5d` 发现了协议数据完整性、连接生命周期、P2P 浏览器适配、安装卸载安全和文档一致性问题。目标是在不改变现有 Gateway/Agent 部署边界的前提下，修复确认成立的问题，并保持以下约束：
 
 - WSL 到 Windows 的 Relay 路径继续可用。
-- ehang-box 的局域网 P2P 路径继续可用。
+- Device B 的局域网 P2P 路径继续可用。
 - 不修改 Lucky、Xray、Hysteria、FRP、防火墙或真实 OpenCode。
 - 所有批次先在本地验证，全部完成后再部署公网和设备。
 - 不向仓库提交真实凭据、token、设备身份或运行时状态。
@@ -108,7 +110,7 @@ P2P 使用统一的双向分片消息格式，至少包含逻辑消息 ID、序�
 
 ### 端到端验证
 
-本地启动 Gateway、Agent 和假 OpenCode，验证 HTTP、SSE、WebSocket、PTY、Relay、P2P、断线重连和设备切换。所有验证通过后，才部署 VPS、WSL 和 ehang-box，最后从公网手机验证 Relay，并从可达局域网验证 P2P。
+本地启动 Gateway、Agent 和假 OpenCode，验证 HTTP、SSE、WebSocket、PTY、Relay、P2P、断线重连和设备切换。所有验证通过后，才部署 VPS、WSL 和 Device B，最后从公网手机验证 Relay，并从可达局域网验证 P2P。
 
 ## 非目标
 

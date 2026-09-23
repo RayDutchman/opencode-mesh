@@ -1,5 +1,7 @@
 # Mesh Version Display and Release Implementation Plan
 
+> **历史状态声明：** 本文是特定时期的历史记录，不是当前实施指令；当前以 [`../../../README.md`](../../../README.md)、[`../../architecture.md`](../../architecture.md)、[`../../protocol.md`](../../protocol.md) 和 [`../../maintenance.md`](../../maintenance.md) 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task with verification checkpoints.
 
 **Goal:** Add a runtime Mesh version to the injected browser status bar and establish a tag-based, CI-verified versioning workflow.
@@ -124,9 +126,9 @@ from pathlib import Path
 import re
 text = Path('src/static_adapter.py').read_text()
 script = re.search(r'TRANSPORT_ADAPTER = r"""\n(.*?)\n"""', text, re.S).group(1)
-Path('/tmp/opencode/transport-adapter-check.js').write_text(re.sub(r'^<script[^>]*>\n|\n</script>$', '', script))
+Path('/tmp/mesh-check/transport-adapter-check.js').write_text(re.sub(r'^<script[^>]*>\n|\n</script>$', '', script))
 PY
-node --check /tmp/opencode/transport-adapter-check.js
+node --check /tmp/mesh-check/transport-adapter-check.js
 ```
 
 Expected: tests pass and `node --check` exits successfully.
