@@ -140,10 +140,32 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 
 ## 配置参考
 
+- `agents.json`：同机所有 Agent 的统一人工配置，参见 [`config/agents.example.json`](config/agents.example.json)。顶层配置 Gateway 与加入密钥，`agents` 中按实例名填写各自上游、显示名和可选认证；实例字段覆盖同名公共字段。
 - `gateway.json`：`auth.username` / `auth.password`（浏览器登录）、`enroll_token`（加入密钥）、`default_device`。
-- `agent.json`：`gateway_url`、`enroll_token`、`opencode_url`、可选的 `opencode_basic_auth`、`p2p_loopback_candidate`（默认 true，让同机/宿主机浏览器通过 `127.0.0.1` 建立 P2P 直连）。
+- `agent.json`：`gateway_url`、`enroll_token`、`opencode_url`、可选的 `device_name`（注册显示名，省略时使用主机名）、`opencode_basic_auth`、`p2p_loopback_candidate`（默认 true，让同机/宿主机浏览器通过 `127.0.0.1` 建立 P2P 直连）。
 
 `enroll_token` 属于 Gateway，同一 Gateway 上的所有 Agent 共用同一个值。`device_id` 与 `agent_token` 由系统自动生成/签发，无需手工配置。
+
+同机新增实例使用 `bash scripts/install.sh agent second`（或 `MESH_INSTANCE=second`）；设置 `MESH_INSTALL_ONLY=1` 时只写配置与单元，不启用、不启动。`MESH_DEVICE_NAME` 指定显示名。已有实例拒绝重复安装；更改配置后重启该实例即可，升级共享代码使用 `deploy-release.sh`。
+
+加入密钥通过已导出的 `MESH_ENROLL_TOKEN` 提供。服务名称为 `opencode-mesh-agent@second.service`，默认实例仍为 `opencode-mesh-agent.service`。远端 `deploy-agent.sh` 使用 `MESH_INSTANCE=second` 与相同的仅安装开关。`uninstall.sh agent second` 只移除对应服务和配置项，保留身份与共享目录；`all` 才进入整目录卸载流程。共享升级按同一 systemd scope、实际工作目录收集关联服务，仅恢复升级前运行的集合。
+
+统一配置通过 `--instance` 选择实例，例如：
+
+```bash
+.venv/bin/python -m src.main --mode agent --config config/agents.json --instance second
+```
+
+此命令会实际启动并注册 Agent。程序不会监听 OpenCode 的上游端口，而是连接 `opencode_url`。统一配置不接受 `state_file`：默认实例身份自动保存于安装目录的 `data/agent-state.json`，其他实例为 `data/agent-state-<name>.json`。这些文件是程序内部身份存储，不需要手工填写，也不写回人工配置；备份时应连同配置保存。
+
+旧单实例配置仍可使用原命令运行。迁移到统一配置前先预检，再明确写入：
+
+```bash
+.venv/bin/python scripts/migrate-agent-config.py config/agent.local.json config/agents.json --working-directory "$PWD"
+.venv/bin/python scripts/migrate-agent-config.py config/agent.local.json config/agents.json --working-directory "$PWD" --apply
+```
+
+将源路径替换为实际旧配置路径；工作目录必须是旧服务的 `WorkingDirectory`。迁移保留原文件和设备身份，拒绝覆盖已有目标或冲突身份，不自动切换、启用或重启服务。`config/agents.json` 已被 Git 忽略；示例文件不包含真实凭据。
 
 ## 更多文档
 

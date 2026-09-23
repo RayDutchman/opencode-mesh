@@ -1,0 +1,14 @@
+{
+  "gateway_url": "https://mesh.example.com",
+  "enroll_token": "CHANGE_ME_LONG_RANDOM",
+  "agents": {
+    "default": {
+      "device_name": "Device A",
+      "opencode_url": "http://127.0.0.1:4096"
+    },
+    "second": {
+      "device_name": "Device B",
+      "opencode_url": "http://127.0.0.1:4097"
+    }
+  }
+}

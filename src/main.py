@@ -1384,7 +1384,7 @@ class Agent:
             try:
                 async with httpx.AsyncClient(timeout=20) as client:
                     r = await client.post(gateway_url + "/_mesh/register", json={
-                        "device_id": data["device_id"], "name": hostname(), "platform": platform.platform(),
+                        "device_id": data["device_id"], "name": self.cfg.get("device_name") or hostname(), "platform": platform.platform(),
                          "enroll_token": self.cfg["enroll_token"], "agent_token": data.get("agent_token", ""),
                          "rotate_token": bool(data.pop("rotate_token", False))})
                     if r.status_code == 429:
@@ -1484,18 +1484,46 @@ def inject_mesh_bar(body: bytes) -> bytes:
 
 
 
+def resolve_agent_config(path: str | Path, cfg: dict[str, Any], instance: str | None) -> dict[str, Any]:
+    """统一配置只保存人工设置，身份路径由安装目录与实例名确定。"""
+    if "agents" not in cfg:
+        if instance is not None:
+            raise ValueError("--instance requires a shared agents configuration")
+        return dict(cfg)
+    name = "default" if instance is None else instance
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        raise ValueError("Invalid agent instance name")
+    agents = cfg["agents"]
+    if not isinstance(agents, dict) or name not in agents or not isinstance(agents[name], dict):
+        raise ValueError("Agent instance not configured")
+    if "state_file" in cfg or "state_file" in agents[name]:
+        raise ValueError("Shared configuration manages identity paths automatically")
+    result = {key: value for key, value in cfg.items() if key != "agents"}
+    result.update(agents[name])
+    filename = "agent-state.json" if name == "default" else f"agent-state-{name}.json"
+    result["state_file"] = str(Path(path).resolve().parent.parent / "data" / filename)
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--mode", choices=["gateway", "agent"], required=True)
+    parser.add_argument("--instance", help="Select an agent from the shared configuration")
     args = parser.parse_args()
     cfg = load_json(args.config)
     if args.mode == "gateway":
+        if args.instance is not None:
+            parser.error("--instance is only supported in agent mode")
         # ws_max_size 必须覆盖应用层请求上限（base64 展开 + JSON 开销），
         # 否则默认 16MiB 会在应用层限制生效前提前断开大响应。
         uvicorn.run(Gateway(cfg).app, host=cfg.get("listen_host", "127.0.0.1"), port=int(cfg.get("listen_port", 8090)),
                     log_level="info", timeout_graceful_shutdown=5, ws_max_size=ws_frame_limit(cfg))
     else:
+        try:
+            cfg = resolve_agent_config(args.config, cfg, args.instance)
+        except ValueError as exc:
+            parser.error(str(exc))
         agent = Agent(cfg)
         asyncio.run(agent.run())
 

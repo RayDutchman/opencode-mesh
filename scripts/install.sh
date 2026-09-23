@@ -99,6 +99,21 @@ if [ "$MODE" != "agent" ] && [ "$MODE" != "gateway" ]; then
 fi
 
 SERVICE_NAME="opencode-mesh-${MODE}"
+[[ $# -le 2 ]] || { err "too many arguments"; exit 2; }
+INSTANCE="${2-${MESH_INSTANCE:-default}}"
+if [[ $# == 2 && ( -z "$INSTANCE" || "$INSTANCE" == default ) ]]; then
+  err "omit the instance argument for the default service"; exit 2
+fi
+[[ "$INSTANCE" =~ ^[A-Za-z0-9_-]+$ ]] || { err "invalid instance name"; exit 2; }
+[[ "$MODE" == agent || "$INSTANCE" == default ]] || { err "instances require agent mode"; exit 2; }
+[[ "$INSTANCE" == default ]] || SERVICE_NAME="opencode-mesh-agent@${INSTANCE}"
+if [[ -e "$UNIT_DIR/${SERVICE_NAME}.service" ]]; then
+  err "service already installed; edit configuration or use deploy-release.sh"; exit 1
+fi
+if [[ "$MODE" == agent && ! -f "$INSTALL_DIR/config/agents.json" ]] &&
+   [[ -f "$INSTALL_DIR/config/agent.json" || -f "$INSTALL_DIR/config/agent.local.json" ]]; then
+  err "migrate the existing configuration with scripts/migrate-agent-config.py first"; exit 1
+fi
 VERSION="${MESH_VERSION:-main}"
 if [[ "$VERSION" == v* ]]; then
   TARBALL="https://github.com/RayDutchman/opencode-mesh/archive/refs/tags/${VERSION}.tar.gz"
@@ -131,9 +146,9 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 if [ -d "$INSTALL_DIR/src" ]; then
-  warn "existing install detected; overwriting source and scripts (config and data are kept)"
-  rm -rf "$INSTALL_DIR/src" "$INSTALL_DIR/scripts" "$INSTALL_DIR/pyproject.toml"
-fi
+  [[ -x "$INSTALL_DIR/.venv/bin/python" ]] || { err "incomplete existing installation"; exit 1; }
+  info "reusing existing source and virtual environment"
+else
 cp -r "$SRC"/src "$SRC"/pyproject.toml "$SRC"/scripts "$INSTALL_DIR"/
 
 if [ ! -d "$INSTALL_DIR/.venv" ]; then
@@ -144,6 +159,7 @@ fi
 info "installing dependencies (first run may take a while; aiortc needs a wheel or build)..."
 "$INSTALL_DIR/.venv/bin/python" -m pip install --upgrade pip -q
 "$INSTALL_DIR/.venv/bin/python" -m pip install -e "$INSTALL_DIR" -q
+fi
 
 mkdir -p "$INSTALL_DIR/config" "$INSTALL_DIR/data"
 chmod 700 "$INSTALL_DIR/config" "$INSTALL_DIR/data"
@@ -168,17 +184,16 @@ if [ "$MODE" = "agent" ]; then
   OPENCODE_URL="$(ask "Local OpenCode URL (with port)" "${OPENCODE_URL:-http://127.0.0.1:4096}")"
   OPENCODE_USERNAME="$(ask "OpenCode username (leave empty if auth is disabled)" "${OPENCODE_USERNAME:-}")"
   OPENCODE_PASSWORD="$(ask_secret "OpenCode password (leave empty if auth is disabled)" "${OPENCODE_PASSWORD:-}")"
-  CONFIG_FILE="$INSTALL_DIR/config/agent.json"
+  CONFIG_FILE="$INSTALL_DIR/config/agents.json"
   INSTALL_DIR="$INSTALL_DIR" GATEWAY_URL="$GATEWAY_URL" ENROLL_TOKEN="$ENROLL_TOKEN" \
     OPENCODE_URL="$OPENCODE_URL" OPENCODE_USERNAME="$OPENCODE_USERNAME" OPENCODE_PASSWORD="$OPENCODE_PASSWORD" \
-    ALLOW_INSECURE="$ALLOW_INSECURE" \
+    ALLOW_INSECURE="$ALLOW_INSECURE" INSTANCE="$INSTANCE" MESH_DEVICE_NAME="${MESH_DEVICE_NAME:-}" \
     python3 - "$CONFIG_FILE" <<'PY'
-import json, os, sys
+import json, os, sys, tempfile
 cfg = {
     "gateway_url": os.environ["GATEWAY_URL"].rstrip("/"),
     "enroll_token": os.environ["ENROLL_TOKEN"],
     "opencode_url": os.environ["OPENCODE_URL"].rstrip("/"),
-    "state_file": os.path.join(os.environ["INSTALL_DIR"], "data", "agent-state.json"),
     "reconnect_seconds": 5,
 }
 if os.environ.get("ALLOW_INSECURE"):
@@ -188,12 +203,26 @@ if os.environ.get("OPENCODE_PASSWORD"):
         "username": os.environ.get("OPENCODE_USERNAME") or "opencode",
         "password": os.environ["OPENCODE_PASSWORD"],
     }
-with open(sys.argv[1], "w", encoding="utf-8") as f:
-    json.dump(cfg, f, ensure_ascii=False, indent=2)
+path = sys.argv[1]
+shared = json.load(open(path)) if os.path.exists(path) else {"agents": {}}
+name = os.environ["INSTANCE"]
+if name in shared["agents"]:
+    raise SystemExit("Instance already configured; refusing to overwrite")
+for key in ("gateway_url", "enroll_token"):
+    value = cfg.pop(key)
+    if key in shared and shared[key] != value:
+        raise SystemExit("Shared Gateway settings differ; refusing to change other instances")
+    shared[key] = value
+if os.environ.get("MESH_DEVICE_NAME"):
+    cfg["device_name"] = os.environ["MESH_DEVICE_NAME"]
+shared["agents"][name] = cfg
+fd, temporary = tempfile.mkstemp(dir=os.path.dirname(path))
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    json.dump(shared, f, ensure_ascii=False, indent=2)
     f.write("\n")
-os.chmod(sys.argv[1], 0o600)
+os.replace(temporary, path)
 PY
-  EXEC="\"$INSTALL_DIR/.venv/bin/python\" -m src.main --mode agent --config \"$CONFIG_FILE\""
+  EXEC="\"$INSTALL_DIR/.venv/bin/python\" -m src.main --mode agent --config \"$CONFIG_FILE\" --instance $INSTANCE"
 else
   LISTEN_PORT="$(ask "Listen port" "${MESH_LISTEN_PORT:-18080}")"
   case "$LISTEN_PORT" in
@@ -248,10 +277,12 @@ RestartSec=5
   [Install]
   WantedBy=default.target
 UNIT
-  info "enabling user linger (keeps the service running while logged out)..."
-  loginctl enable-linger "$(id -un)" 2>/dev/null || warn "could not enable linger (no loginctl); the session must stay logged in"
+  if [[ "${MESH_INSTALL_ONLY:-0}" != 1 ]]; then
+    info "enabling user linger (keeps the service running while logged out)..."
+    loginctl enable-linger "$(id -un)" 2>/dev/null || warn "could not enable linger (no loginctl); the session must stay logged in"
+  fi
   systemctl --user daemon-reload
-  systemctl --user enable --now "${SERVICE_NAME}.service"
+  [[ "${MESH_INSTALL_ONLY:-0}" == 1 ]] || systemctl --user enable --now "${SERVICE_NAME}.service"
 else
   UNIT_FILE="$UNIT_DIR/${SERVICE_NAME}.service"
   cat > "$UNIT_FILE" <<UNIT
@@ -271,9 +302,10 @@ RestartSec=5
 WantedBy=multi-user.target
 UNIT
   systemctl daemon-reload
-  systemctl enable --now "${SERVICE_NAME}.service"
+  [[ "${MESH_INSTALL_ONLY:-0}" == 1 ]] || systemctl enable --now "${SERVICE_NAME}.service"
 fi
 
+if [[ "${MESH_INSTALL_ONLY:-0}" != 1 ]]; then
 info "starting service..."
 if [ "$SYSTEMD_KIND" = "user" ]; then
   systemctl --user restart "${SERVICE_NAME}.service"
@@ -281,6 +313,7 @@ if [ "$SYSTEMD_KIND" = "user" ]; then
 else
   systemctl restart "${SERVICE_NAME}.service"
   systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
+fi
 fi
 
 INSTALLED_VERSION="$(cd "$INSTALL_DIR" && "$INSTALL_DIR/.venv/bin/python" -c 'import src; print(src.__version__)')"

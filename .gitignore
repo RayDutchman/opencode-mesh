@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 data/
 *.local.json
+config/agents.json
 .cache-opencode.js
 交接给WSL-OpenCode.md
 

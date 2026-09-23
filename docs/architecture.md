@@ -54,7 +54,7 @@ Gateway 和 Agent 使用同一套 Python 入口，通过 `--mode` 选择运行�
 
 ```bash
 python -m src.main --mode gateway --config config/gateway.json
-python -m src.main --mode agent --config config/agent.json
+python -m src.main --mode agent --config config/agents.json --instance default
 ```
 
 Gateway 由 FastAPI/uvicorn 托管；Agent 是 asyncio 常驻进程。Agent 不监听公网端口，只主动连接 Gateway 和本机 OpenCode。
@@ -65,7 +65,9 @@ Gateway 由 FastAPI/uvicorn 托管；Agent 是 asyncio 常驻进程。Agent 不�
 
 同一 VPS 可以同时运行 Gateway 和一套 OpenCode，但两者仍是独立角色：另起一个 Agent，将 `opencode_url` 指向该 VPS 的本地 OpenCode，例如 `http://127.0.0.1:4096`（按实际监听端口配置），再注册到 Gateway。浏览器以该 Agent 的明确 `device_id` 访问，不将 Gateway 的 origin 当作此 OpenCode 的身份，也不为 VPS 增加特殊业务路由。
 
-每个 Agent 必须使用独立 `state_file`，因为设备身份和 Agent token 保存在其中；同机多个 Agent 不能共享它。设备显示名用于辨认，不用于判断身份。Gateway 浏览器认证与本地 OpenCode 认证分别配置。
+同机 Agent 共用一份 `config/agents.json`，以 `agents` 映射和 `--instance` 选择上游。设备身份与 Agent token 由程序分别保存到内部 `data/agent-state.json` 或 `data/agent-state-<name>.json`，统一人工配置不填写 `state_file`。旧单实例配置仍兼容，可用迁移工具保身份转入统一配置。设备显示名用于辨认，不用于判断身份。Gateway 浏览器认证与本地 OpenCode 认证分别配置。
+
+具名实例使用独立 systemd 单元，共享源码和虚拟环境。新增实例不升级共享代码；发布脚本按同一 scope 和实际工作目录收集关联服务，升级及回滚恢复原先运行的集合。单实例卸载保留共享目录和身份；完整卸载须明确选择 `all`。
 
 ## 3. 两条传输路径
 

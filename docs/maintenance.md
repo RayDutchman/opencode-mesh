@@ -18,6 +18,8 @@
 
 ## 2. 维护范围与模块地图
 
+同机多实例使用 `config/agents.json` 和 `--instance`；内部身份文件由程序派生，不手工填写。`scripts/migrate-agent-config.py` 先预检、加 `--apply` 才写入，保留旧配置且不切换服务。迁移运行中服务时核对新旧有效配置和身份，区分 daemon-reload 与真正重启；仅安装实例必须 disabled/inactive 且尚无注册副作用。生命周期回归见 `test_agent_instances.py`、`test_agent_migration.py`、`test_instance_install.py`、`test_instance_release.py`。代码是否已发布以 Git 和部署 revision 为准。
+
 当前维护 OpenCode V2；最近发布验收使用上游 **2.0.6**。这不是对所有未来 V2 版本的兼容承诺。产品版本从源码读取，不在交接入口重复维护。
 
 | 文件 | 责任 |

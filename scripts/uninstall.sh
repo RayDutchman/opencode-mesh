@@ -28,6 +28,10 @@ ask() {
 }
 
 MODE="${1:-${MESH_MODE:-}}"
+[[ $# -le 2 ]] || exit 2
+INSTANCE="${2-${MESH_INSTANCE:-default}}"
+[[ "$INSTANCE" =~ ^[A-Za-z0-9_-]+$ ]] || exit 2
+[[ $# != 2 || ( "$MODE" == agent && "$INSTANCE" != default ) ]] || exit 2
 case "$MODE" in
   agent|gateway|all) ;;
   "") err "mode is required; use agent, gateway, or all"; exit 2 ;;
@@ -48,12 +52,25 @@ fi
 
 if [ "$MODE" = "all" ]; then
   SERVICES=("opencode-mesh-agent" "opencode-mesh-gateway")
+  for unit in "$UNIT_DIR"/opencode-mesh-agent@*.service; do
+    [[ -f "$unit" && "$unit" != *'@.service' ]] || continue
+    SERVICES+=("$(basename "$unit" .service)")
+  done
 else
   SERVICES=("opencode-mesh-${MODE}")
+  [[ "$MODE" != agent || "$INSTANCE" == default ]] || SERVICES=("opencode-mesh-agent@$INSTANCE")
 fi
 
 for svc in "${SERVICES[@]}"; do
   if [ -f "${UNIT_DIR}/${svc}.service" ]; then
+    wd=$(python3 - "${UNIT_DIR}/${svc}.service" <<'PY'
+import sys
+for line in open(sys.argv[1]):
+    if line.startswith("WorkingDirectory="):
+        print(line.split("=", 1)[1].strip().strip('"'))
+PY
+)
+    [[ -n "$wd" && "$(realpath "$wd")" == "$(realpath "$INSTALL_DIR")" ]] || { err "service belongs to another directory"; exit 1; }
     info "stopping and disabling ${svc} ..."
     $SC_CMD stop "${svc}.service"
     $SC_CMD disable "${svc}.service" 2>/dev/null || true
@@ -61,6 +78,48 @@ for svc in "${SERVICES[@]}"; do
   fi
 done
 $SC_CMD daemon-reload 2>/dev/null || true
+
+if [[ "$MODE" != gateway && -f "$INSTALL_DIR/config/agents.json" ]]; then
+  while IFS= read -r gateway && IFS= read -r device && IFS= read -r token; do
+    curl -fsSL --max-time 15 -H "X-Mesh-Agent-Token: $token" -X DELETE \
+      "${gateway%/}/_mesh/deregister/$device" >/dev/null 2>&1 || warn "device deregistration failed"
+  done < <(python3 - "$INSTALL_DIR" "$MODE" "$INSTANCE" <<'PY'
+import json, sys
+from pathlib import Path
+root, mode, selected = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+cfg = json.loads((root / "config" / "agents.json").read_text())
+for name, entry in cfg.get("agents", {}).items():
+    if mode != "all" and name != selected:
+        continue
+    state = root / "data" / ("agent-state.json" if name == "default" else f"agent-state-{name}.json")
+    if not state.exists():
+        continue
+    identity = json.loads(state.read_text())
+    values = [entry.get("gateway_url", cfg.get("gateway_url", "")), identity.get("device_id", ""), identity.get("agent_token", "")]
+    if all(isinstance(v, str) and v and "\n" not in v and "\r" not in v for v in values):
+        print("\n".join(values))
+PY
+)
+  python3 - "$INSTALL_DIR/config/agents.json" "$MODE" "$INSTANCE" <<'PY'
+import json, os, sys, tempfile
+path, mode, name = sys.argv[1:]
+cfg = json.load(open(path))
+if mode == "all":
+    cfg["agents"] = {}
+else:
+    cfg.get("agents", {}).pop(name, None)
+fd, temporary = tempfile.mkstemp(dir=os.path.dirname(path))
+with os.fdopen(fd, "w") as handle:
+    json.dump(cfg, handle, indent=2)
+os.replace(temporary, path)
+PY
+fi
+
+# 单实例卸载始终保留共享源码和内部身份，避免影响其他停止中的实例。
+if [[ "$MODE" != all ]]; then
+  info "instance removed; shared installation and identity retained"
+  exit 0
+fi
 
 # Tell the Gateway to drop the agent registration so no offline device remains.
 if [ "$MODE" != "gateway" ] && [ -f "$INSTALL_DIR/config/agent.json" ] && [ -f "$INSTALL_DIR/data/agent-state.json" ]; then
