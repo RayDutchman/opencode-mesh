@@ -1,4 +1,4 @@
-"""install.sh / deploy-agent.sh / uninstall.sh 同机多实例行为测试。
+"""install.sh / uninstall.sh 同机多实例行为测试。
 
 契约（docs/superpowers/specs/2026-09-23-multi-agent-design.md 与用户确认）：
 - 所有 Agent 共享人工配置 config/agents.json：顶层公共字段 + agents 映射按实例。
@@ -165,11 +165,6 @@ def make_source(tmp_path):
     (src / "config").mkdir()
     (src / "config" / ".keep").write_text("")
     (src / "deploy").mkdir()
-    (src / "deploy" / "opencode-mesh-agent.service.example").write_text(
-        "[Service]\nWorkingDirectory=/opt/opencode-mesh\n"
-        "ExecStart=/opt/opencode-mesh/.venv/bin/python -m src.main --mode agent --config /opt/opencode-mesh/config/agent.json\n"
-        "ReadWritePaths=/opt/opencode-mesh/data /opt/opencode-mesh/config\n"
-    )
     return src
 
 
@@ -186,11 +181,6 @@ def seed_shared_code(install_dir):
     stub.write_text(STUB_PY)
     stub.chmod(0o755)
     (install_dir / "deploy").mkdir(exist_ok=True)
-    (install_dir / "deploy" / "opencode-mesh-agent.service.example").write_text(
-        "[Service]\nWorkingDirectory=/opt/opencode-mesh\n"
-        "ExecStart=/opt/opencode-mesh/.venv/bin/python -m src.main --mode agent --config /opt/opencode-mesh/config/agent.json\n"
-        "ReadWritePaths=/opt/opencode-mesh/data /opt/opencode-mesh/config\n"
-    )
 
 
 def read_json(path):
@@ -344,89 +334,6 @@ def test_install_gateway_rejects_instance(tmp_path):
     ))
     result = run_script("install.sh", ["gateway", "win"], env)
     assert result.returncode != 0
-
-
-# --------------------------------------------------------------- deploy-agent.sh
-
-
-def test_deploy_named_existing_code_skips_source_and_merges(tmp_path):
-    """具名远端部署到已有共享代码目录：不传源码、远端合并 agents.json、仅安装不启用。"""
-    fakebin, logs = make_fakebin(tmp_path)
-    inst = tmp_path / "remote-inst"
-    seed_shared_code(inst)
-    (inst / "config").mkdir(exist_ok=True)
-    (inst / "config" / "agents.json").write_text(json.dumps({
-        "gateway_url": "https://mesh.example.com",
-        "agents": {"alpha": {"opencode_url": "http://127.0.0.1:4097"}},
-    }))
-    (inst / "data").mkdir(exist_ok=True)
-
-    env = base_env(tmp_path, fakebin, logs, **agent_env(
-        MESH_INSTANCE="beta",
-        MESH_DEVICE_NAME="Remote Beta",
-        MESH_INSTALL_ONLY="1",
-        HOME=str(tmp_path / "home"),
-    ))
-    result = run_script("deploy-agent.sh", ["user@device", str(inst)], env)
-
-    assert result.returncode == 0, result.stderr
-    agents = read_json(inst / "config" / "agents.json")
-    assert set(agents["agents"]) == {"alpha", "beta"}
-    assert agents["agents"]["beta"]["device_name"] == "Remote Beta"
-    assert "state_file" not in agents["agents"]["beta"]
-    # 已有共享代码：没有 tar 传输与 venv/pip 调用
-    ssh_log = logs["ssh"].read_text()
-    assert "tar -xzf" not in ssh_log
-    assert not logs["pip"].exists() or not logs["pip"].read_text()
-    unit = unit_dir(tmp_path) / "opencode-mesh-agent@beta.service"
-    assert unit.exists()
-    assert "--instance beta" in unit.read_text()
-    assert "enable --now" not in ssh_log
-    assert (inst / "src" / "SENTINEL").read_text() == "keep-me\n"
-
-
-def test_deploy_named_new_dir_bootstraps_and_enables(tmp_path):
-    """具名远端部署到新目录：tar 传输源码、远端建 venv、写 agents.json、完整安装启用服务。"""
-    fakebin, logs = make_fakebin(tmp_path)
-    source = make_source(tmp_path)
-    inst = tmp_path / "fresh-inst"
-
-    env = base_env(tmp_path, fakebin, logs, **agent_env(
-        MESH_INSTANCE="beta",
-        MESH_DEVICE_NAME="Fresh Beta",
-        HOME=str(tmp_path / "home"),
-    ))
-    result = run_script("deploy-agent.sh", ["user@device", str(inst)], env, cwd=source)
-
-    assert result.returncode == 0, result.stderr
-    ssh_log = logs["ssh"].read_text()
-    assert "tar -xzf" in ssh_log
-    assert (inst / "src" / "main.py").exists()
-    assert (inst / ".venv" / "bin" / "python").exists()
-    agents = read_json(inst / "config" / "agents.json")
-    assert set(agents["agents"]) == {"beta"}
-    unit = unit_dir(tmp_path) / "opencode-mesh-agent@beta.service"
-    assert unit.exists()
-    assert "--instance beta" in unit.read_text()
-    assert "enable --now opencode-mesh-agent@beta.service" in logs["systemctl"].read_text()
-
-
-def test_deploy_rejects_legacy_config_on_remote(tmp_path):
-    """远端已有旧式 agent.local.json 时显式拒绝。"""
-    fakebin, logs = make_fakebin(tmp_path)
-    source = make_source(tmp_path)
-    inst = tmp_path / "legacy-remote"
-    (inst / "config").mkdir(parents=True)
-    (inst / "config" / "agent.local.json").write_text("{}")
-
-    env = base_env(tmp_path, fakebin, logs, **agent_env(
-        MESH_INSTANCE="beta",
-        HOME=str(tmp_path / "home"),
-    ))
-    result = run_script("deploy-agent.sh", ["user@device", str(inst)], env, cwd=source)
-
-    assert result.returncode != 0
-    assert not (inst / "config" / "agents.json").exists()
 
 
 # --------------------------------------------------------------- uninstall.sh

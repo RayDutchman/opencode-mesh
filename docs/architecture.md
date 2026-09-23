@@ -349,18 +349,11 @@ opencode-mesh/
 │   └── static_adapter.py
 ├── config/
 │   ├── gateway.example.json
-│   └── agent.example.json
-├── deploy/
-│   ├── Caddyfile.example
-│   ├── opencode-mesh-gateway.service.example
-│   └── opencode-mesh-agent.service.example
+│   └── agents.example.json
 ├── scripts/
 │   ├── install.sh
 │   ├── uninstall.sh
-│   ├── deploy-agent.sh
-│   ├── deploy-release.sh
-│   ├── bootstrap.sh
-│   └── check_auth.py
+│   └── upgrade.sh
 ├── docs/
 │   ├── architecture.md
 │   ├── protocol.md
@@ -419,9 +412,9 @@ P2P 和分片基础设施：
 ### 10.2 配置与部署文件
 
 - `config/gateway.example.json`：Gateway 配置模板，包括监听地址、认证、注册密钥和状态文件。
-- `config/agent.example.json`：Agent 配置模板，包括 Gateway 地址、加入密钥、本机 OpenCode 地址和状态文件。
-- `deploy/Caddyfile.example`：使用 Caddy 为 Gateway 提供 HTTPS 反向代理的示例。
-- `deploy/*.service.example`：Gateway 和 Agent 的 systemd 服务模板。
+- `config/agents.example.json`：Agent 统一配置模板，包括公共 Gateway 地址、加入密钥及各实例上游；身份文件由程序维护。
+- Gateway 的 HTTPS 入口由部署环境的反向代理提供，配置要求见 README，不在仓库另放代理模板。
+- systemd 单元由安装脚本生成，不另维护重复模板。
 
 真实配置、Agent token 和设备状态不应写入 Git；本地配置文件和 data 目录由 `.gitignore` 排除。
 
@@ -429,10 +422,8 @@ P2P 和分片基础设施：
 
 - `scripts/install.sh`：安装依赖、写入配置、生成 systemd 服务，并处理 root/普通用户两种安装范围。
 - `scripts/uninstall.sh`：显式按 `agent`、`gateway` 或 `all` 卸载，Agent 模式会先尝试注销设备，并支持保留设备身份。
-- `scripts/deploy-agent.sh`：通过 SSH 将 Agent 部署到远程 Linux 设备。
-- `scripts/deploy-release.sh`：按已提交 revision 部署本机或远程 Gateway/Agent，保留源码备份并记录 `.mesh-revision`。
-- `scripts/bootstrap.sh`：本地开发环境初始化。
-- `scripts/check_auth.py`：使用 ASGI transport 验证认证、注册所有权、请求头隔离、注销和文件权限。
+- `scripts/upgrade.sh`：按已提交 revision 升级本机或远程 Gateway/Agent，保留源码备份并记录 `.mesh-revision`。
+- `tests/test_auth_boundaries.py`：随 pytest 使用 ASGI transport 验证认证、注册所有权、请求头隔离、注销和文件权限。
 
 ### 10.4 版本控制
 

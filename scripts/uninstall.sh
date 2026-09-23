@@ -30,6 +30,12 @@ ask() {
 MODE="${1:-${MESH_MODE:-}}"
 [[ $# -le 2 ]] || exit 2
 INSTANCE="${2-${MESH_INSTANCE:-default}}"
+if [[ -z "$MODE" && -n "$TTY_AVAILABLE" ]]; then
+  MODE=$(ask 'Uninstall mode (agent/gateway/all)' agent)
+  [[ "$MODE" != agent ]] || INSTANCE=$(ask 'Agent instance' default)
+  answer=$(ask 'Continue (y/N)' N)
+  [[ "$answer" == y || "$answer" == Y ]] || exit 0
+fi
 [[ "$INSTANCE" =~ ^[A-Za-z0-9_-]+$ ]] || exit 2
 [[ $# != 2 || ( "$MODE" == agent && "$INSTANCE" != default ) ]] || exit 2
 case "$MODE" in

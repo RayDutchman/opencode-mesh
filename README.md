@@ -31,7 +31,7 @@ Gateway 提供页面、设备发现和 WebRTC 信令。直连建立后，消息�
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | \
-  MESH_VERSION=v0.2.1 bash -s -- agent
+  MESH_VERSION=v0.3.0 bash -s -- agent
 ```
 
 安装完成后会打印实际运行版本。升级时修改 `MESH_VERSION` 后重新执行安装；需要回滚时指定较早的 tag。版本号的唯一来源是 `src/__init__.py`，发布前需同步创建对应的 Git tag。
@@ -53,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 
 安装完成后脚本会打印 Agent 安装步骤和 Gateway 地址。脚本不会把 enroll token 拼进可执行命令；请在 Agent 安装提示中粘贴保存的 token。
 
-Gateway 默认只监听 `127.0.0.1:18080`，请用反向代理为它提供 HTTPS（可参考 `deploy/Caddyfile.example`）。**务必使用 HTTPS**：Agent 默认拒绝连接非 `https://` 的 Gateway（内网测试可在 Agent 配置中设置 `allow_insecure_gateway`）。
+Gateway 默认只监听 `127.0.0.1:18080`，请在 Gateway 所在机器配置 HTTPS 反向代理，将公网入口转发到该地址，并支持 WebSocket 和流式响应。可使用现有 Caddy、Nginx 等入口，无需另装一套。**务必使用 HTTPS**：Agent 默认拒绝连接非 `https://` 的 Gateway（内网测试可在 Agent 配置中设置 `allow_insecure_gateway`）。该反向代理提供公网入口，与同机浏览器的 WebRTC/ICE 直连是不同层。
 
 ### 第 2 步：部署 Agent（每台 OpenCode 设备）
 
@@ -104,10 +104,10 @@ bash -c 'curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/
 统一使用 Git tag 或 commit 部署，无需逐个同步 Python 文件：
 
 ```bash
-bash scripts/deploy-release.sh root@your-vps /root/opencode-mesh gateway system v0.2.1
-bash scripts/deploy-release.sh user@device /home/user/.local/share/opencode-mesh agent user v0.2.1
+bash scripts/upgrade.sh root@your-vps /root/opencode-mesh gateway system v0.3.0
+bash scripts/upgrade.sh user@device /home/user/.local/share/opencode-mesh agent user v0.3.0
 # 本机以 Git 工作区运行的 Agent：工作区须干净，且 HEAD 与部署 ref 一致
-bash scripts/deploy-release.sh local "$PWD" agent user HEAD
+bash scripts/upgrade.sh local "$PWD" agent user HEAD
 ```
 
 脚本将指定 Git ref 的 `src/`、`scripts/`、`pyproject.toml` 打包，通过 SHA-256 校验后更新，安装依赖并重启服务；不复制本地配置、密钥或 data。目标机沿用原有 systemd 单元、配置和虚拟环境，需已完成首次安装。
@@ -146,9 +146,9 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 
 `enroll_token` 属于 Gateway，同一 Gateway 上的所有 Agent 共用同一个值。`device_id` 与 `agent_token` 由系统自动生成/签发，无需手工配置。
 
-同机新增实例使用 `bash scripts/install.sh agent second`（或 `MESH_INSTANCE=second`）；设置 `MESH_INSTALL_ONLY=1` 时只写配置与单元，不启用、不启动。`MESH_DEVICE_NAME` 指定显示名。已有实例拒绝重复安装；更改配置后重启该实例即可，升级共享代码使用 `deploy-release.sh`。
+同机新增实例使用 `bash scripts/install.sh agent second`（或 `MESH_INSTANCE=second`）；设置 `MESH_INSTALL_ONLY=1` 时只写配置与单元，不启用、不启动。`MESH_DEVICE_NAME` 指定显示名。已有实例拒绝重复安装；更改配置后重启该实例即可，升级共享代码使用 `upgrade.sh`。
 
-加入密钥通过已导出的 `MESH_ENROLL_TOKEN` 提供。服务名称为 `opencode-mesh-agent@second.service`，默认实例仍为 `opencode-mesh-agent.service`。远端 `deploy-agent.sh` 使用 `MESH_INSTANCE=second` 与相同的仅安装开关。`uninstall.sh agent second` 只移除对应服务和配置项，保留身份与共享目录；`all` 才进入整目录卸载流程。共享升级按同一 systemd scope、实际工作目录收集关联服务，仅恢复升级前运行的集合。
+加入密钥通过已导出的 `MESH_ENROLL_TOKEN` 提供。服务名称为 `opencode-mesh-agent@second.service`，默认实例仍为 `opencode-mesh-agent.service`。远端首次安装时在目标机器运行 `install.sh`，不另设远程安装脚本。`uninstall.sh agent second` 只移除对应服务和配置项，保留身份与共享目录；`all` 才进入整目录卸载流程。共享升级按同一 systemd scope、实际工作目录收集关联服务，仅恢复升级前运行的集合。
 
 统一配置通过 `--instance` 选择实例，例如：
 
@@ -158,14 +158,9 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 
 此命令会实际启动并注册 Agent。程序不会监听 OpenCode 的上游端口，而是连接 `opencode_url`。统一配置不接受 `state_file`：默认实例身份自动保存于安装目录的 `data/agent-state.json`，其他实例为 `data/agent-state-<name>.json`。这些文件是程序内部身份存储，不需要手工填写，也不写回人工配置；备份时应连同配置保存。
 
-旧单实例配置仍可使用原命令运行。迁移到统一配置前先预检，再明确写入：
+旧单实例配置仍可使用原命令运行。新增实例前如需调整为统一配置，应备份配置、保留原设备身份，并核对服务工作目录与内部状态路径；安装脚本不会自动覆盖旧配置。`config/agents.json` 已被 Git 忽略；示例文件不包含真实凭据。Agent 不使用 `listen_host`、`listen_port`，这两个字段仅属于 Gateway。
 
-```bash
-.venv/bin/python scripts/migrate-agent-config.py config/agent.local.json config/agents.json --working-directory "$PWD"
-.venv/bin/python scripts/migrate-agent-config.py config/agent.local.json config/agents.json --working-directory "$PWD" --apply
-```
-
-将源路径替换为实际旧配置路径；工作目录必须是旧服务的 `WorkingDirectory`。迁移保留原文件和设备身份，拒绝覆盖已有目标或冲突身份，不自动切换、启用或重启服务。`config/agents.json` 已被 Git 忽略；示例文件不包含真实凭据。
+`scripts/` 仅保留安装 `install.sh`、卸载 `uninstall.sh`、升级 `upgrade.sh` 三个入口；认证检查统一随 pytest 执行。有控制终端时直接 `bash scripts/upgrade.sh` 或 `bash scripts/uninstall.sh` 可按提示选择目标并确认；自动化仍可使用位置参数。安装具名实例使用 `bash scripts/install.sh agent NAME`，连接参数通过终端提示填写。
 
 ## 更多文档
 

@@ -108,11 +108,11 @@ fi
 [[ "$MODE" == agent || "$INSTANCE" == default ]] || { err "instances require agent mode"; exit 2; }
 [[ "$INSTANCE" == default ]] || SERVICE_NAME="opencode-mesh-agent@${INSTANCE}"
 if [[ -e "$UNIT_DIR/${SERVICE_NAME}.service" ]]; then
-  err "service already installed; edit configuration or use deploy-release.sh"; exit 1
+  err "service already installed; edit configuration or use upgrade.sh"; exit 1
 fi
 if [[ "$MODE" == agent && ! -f "$INSTALL_DIR/config/agents.json" ]] &&
    [[ -f "$INSTALL_DIR/config/agent.json" || -f "$INSTALL_DIR/config/agent.local.json" ]]; then
-  err "migrate the existing configuration with scripts/migrate-agent-config.py first"; exit 1
+  err "legacy configuration found; preserve its identity and explicitly configure config/agents.json before adding an instance"; exit 1
 fi
 VERSION="${MESH_VERSION:-main}"
 if [[ "$VERSION" == v* ]]; then

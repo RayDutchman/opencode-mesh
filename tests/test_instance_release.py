@@ -1,4 +1,4 @@
-"""共享源码升级（deploy-release.sh --apply）的多实例行为测试。
+"""共享源码升级（upgrade.sh --apply）的多实例行为测试。
 
 真实执行脚本（基于行为断言，不是检查输出字符串），用临时安装目录 +
 mock systemctl/python 验证：
@@ -26,12 +26,12 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEPLOY_SCRIPT = REPO_ROOT / "scripts" / "deploy-release.sh"
+DEPLOY_SCRIPT = REPO_ROOT / "scripts" / "upgrade.sh"
 REVISION = "rev-new"
 
 pytestmark = pytest.mark.skipif(
     any(shutil.which(tool) is None for tool in ("bash", "tar", "sha256sum", "realpath")),
-    reason="需要 bash/tar/sha256sum/realpath 才能真实执行 deploy-release.sh",
+    reason="需要 bash/tar/sha256sum/realpath 才能真实执行 upgrade.sh",
 )
 
 # 安装目录 .venv/bin/python 的 mock：验证阶段打印版本行，
@@ -149,7 +149,7 @@ def deploy_script():
     """被测脚本复制到临时目录之外：各场景安装目录内的 scripts/ 会被部署自替换，
     执行副本保持原样，多场景共用同一版本。"""
     scratch = Path(tempfile.mkdtemp(prefix="ocm-deploy-script-"))
-    target = scratch / "deploy-release.sh"
+    target = scratch / "upgrade.sh"
     shutil.copy(DEPLOY_SCRIPT, target)
     yield target
     shutil.rmtree(scratch, ignore_errors=True)
@@ -191,8 +191,8 @@ def make_release_archive(base: Path) -> tuple[Path, str]:
     (stage / "src").mkdir(parents=True)
     (stage / "src" / "MARKER").write_text("NEW", encoding="utf-8")
     (stage / "scripts").mkdir()
-    # 部署会自替换 scripts/：归档里的 deploy-release.sh 是“新版本”占位，用于验证自替换行为
-    (stage / "scripts" / "deploy-release.sh").write_text("# archive-script-v2\n", encoding="utf-8")
+    # 升级会自替换 scripts/，归档里的脚本用于验证自替换行为。
+    (stage / "scripts" / "upgrade.sh").write_text("# archive-script-v2\n", encoding="utf-8")
     (stage / "pyproject.toml").write_text(
         '[project]\nname = "opencode-mesh"\nversion = "new"\n', encoding="utf-8"
     )
@@ -304,7 +304,7 @@ def test_apply_restarts_running_same_root_agent_instances_and_gateway(
     # 回滚备份保留旧源码与旧 revision（含旧身份文件不改动）
     assert (root / "src" / "MARKER").read_text(encoding="utf-8") == "NEW"
     assert (root / ".mesh-revision").read_text(encoding="utf-8") == f"{REVISION}\n"
-    assert (root / "scripts" / "deploy-release.sh").read_text(encoding="utf-8") == "# archive-script-v2\n"
+    assert (root / "scripts" / "upgrade.sh").read_text(encoding="utf-8") == "# archive-script-v2\n"
     backups = list((root / ".mesh-backups").glob("source.*.tar.gz"))
     assert len(backups) == 1
     with tarfile.open(backups[0], "r:gz") as tf:

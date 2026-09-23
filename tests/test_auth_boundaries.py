@@ -1,12 +1,10 @@
-"""Exercise credential boundaries without accessing production services."""
+"""通过实际 ASGI 请求验证认证边界，不访问生产服务。"""
 import asyncio
 import json
-import sys
 import stat
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import httpx
 
@@ -42,5 +40,5 @@ async def main():
         print('PASS: Basic Auth, ownership proof, header isolation, deregistration, private state')
 
 
-if __name__ == '__main__':
+def test_authentication_ownership_and_private_state():
     asyncio.run(main())

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Update an existing installation from a committed Git ref, preserving config/data.
-# Usage: bash scripts/deploy-release.sh HOST DIR agent|gateway user|system [REF]
+# 用法：bash scripts/upgrade.sh HOST DIR agent|gateway user|system [REF]
 # HOST=local runs the same deployment steps without SSH. REF defaults to HEAD.
 
 if [[ "${1:-}" == --apply ]]; then
@@ -148,6 +148,24 @@ if [[ "${1:-}" == --apply ]]; then
   exit 0
 fi
 
+if [[ $# == 0 ]] && { : >/dev/tty; } 2>/dev/null; then
+  ask() {
+    local value
+    printf '%s [%s]: ' "$1" "$2" >&2
+    read -r value </dev/tty || return 1
+    printf '%s' "${value:-$2}"
+  }
+  host=$(ask 'Target host' local)
+  root=$(ask 'Install directory' "$PWD")
+  role=$(ask 'Role (agent/gateway)' agent)
+  scope=$(ask 'Scope (user/system)' user)
+  ref=$(ask 'Git ref' HEAD)
+  printf 'Upgrade %s:%s (%s/%s) to %s\n' "$host" "$root" "$role" "$scope" "$ref"
+  answer=$(ask 'Continue (y/N)' N)
+  [[ "$answer" == y || "$answer" == Y ]] || exit 0
+  set -- "$host" "$root" "$role" "$scope" "$ref"
+fi
+
 [[ $# -ge 4 && $# -le 5 ]] || {
   printf 'Usage: bash %s HOST DIR agent|gateway user|system [TAG_OR_COMMIT]\n' "$0" >&2
   exit 2
@@ -186,6 +204,6 @@ else
   trap cleanup EXIT
   scp "${options[@]}" "$tmp/release.tar.gz" "$script" "$host:$remote_tmp/"
   printf -v command 'bash %q --apply %q %q %q %q %q %q' \
-    "$remote_tmp/deploy-release.sh" "$remote_tmp/release.tar.gz" "$digest" "$root" "$role" "$scope" "$revision"
+    "$remote_tmp/upgrade.sh" "$remote_tmp/release.tar.gz" "$digest" "$root" "$role" "$scope" "$revision"
   ssh "${options[@]}" "$host" "$command"
 fi
