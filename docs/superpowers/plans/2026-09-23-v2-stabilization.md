@@ -13,8 +13,8 @@
 - [x] Mesh JSON 错误 Content-Type、流式首帧前错误一致性：8 项错误边界测试通过；首帧后仍保持流中断。
 - [x] 核实已部署 V2 启动接入点，集中适配唯一 origin getter；真实浏览器预验收只有设备 Server，发现不刷新。
 - [x] 弱网终端调查：已关联 PTY、连接、cursor、resize；多次提示符包含 ANSI 清行重绘，尚未复现用户所述两行可见提示符，不做文本去重。
-- [ ] 全量测试、独立审阅及真实浏览器 P2P/Relay、多 Server 回归。
-- [ ] 提交推送、三端部署、记录可验收项与剩余限制。
+- [x] 全量测试、独立审阅及真实浏览器 P2P/Relay、多 Server 回归。
+- [x] 候选版本已提交并三端部署；最终发布使用 `v0.2.1`，具体 revision 由 Git 标签和 `.mesh-revision` 记录。
 
 ## 验收标准
 
@@ -33,3 +33,14 @@
 - Ruling: 离线默认设备的 canonical 身份不改绑，旧项目/书签仍归原设备；首次默认选择可回退到已探测在线的设备，显式用户选择保持。拒绝直接改绑 canonical 的建议，因为会把已有 local 状态归到另一台机器。
 - 最后一次弱网视觉采样：初始、resize 及 P2P 断开回 Relay 后的截图均只显示一行提示符；这次未复现用户的两行现象，不作根治声明。
 - 低风险延后项：源流单块本身大于限额时暂时持有该块；错误 reason 常量在 Python/JS 两端维护；现有 Gateway 请求体仍全量缓冲。浏览器有界探测不代表端到端流式上传。
+
+## 公网候选版本验收
+
+- `7cb43f3`：三端部署成功。真实浏览器首个设备发现请求故意返回 503 后自动恢复，Server 列表仅 GTi15-Ultra 与 ehang-box 两条明确设备地址。
+- GTi15 P2P：助手返回唯一标记 `MESH_6410babfc62c`，终端 `printf` 和 `hostname` 返回正确结果；成功 ICE 对收发 51041/724234 字节。
+- 关闭 DataChannel 并禁止新建 RTC 后，后续明确设备请求经 Relay 返回 200；原生首页切换 ehang-box 并打开其 OTG 会话、再切回 GTi15 均成功。
+- ehang-box：0.2.1 的 resize、P2P 断开与恢复画面仍为单行 shell 提示符。该测试以预置认证头驱动浏览器，ServiceWorker 注册出现 401，PWA 不在本轮验收结论内。
+- 浏览器验收暴露首页 RTT 探测残留裸 `/api/info`；Node 测试先失败后通过，`41e9dac` 改为明确当前设备地址，无设备时不探测。全套测试增至 139 项并通过，已部署三端。
+- 首次强制 Relay 测试未确认消息提交（未观察到 prompt POST，模型目录尚未就绪），终端输入输出通过；补充模型目录响应就绪条件后重新验证，不将这次未提交当作成功。
+- `41e9dac` 最终 Relay 复测：模型目录 200 后，原生 UI 实际发送 agent/model/prompt 请求，收到唯一助手回复 `MESH_a69d4fe4fe24`；终端输出 `MESH_TERMINAL_OK` 和 `GTi15-Ultra`，RTC channel 不存在。未再出现裸 API 400；测试脚本在页面销毁时有 Playwright Target closed 回调告警，不是产品 pageerror。
+- 最终自动化：139 passed；Python 编译、JavaScript 语法与 diff 空白检查通过。独立产品审阅及文档审阅均完成，重要发现以回归测试验证修复；保留以上未复现现象与低风险边界。
