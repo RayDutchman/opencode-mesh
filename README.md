@@ -32,7 +32,7 @@ Gateway 提供页面、设备发现和 WebRTC 信令。直连建立后，消息�
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | \
-  MESH_VERSION=v0.2.0 bash -s -- agent
+  MESH_VERSION=v0.2.1 bash -s -- agent
 ```
 
 安装完成后会打印实际运行版本。升级时修改 `MESH_VERSION` 后重新执行安装；需要回滚时指定较早的 tag。版本号的唯一来源是 `src/__init__.py`，发布前需同步创建对应的 Git tag。
@@ -77,6 +77,8 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 
 当前开发线以 **V2.0.6** 为验证版本，不再维护 V1 前端兼容。浏览器页面使用原生 `/server/<encoded-server>/...` 路由；`/_mesh/device/<id>` 是 Server 的请求地址，不是 V2 页面入口。状态栏显示当前设备及 P2P/Relay；后台访问其他 Server 时会使用该 Server 的明确地址。
 
+Gateway 域名只作为访问入口，不再额外显示为业务 Server。Mesh 在原生 UI 初始化前发现设备，集中适配已验证的 V2 入口模块；旧域名别名定向迁移到明确设备，设备发现不再触发迟到刷新。OpenCode 升级后入口契约需要复验。VPS 若也运行 OpenCode，应另启一个独立 Agent 指向本机服务，与其他设备一样注册和访问，且使用独立的身份状态文件。
+
 Mesh 适配 `fetch` 和 WebSocket 传输，并在 V2 SDK 通过 `new URL('/api/...', serverUrl)` 构造请求时保留 Mesh Server 基址，避免绝对路径丢掉设备前缀。其他 URL 沿用原生解析；不替换 XMLHttpRequest/EventSource，也不改写 JSON 请求体。P2P 已发出的请求若中断，结果可能未知，不会自动换到 Relay 重发 mutation；后续请求可走 Relay。
 
 ## 非交互安装
@@ -103,8 +105,8 @@ bash -c 'curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/
 统一使用 Git tag 或 commit 部署，无需逐个同步 Python 文件：
 
 ```bash
-bash scripts/deploy-release.sh root@your-vps /root/opencode-mesh gateway system v0.1.0
-bash scripts/deploy-release.sh user@device /home/user/.local/share/opencode-mesh agent user v0.1.0
+bash scripts/deploy-release.sh root@your-vps /root/opencode-mesh gateway system v0.2.1
+bash scripts/deploy-release.sh user@device /home/user/.local/share/opencode-mesh agent user v0.2.1
 # 本机以 Git 工作区运行的 Agent：工作区须干净，且 HEAD 与部署 ref 一致
 bash scripts/deploy-release.sh local "$PWD" agent user HEAD
 ```

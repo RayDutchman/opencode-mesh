@@ -8,8 +8,9 @@ import httpx
 import uvicorn
 import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse, RedirectResponse
 from . import __version__
+from .frontend import ASSET_ROOT, adapt_entry, asset_prefix, parse_asset_route, legacy_server_redirect
 from .p2p import (CHUNK_SIZE, CONNECTION_FAILED_REASON, CONTROL_SEND_TIMEOUT,
                    INVALID_ENCODING_REASON, INVALID_SEQUENCE_REASON,
                    PAYLOAD_TOO_LARGE_REASON, REQUEST_TOO_LARGE_REASON,
@@ -95,11 +96,14 @@ def parse_server_route(path: str) -> tuple[str | None, str]:
     return device_id, match.group(2) or "/"
 
 
-def rewrite_device_html(body: bytes, device_id: str) -> bytes:
+def rewrite_device_html(body: bytes, device_id: str, bootstrap: bool = False) -> bytes:
     """把设备 HTML 中的根相对静态资源改成设备作用域路径。"""
     prefix = "/_mesh/device/" + quote(device_id, safe="")
     pattern = re.compile(rb"((?:src|href)\s*=\s*[\"'])/(?!/|_mesh/)", re.IGNORECASE)
-    return pattern.sub(lambda match: match.group(1) + prefix.encode("ascii") + b"/", body)
+    result = pattern.sub(lambda match: match.group(1) + prefix.encode("ascii") + b"/", body)
+    if bootstrap:
+        result = result.replace((prefix + '/_assets/').encode(), (asset_prefix(device_id) + '/_assets/').encode())
+    return result
 
 
 def forwarding_headers(headers) -> dict[str, str]:
@@ -467,7 +471,8 @@ class Gateway:
 
         @app.get("/_mesh/devices")
         async def devices(req: Request):
-            return {"devices": self.registry.public(), "default_device": self.resolve_default_device()}
+            return {"devices": self.registry.public(), "default_device": self.resolve_default_device(),
+                    "configured_default_device": self.cfg.get("default_device")}
 
         @app.get("/_mesh/transport-manifest")
         async def transport_manifest(req: Request):
@@ -686,17 +691,28 @@ class Gateway:
         @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
         async def proxy(req: Request, path: str):
             explicit_device = None
+            frontend_asset = ("/" + path).startswith(ASSET_ROOT)
             try:
-                if path.startswith("server/"):
+                if frontend_asset:
+                    explicit_device, routed_path = parse_asset_route("/" + path)
+                elif path.startswith("server/"):
                     explicit_device, routed_path = parse_server_route("/" + path)
                 else:
                     explicit_device, routed_path = self.parse_device_route("/" + path)
             except ValueError:
+                if req.method in {'GET', 'HEAD'} and self.wants_html(req):
+                    target = legacy_server_redirect('/' + path, str(req.base_url).rstrip('/'),
+                                                    self.cfg.get('default_device') or self.resolve_default_device())
+                    if target:
+                        return RedirectResponse(target + ('?' + req.url.query if req.url.query else ''))
                 return JSONResponse({"error": "Invalid device route"}, status_code=404)
             if explicit_device:
                 path = routed_path.lstrip("/")
             elif path.startswith("_mesh/"):
                 return JSONResponse({"error": "not found"}, status_code=404)
+
+            if not explicit_device and (path == 'api' or path.startswith('api/')):
+                return JSONResponse({"error": "Explicit device required", "reason": "device_required"}, status_code=400)
 
             if explicit_device:
                 # An explicitly routed device must never be substituted by another one.
@@ -762,9 +778,16 @@ class Gateway:
             print(f"proxy response id={request_id} status={result.get('status')} encoded={len(result.get('body', ''))} decoded={len(body)}", flush=True)
             content_type = headers.get("content-type", headers.get("Content-Type", ""))
             if "text/html" in content_type.lower() and int(result.get("status", 502)) == 200:
-                if explicit_device:
-                    body = rewrite_device_html(body, explicit_device)
+                body = rewrite_device_html(body, device_id, bootstrap=True)
                 body = inject_mesh_bar(body)
+                headers['cache-control'] = 'no-store'
+            if frontend_asset and int(result.get('status', 502)) == 200:
+                try:
+                    body = adapt_entry('/' + path, body)
+                except ValueError as exc:
+                    return JSONResponse({'error': str(exc)}, status_code=502)
+                # 新命名空间隔离旧版本 immutable 缓存；入口适配只在该命名空间生效。
+                headers.pop('etag', None)
             headers["content-length"] = str(len(body))
             return Response(body, status_code=int(result.get("status", 502)), headers=headers)
 
@@ -1008,7 +1031,7 @@ class Agent:
         """以统一信封回一条带稳定 reason 的协议错误响应。"""
         payload = json.dumps({"error": reason, "reason": reason}).encode()
         await self.p2p_send(channel, {"type": "response", "id": message_id, "status": status,
-                                      "headers": {},
+                                      "headers": {"content-type": "application/json"},
                                       "body": base64.b64encode(payload).decode()})
 
     async def p2p_message(self, channel: Any, item: dict[str, Any]) -> None:
@@ -1108,7 +1131,7 @@ class Agent:
         except Exception as exc:
             reason = CONNECTION_FAILED_REASON if isinstance(exc, ConnectionError) else UPSTREAM_ERROR_REASON
             await self.p2p_send(channel, {"type": "response", "id": item.get("id", ""), "status": 502,
-                                          "headers": {},
+                                          "headers": {"content-type": "application/json"},
                                           "body": base64.b64encode(json.dumps({"error": str(exc),
                                                                                "reason": reason}).encode()).decode()})
         finally:
@@ -1268,7 +1291,7 @@ class Agent:
             try:
                 reason = CONNECTION_FAILED_REASON if isinstance(exc, ConnectionError) else UPSTREAM_ERROR_REASON
                 await self.send_control(ws, {"type": "response", "id": item.get("id", ""), "status": 502,
-                                          "headers": {},
+                                          "headers": {"content-type": "application/json"},
                                           "body": base64.b64encode(
                                               json.dumps({"error": str(exc),
                                                           "reason": reason}).encode()).decode()})
@@ -1280,7 +1303,7 @@ class Agent:
             # 非法 base64 是协议错误：返回 400 而不是让 decode_strict 抛异常变成 502。
             payload = json.dumps({"error": INVALID_ENCODING_REASON,
                                   "reason": INVALID_ENCODING_REASON}).encode()
-            return {"type": "response", "id": item["id"], "status": 400, "headers": {},
+            return {"type": "response", "id": item["id"], "status": 400, "headers": {"content-type": "application/json"},
                     "body": base64.b64encode(payload).decode()}
         url = self.target + item["path"]
         if item.get("query"):
@@ -1305,14 +1328,14 @@ class Agent:
                         "headers": filter_response_headers(r.headers),
                         "body": encoded}
             except FrameError as exc:
-                return {"type": "response", "id": item["id"], "status": 502, "headers": {},
+                return {"type": "response", "id": item["id"], "status": 502, "headers": {"content-type": "application/json"},
                         "body": base64.b64encode(json.dumps({"error": str(exc),
                                                              "reason": str(exc)}).encode()).decode()}
             except Exception as exc:
                 reason = CONNECTION_FAILED_REASON if isinstance(
                     exc, (ConnectionError, httpx.ConnectError, httpx.TimeoutException)
                 ) else UPSTREAM_ERROR_REASON
-                return {"type": "response", "id": item["id"], "status": 502, "headers": {},
+                return {"type": "response", "id": item["id"], "status": 502, "headers": {"content-type": "application/json"},
                         "body": base64.b64encode(json.dumps({"error": str(exc),
                                                              "reason": reason}).encode()).decode()}
 

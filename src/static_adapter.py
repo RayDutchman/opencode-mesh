@@ -203,32 +203,88 @@ TRANSPORT_ADAPTER = r"""
   };
 
   async function syncNativeServers() {
-    try {
-      const response = await nativeFetch('/_mesh/devices', { credentials: 'same-origin' });
-      if (!response.ok) return;
+      const response = await nativeFetch('/_mesh/devices', { credentials: 'same-origin', signal: AbortSignal.timeout(10000) });
+      if (!response.ok) throw new Error('Mesh device discovery failed: ' + response.status);
       const payload = await response.json();
       state.devices = Array.isArray(payload.devices) ? payload.devices : [];
       state.defaultDevice = payload.default_device || null;
       renderBar();
+      const unsupported = new Set();
       const devices = (await Promise.all(state.devices.filter(device => device.online).map(async device => {
         try {
           const info = await nativeFetch(serverTabUrl(device.device_id) + '/api/info', {
             credentials: 'same-origin', signal: AbortSignal.timeout(5000)
           });
-          if (!info.ok || !info.headers.get('content-type')?.includes('application/json')) return null;
-          return String((await info.json()).version).startsWith('2.') ? device : null;
+          if (!info.ok) return null;
+          if (info.headers.get('content-type')?.includes('application/json') && String((await info.json()).version).startsWith('2.')) return device;
+          unsupported.add(device.device_id);
+          return null;
         } catch (_) { return null; }
       }))).filter(Boolean);
       const store = readJson('opencode.global.dat:server', { list: [], projects: {}, lastProject: {}, recentlyClosed: {} });
+      const primary = state.devices.find(device => device.device_id === payload.configured_default_device)
+        || devices.find(device => device.device_id === payload.default_device) || devices[0];
+      if (!primary) throw new Error('No OpenCode V2 device available');
+      if (unsupported.has(primary.device_id)) {
+        throw new Error('Default device is not an OpenCode V2 server');
+      }
+      const primaryUrl = serverTabUrl(primary.device_id);
+      state.defaultDevice = primary.device_id;
+      const original = Array.isArray(store.list) ? store.list : [];
+      const alias = original.find(entry => entry.http?.url?.replace(/\/+$/, '') === location.origin);
+      store.list = original.filter(entry => entry.http?.url?.replace(/\/+$/, '') !== location.origin);
       // 原生 Server 列表由用户管理，只补充新发现的 V2 入口，不覆盖名称和外部地址。
       const existing = new Set((store.list || []).map(entry => entry.http?.url?.replace(/\/+$/, '')));
-      const added = devices.filter(device => !existing.has(serverTabUrl(device.device_id))).map(device =>
-        ({ type: 'http', displayName: device.name || device.device_id, http: { url: serverTabUrl(device.device_id) } }));
-      if (!added.length) return;
+      const candidates = devices.some(device => device.device_id === primary.device_id) ? devices : [primary, ...devices];
+      const added = candidates.filter(device => !existing.has(serverTabUrl(device.device_id))).map(device =>
+        ({ type: 'http', displayName: (device.device_id === primary.device_id && alias?.displayName) || device.name || device.device_id,
+          http: { url: serverTabUrl(device.device_id) } }));
       store.list = [...(store.list || []), ...added];
       localStorage.setItem('opencode.global.dat:server', JSON.stringify(store));
-      location.reload();
-    } catch (_) {}
+      const defaultKey = 'opencode.settings.dat:defaultServerUrl';
+      const previous = localStorage.getItem(defaultKey);
+      const initial = primary.online ? primary : devices.find(device => device.device_id === payload.default_device) || devices[0] || primary;
+      if (!previous || previous.replace(/\/+$/, '') === location.origin) localStorage.setItem(defaultKey, serverTabUrl(initial.device_id));
+      const layout = readJson('opencode.global.dat:layout', {});
+      if (layout.home?.selection?.server?.replace(/\/+$/, '') === location.origin) {
+        layout.home.selection.server = primaryUrl;
+        localStorage.setItem('opencode.global.dat:layout', JSON.stringify(layout));
+      }
+      const pwaKey = 'opencode.pwa.last-route';
+      const previousRoute = localStorage.getItem(pwaKey);
+      if (previousRoute) {
+        for (const origin of [location.origin, location.origin + '/']) {
+          const prefix = '/server/' + encodeServer(origin) + '/';
+          if (previousRoute.startsWith(prefix)) {
+            localStorage.setItem(pwaKey, '/server/' + encodeServer(primaryUrl) + '/' + previousRoute.slice(prefix.length));
+          }
+        }
+      }
+      // canonicalLocalServer 同时改为明确设备，原有 local 项目/窗口状态继续由原生迁移保留。
+      window.__ocmBootstrap.serverUrl = primaryUrl;
+  }
+
+  async function bootstrapServers() {
+    // 启动失败可见且自动重试；保持同一个 ready Promise，让入口模块在恢复后继续初始化。
+    for (;;) {
+      try {
+        await syncNativeServers();
+        window.__ocmBootstrap.error = null;
+        document.getElementById('ocm-bootstrap-status')?.remove();
+        return;
+      } catch (error) {
+        window.__ocmBootstrap.error = String(error);
+        const parent = document.body || document.documentElement;
+        if (parent) {
+          const notice = document.getElementById('ocm-bootstrap-status') || document.createElement('div');
+          notice.id = 'ocm-bootstrap-status';
+          notice.textContent = '暂时无法连接 OpenCode 设备，正在自动重试…';
+          notice.style.cssText = 'position:fixed;inset:40px 16px auto;padding:16px;background:#222;color:#fff;z-index:2147483647';
+          if (!notice.parentNode) parent.appendChild(notice);
+        }
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+    }
   }
 
   function rejectEntry(id, error) {
@@ -262,6 +318,8 @@ TRANSPORT_ADAPTER = r"""
     state.streams.clear();
     state.incoming.clear();
     for (const socket of state.sockets.values()) {
+      // 标记终止，防止排队中的 send 任务随后 fail() 重复触发 error/close。
+      socket._done = true;
       socket.readyState = MeshWebSocket.CLOSED;
       socket.dispatch('error', error);
       socket.dispatch('close', { code: 1011, reason: error.message });
@@ -289,6 +347,8 @@ TRANSPORT_ADAPTER = r"""
           socket.dispatch('open', {});
         }
       } else if (message.type === 'ws_data') {
+        // 关闭已发起或尚未打开时丢弃迟到数据（规范：CLOSING 后不再投递数据帧）。
+        if (socket.readyState !== MeshWebSocket.OPEN) return;
         let data;
         if (message.kind === 'bytes') {
           const bytes = unb64(message.data);
@@ -298,6 +358,8 @@ TRANSPORT_ADAPTER = r"""
         }
         socket.dispatch('message', { data });
       } else if (message.type === 'ws_closed' || message.type === 'ws_error') {
+        // Agent 侧终止同样标记 socket 已终止，防止排队任务的 fail() 重复触发事件。
+        socket._done = true;
         socket.readyState = MeshWebSocket.CLOSED;
         if (message.type === 'ws_error') socket.dispatch('error', new Error(message.error || 'WebSocket failed'));
         socket.dispatch('close', { code: message.code || 1011, reason: message.error || '' });
@@ -351,6 +413,16 @@ TRANSPORT_ADAPTER = r"""
         state.streams.delete(message.id);
         state.pending.delete(message.id);
         if (entry.timer) clearTimeout(entry.timer);
+        // 首帧前的代理错误与 Relay 保持相同 HTTP/JSON 语义；已开始的流只能中断。
+        if (message.type === 'stream_error' && !entry.resolved) {
+          // 镜像 src/p2p.py 的 INVALID_ENCODING_REASON，识别为 400；其余代理错误按 502。
+          const reason = message.reason || message.error || 'stream failed';
+          entry.resolve({ status: reason === 'invalid base64 encoding' ? 400 : 502,
+            headers: { 'content-type': 'application/json' } });
+          stream.controller.enqueue(enc.encode(JSON.stringify({ error: reason, reason })));
+          stream.controller.close();
+          return;
+        }
         if (message.type === 'stream_error') entry.reject(new Error(message.error || 'stream failed'));
         if (message.type === 'stream_error') stream.controller.error(new Error(message.error || 'stream failed'));
         else stream.controller.close();
@@ -546,6 +618,89 @@ TRANSPORT_ADAPTER = r"""
     finally { release(); }
   }
 
+  // 有界读取请求体探测：小体量返回完整字节供 P2P 发送；超限不消费源流，交由 Relay 转发。
+  // 非流式体（content-length 已知）零读取判超限，原 Request 原样用于 Relay；
+  // 未知大小流用唯一 reader 有界读取，读到上限即暂停，避免 clone/tee 单分支取消挂死。
+  const decodeContentLength = request => {
+    const header = request.headers.get('content-length');
+    if (header == null || header === '') return null;
+    const value = Number(header);
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  };
+  const probeBody = (request, limit) => {
+    const known = decodeContentLength(request);
+    if (known != null && known > limit) return { kind: 'relay' };
+    if (request.body == null) return { kind: 'p2p', body: new Uint8Array() };
+    const reader = request.body.getReader();
+    const chunks = [];
+    let total = 0;
+    // 探测期间取消立即打断 pending read，避免全量缓冲时无法响应 abort。
+    const onAbort = () => { reader.cancel(request.signal.reason).catch(() => {}); };
+    request.signal.addEventListener('abort', onAbort, { once: true });
+    return (async () => {
+      try {
+        while (true) {
+          request.signal.throwIfAborted();
+          const { done, value } = await reader.read();
+          request.signal.throwIfAborted();
+          if (done) break;
+          chunks.push(value);
+          total += value.length;
+          if (total > limit) {
+            // 超限：暂停源 reader 并移交所有权，由 Relay 重建流续读剩余部分。
+            return { kind: 'relay-stream', reader, chunks };
+          }
+        }
+        const body = new Uint8Array(total);
+        let offset = 0;
+        for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.length; }
+        return { kind: 'p2p', body };
+      } catch (error) {
+        reader.cancel(error).catch(() => {});
+        throw error;
+      } finally {
+        request.signal.removeEventListener('abort', onAbort);
+      }
+    })();
+  };
+  // 把探测已读前置块与续读剩余部分按序重建为 Relay 请求体，不丢不重。
+  const relayStreamBody = (request, reader, chunks) => {
+    let released = false;
+    let index = 0;
+    let controller;
+    const release = reason => {
+      if (released) return;
+      released = true;
+      chunks.length = 0;
+      request.signal.removeEventListener('abort', onAbort);
+      reader.cancel(reason).catch(() => {});
+    };
+    const onAbort = () => { controller.error(request.signal.reason); release(request.signal.reason); };
+    return new ReadableStream({
+      start(value) {
+        controller = value;
+        request.signal.addEventListener('abort', onAbort, { once: true });
+        if (request.signal.aborted) onAbort();
+      },
+      async pull(controller) {
+        if (released) return;
+        try {
+          if (index < chunks.length) {
+            const chunk = chunks[index];
+            chunks[index++] = null;
+            controller.enqueue(chunk);
+            return;
+          }
+          const { done, value } = await reader.read();
+          if (released) return;
+          if (done) { controller.close(); release(); }
+          else controller.enqueue(value);
+        } catch (error) { controller.error(error); release(error); }
+      },
+      cancel(reason) { release(reason); },
+    }, { highWaterMark: 0 });
+  };
+
   async function p2pFetch(input, init = {}) {
     const channel = state.channel;
     const [scopedInput, scopedInit] = scopeNativeRequest(input, init);
@@ -556,10 +711,15 @@ TRANSPORT_ADAPTER = r"""
     if (requestedDevice && requestedDevice !== state.manifest?.device_id) return nativeFetch(request);
     path = serverRoutePath(path) || devicePath(path);
     const id = makeId();
-    const sizeProbe = new Uint8Array(await request.clone().arrayBuffer());
+    // 有界探测请求体：大上传零读取转 Relay（保留原 Request），未知大小流超限后续读重建。
+    const probe = await probeBody(request, MAX_P2P_BODY);
+    if (probe.kind === 'relay') return nativeFetch(request);
+    if (probe.kind === 'relay-stream') {
+      // Relay 请求体 = 探测已读前置块 + 源流剩余部分；signal 随请求传播，abort 会释放源流。
+      return nativeFetch(new Request(request, { body: relayStreamBody(request, probe.reader, probe.chunks), duplex: 'half', signal: request.signal }));
+    }
     request.signal.throwIfAborted();
-    // Fall back to Relay for requests larger than the P2P payload limit.
-    if (sizeProbe.length > MAX_P2P_BODY) return nativeFetch(request);
+    const sizeProbe = probe.body;
     const headers = headersObject(request.headers);
     const accept = (headers.accept || '').toLowerCase();
     if (accept.includes('text/event-stream') || path === '/event' || path === '/global/event' || path === '/api/event' || path.endsWith('/event')) {
@@ -605,14 +765,22 @@ TRANSPORT_ADAPTER = r"""
       this.binaryType = 'blob';
       this._listeners = new Map();
       this._channel = state.channel;
-      // Serialize frames so text cannot overtake a queued binary frame.
+      // Serialize frames so text cannot overtake a queued binary frame; close 帧也排在其后。
       this._sendQueue = Promise.resolve();
-       this.id = makeId();
+      this.id = makeId();
+      this._opened = false; // ws_open 已发出（Agent 已被告知该 socket）
+      this._done = false;   // 已到达终止态：至多一次 close 事件、禁止后续帧
       state.sockets.set(this.id, this);
       Promise.resolve(state.ready).then(() => {
-        if (this.readyState !== MeshWebSocket.CONNECTING) return;
+        if (this._done || this.readyState !== MeshWebSocket.CONNECTING) return;
         if (!this._channel || this._channel.readyState !== 'open') return this.fail(new Error('P2P unavailable'));
-        send({ type: 'ws_open', id: this.id, path: serverRoutePath(url.pathname) || devicePath(url.pathname), query: url.search.slice(1), headers: {}, protocols: Array.isArray(protocols) ? protocols : (protocols ? [protocols] : []) }, this._channel).catch(error => this.fail(error));
+        // ws_open 排入发送队列，保证任何已排队帧（含 close）不会超过它，
+        // 也避免 CONNECTING 期 close 后仍向 Agent 发出 ws_open。
+        this._sendQueue = this._sendQueue.then(async () => {
+          if (this._done || this.readyState !== MeshWebSocket.CONNECTING) return;
+          this._opened = true;
+          await send({ type: 'ws_open', id: this.id, path: serverRoutePath(url.pathname) || devicePath(url.pathname), query: url.search.slice(1), headers: {}, protocols: Array.isArray(protocols) ? protocols : (protocols ? [protocols] : []) }, this._channel);
+        }).catch(error => this.fail(error));
       });
     }
     addEventListener(type, fn) { if (!this._listeners.has(type)) this._listeners.set(type, new Set()); this._listeners.get(type).add(fn); }
@@ -620,29 +788,51 @@ TRANSPORT_ADAPTER = r"""
     dispatch(type, event) { this['on' + type]?.(event); for (const fn of this._listeners.get(type) || []) fn.call(this, event); }
     // Expose shared DataChannel backpressure to callers.
     get bufferedAmount() { return this._channel && this._channel.readyState === 'open' ? this._channel.bufferedAmount : 0; }
-    fail(error) { state.sockets.delete(this.id); this.readyState = MeshWebSocket.CLOSED; this.dispatch('error', error); this.dispatch('close', { code: 1011, reason: error.message }); }
+    // 唯一终止出口：幂等、清理 state.sockets、至多一次 close 事件。
+    terminate(code, reason, error) {
+      if (this._done) return;
+      this._done = true;
+      state.sockets.delete(this.id);
+      this.readyState = MeshWebSocket.CLOSED;
+      if (error) this.dispatch('error', error);
+      this.dispatch('close', { code, reason });
+    }
+    fail(error) { this.terminate(1011, error.message, error); }
     send(data) {
       if (this.readyState !== MeshWebSocket.OPEN) throw new Error('WebSocket is not open');
-       const toBytes = async value => {
-         if (value instanceof Blob) return new Uint8Array(await value.arrayBuffer());
-         if (value instanceof ArrayBuffer) return new Uint8Array(value);
-         if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-         throw new TypeError('unsupported WebSocket data type');
-       };
-       // Serialize all frames so text cannot overtake a queued binary frame.
-       this._sendQueue = this._sendQueue.then(async () => {
-         if (typeof data === 'string') {
-            await send({ type: 'ws_data', id: this.id, kind: 'text', data }, this._channel);
-           return;
-         }
-         const bytes = await toBytes(data);
-          await send({ type: 'ws_data', id: this.id, kind: 'bytes', data: b64(bytes) }, this._channel);
-       }).catch(error => { this.fail(error); });
+      const toBytes = async value => {
+        if (value instanceof Blob) return new Uint8Array(await value.arrayBuffer());
+        if (value instanceof ArrayBuffer) return new Uint8Array(value);
+        if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        throw new TypeError('unsupported WebSocket data type');
+      };
+      // Serialize all frames so text cannot overtake a queued binary frame.
+      this._sendQueue = this._sendQueue.then(async () => {
+        if (this._done) return; // 已终止：丢弃排队中的陈旧帧，不再触发 fail
+        if (typeof data === 'string') {
+          await send({ type: 'ws_data', id: this.id, kind: 'text', data }, this._channel);
+          return;
+        }
+        const bytes = await toBytes(data);
+        await send({ type: 'ws_data', id: this.id, kind: 'bytes', data: b64(bytes) }, this._channel);
+      }).catch(error => { this.fail(error); });
     }
     close(code = 1000, reason = '') {
-      if (this.readyState === MeshWebSocket.CLOSED) return;
+      // CLOSING/CLOSED 中的重复 close 是空操作（与浏览器语义一致）。
+      if (this.readyState !== MeshWebSocket.CONNECTING && this.readyState !== MeshWebSocket.OPEN) return;
       this.readyState = MeshWebSocket.CLOSING;
-      send({ type: 'ws_close', id: this.id, code, reason }, this._channel).catch(() => {});
+      if (!this._opened) {
+        // ws_open 尚未发出：连接从未建立，视为建立失败，本地确定终止（close 1006），
+        // 不向 Agent 发送任何帧，Agent 也不会为这个 id 建桥。
+        this.terminate(1006, '');
+        return;
+      }
+      // ws_open 已发出：close 帧排在所有已排队数据帧之后（有界 DataChannel 保序），
+      // 由 Agent 关闭上游并回 ws_closed 完成握手；发送失败同样确定终止。
+      this._sendQueue = this._sendQueue.then(async () => {
+        if (this._done) return;
+        await send({ type: 'ws_close', id: this.id, code, reason }, this._channel);
+      }).catch(() => { this.terminate(1006, ''); });
     }
   }
 
@@ -654,7 +844,10 @@ TRANSPORT_ADAPTER = r"""
   let relayTick = 0;
   setInterval(() => { reconnectForDevice(); renderBar(); if (++relayTick % 5 === 0) measureRelayRtt(); }, 2000);
   setTimeout(measureRelayRtt, 1500);
-  syncNativeServers();
+  // 原生入口模块等待发现完成后才启动；不再在用户开始输入后刷新整页。
+  window.__ocmBootstrap = { serverUrl: null, ready: null };
+  window.__ocmBootstrap.ready = bootstrapServers();
+  window.__ocmBootstrap.ready.catch(error => { console.error('Mesh bootstrap:', error); });
 
   window.fetch = async (input, init) => {
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);

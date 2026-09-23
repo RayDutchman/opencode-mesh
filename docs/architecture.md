@@ -1,11 +1,12 @@
 # OpenCode Mesh 原理与架构
 
-本文说明 OpenCode Mesh 的设计目标、运行原理、组件边界、主要数据流和仓库文件职责。
+本文描述 **OpenCode Mesh 0.2.1** 的架构，当前以 **OpenCode V2.0.6** 为验证版本；部署与验收状态见[稳定性实施记录](./superpowers/plans/2026-09-23-v2-stabilization.md)。V1 稳定基线见根目录 README；当前开发线不再维护 V1 前端兼容。
 
 本文是架构总览，不替代具体协议和部署手册：
 
 - 传输消息、分片信封和错误语义见 [`protocol.md`](./protocol.md)。
-- OpenCode Web 路径和验收范围见 [`opencode-web-capability-matrix.md`](./opencode-web-capability-matrix.md)。
+- V2 设计边界见 [`V2 最小传输适配设计`](./superpowers/specs/2026-09-23-v2-minimal-transport-design.md)，实测结果与限制见 [`执行与验收记录`](./superpowers/plans/2026-09-23-v2-minimal-transport.md)。
+- [`opencode-web-capability-matrix.md`](./opencode-web-capability-matrix.md) 和路由目录保留历史资料，不代表当前 V2 的完整验收范围。
 - 安装、卸载和配置操作见根目录 [`README.md`](../README.md)。
 
 ## 1. 项目目标
@@ -13,6 +14,8 @@
 OpenCode Mesh 将多台设备上的 OpenCode 统一暴露到一个公网 Gateway。用户只需要访问一个 Web 地址，就可以在 OpenCode 原生 Web UI 中选择不同设备，并访问对应设备上的项目、会话、终端和事件流。
 
 项目本身不修改 OpenCode 的业务协议，也不要求每台设备开放公网监听端口。它在 OpenCode Web UI 和本机 OpenCode 之间增加一层设备发现、身份认证、传输选择和故障恢复能力。
+
+Server 名称、项目、会话、模型选择和终端界面交给 OpenCode 原生管理。手机只需浏览器，不要求安装 VPN 客户端；能否直连仍取决于实际网络和 WebRTC 可达性。
 
 核心目标有四个：
 
@@ -43,7 +46,7 @@ OpenCode Mesh 将多台设备上的 OpenCode 统一暴露到一个公网 Gateway
 |---|---|---|
 | Gateway | 公网服务器 | 浏览器认证、设备注册、设备路由、Relay 中继、P2P 信令 |
 | Agent | 每台运行 OpenCode 的设备 | 注册设备、维持控制连接、代理本机 HTTP/WebSocket、响应 P2P 请求 |
-| 浏览器适配层 | Gateway 返回的 OpenCode HTML 内 | 劫持 Fetch/XHR/WebSocket/EventSource，选择 P2P 或 Relay |
+| 浏览器适配层 | Gateway 返回的 OpenCode HTML 内 | 保留 Server URL 作用域，适配 fetch/WebSocket，选择 P2P 或 Relay |
 | OpenCode | Agent 所在设备 | 实际提供项目、会话、终端和事件流业务 |
 
 Gateway 和 Agent 使用同一套 Python 入口，通过 `--mode` 选择运行角色：
@@ -54,6 +57,14 @@ python -m src.main --mode agent --config config/agent.json
 ```
 
 Gateway 由 FastAPI/uvicorn 托管；Agent 是 asyncio 常驻进程。Agent 不监听公网端口，只主动连接 Gateway 和本机 OpenCode。
+
+### 2.1 VPS 同时运行 OpenCode
+
+本节为部署设计边界，本轮未在 VPS 上安装 OpenCode 或同机独立 Agent。
+
+同一 VPS 可以同时运行 Gateway 和一套 OpenCode，但两者仍是独立角色：另起一个 Agent，将 `opencode_url` 指向该 VPS 的本地 OpenCode，例如 `http://127.0.0.1:40960`，再注册到 Gateway。浏览器以该 Agent 的明确 `device_id` 访问，不将 Gateway 的 origin 当作此 OpenCode 的身份，也不为 VPS 增加特殊业务路由。
+
+每个 Agent 必须使用独立 `state_file`，因为设备身份和 Agent token 保存在其中；同机多个 Agent 不能共享它。设备显示名用于辨认，不用于判断身份。Gateway 浏览器认证与本地 OpenCode 认证分别配置。
 
 ## 3. 两条传输路径
 
@@ -72,11 +83,14 @@ P2P 适合浏览器和 Agent 网络条件允许直接建立 WebRTC 连接的场�
 
 P2P 不是另一套业务协议。它和 Relay 使用相同的请求、响应、流和 WebSocket 语义，区别只在于承载方式。
 
-P2P 失败时有三种恢复方式：
+当前浏览器适配层维护一条面向当前设备的 P2P 通道。后台访问其他明确 Server 的请求使用各自的 Relay，不会借用当前设备通道。页面和静态资源仍由 Gateway 提供；“P2P”不表示所有流量都绕过 VPS。
 
-- 当前请求直接使用 Relay，不等待 P2P 恢复。
+P2P 不可用时按请求所处阶段处理：
+
+- 尚未通过 P2P 发送的请求使用 Relay，不等待 P2P 恢复。
 - P2P 初始协商失败时按退避策略重试。
 - 已建立的通道断开时清理旧状态，再按当前设备重新连接。
+- 已通过旧通道发送的请求可能失败，不自动通过 Relay 重放；后续请求可走 Relay，详见 §12.3。
 
 ### 3.2 Gateway Relay
 
@@ -118,7 +132,17 @@ Gateway 是系统的公网入口和控制平面，主要职责如下。
 /_mesh/device/{device_id}/...
 ```
 
-未指定设备时，Gateway 根据默认设备和在线状态选择目标 Agent。设备状态由控制连接、心跳和最后活跃时间共同决定，过期连接不会继续被当作健康设备使用。
+V2 页面使用原生路由：
+
+```text
+/server/{base64url(server_url)}/session/{session_id}
+```
+
+其中 `server_url` 可以是 `https://gateway/_mesh/device/{device_id}`。Gateway 能解析该 Server 路由，并为设备页面重写静态资源地址；`/_mesh/device/{device_id}` 是请求基址，不能直接当作 V2 前端页面路由。
+
+没有设备上下文的页面入口由 Gateway 根据 `default_device` 和在线状态选择前端资源来源，Gateway 本身不注册为业务 Server。直接访问裸 origin 的 `/api/*` 返回 `400 device_required`；业务请求使用明确设备基址。显式设备请求不会因默认设备变化而改投另一台设备。旧 origin 会话书签仅对同源页面跳转迁移到默认设备的明确地址。
+
+设备状态由控制连接、心跳和最后活跃时间共同决定，过期连接不会继续被当作健康设备使用。
 
 ### 4.2 Agent 注册和控制连接
 
@@ -179,6 +203,10 @@ Agent 不理解 OpenCode 的业务语义，只负责传输和边界保护：
 - 过滤不应跨越边界的认证、Cookie、Host 和代理头。
 - 对请求、响应、流和 WebSocket 数据执行大小限制和错误转换。
 
+请求体从传输信封解码后按原始字节交给 httpx，不补空 JSON，也不转换模型字段。请求已重新组装，因此必须剥离 `Content-Length`、`Transfer-Encoding` 等旧分帧头、其他逐跳头以及 `Connection` 声明的头，由 HTTP 库生成新连接的分帧。否则同时带上长度和 chunked 编码会导致上游返回空 400，V2 SDK 随后可能报 `UnsupportedContentType`。
+
+上游 HTTP 请求使用 `Accept-Encoding: identity`。响应过滤旧长度、编码、逐跳头和 `Set-Cookie`，与实际返回字节保持一致；不把 HTML 或空错误体伪装成业务 JSON。
+
 ### 5.3 P2P 应答和资源清理
 
 Agent 接收 Gateway 转发的 P2P offer，使用 aiortc 创建 answer，并为每个 P2P peer 保存有限的装配器、序列号和任务状态。
@@ -192,29 +220,52 @@ Agent 接收 Gateway 转发的 P2P offer，使用 aiortc 创建 answer，并为�
 
 ## 6. 浏览器适配层
 
-Gateway 只对符合条件的 OpenCode HTML 页面注入 `src/static_adapter.py` 中的 JavaScript。适配层不改变 OpenCode 的业务页面，而是替换网络 API 的传输实现。
+Gateway 只对符合条件的 OpenCode HTML 页面注入 `src/static_adapter.py` 中的 JavaScript。适配层保留原生业务界面，补充设备入口、请求作用域和网络传输。
 
-### 6.1 API 劫持
+### 6.1 浏览器接口边界
 
 | 浏览器 API | 适配行为 |
 |---|---|
 | `fetch` | 优先走 P2P，不可用时使用原生请求走 Relay |
-| `XMLHttpRequest` | 通过异步 fetch 适配，拒绝同步 XHR |
 | `WebSocket` | 通过 P2P 或 Relay 桥接文本、二进制和 subprotocol |
-| `EventSource` | 解析 SSE，支持事件 ID、断线重连和认证失败关闭 |
+| `URL` | 仅在同源 Mesh Server 基址与绝对 `/api/...` 路径组合时保留设备前缀，其他情况沿用原生解析 |
+| `XMLHttpRequest` / `EventSource` | 保留原生实现，不再提供自定义模拟类 |
 
-适配层还显示当前设备、传输方式和 P2P RTT，方便判断请求当前走的是 P2P 还是 Relay。
+V2 SDK 的 SSE 使用 fetch 流。Mesh 转发流式响应状态、头和数据，由 SDK 处理事件解析及业务重连，不另造 EventSource 语义。
 
-### 6.2 设备切换
+Mesh 生成的协议/上游错误均声明 JSON 类型。流式首帧前失败返回与 Relay 一致的 HTTP 错误；收到首帧后发生故障，只能中断已开始的响应流，不能再替换状态码。
 
-OpenCode 的多 Server 入口被映射到 Mesh 设备。设备切换时，适配层会：
+状态栏显示当前设备、在线状态、P2P/Relay 和对应 RTT。它描述当前设备的传输状态，不代表其他 Server 的后台请求也走同一通道。
+
+### 6.2 请求设备归属
+
+设备身份在选择 P2P 或 Relay **之前**确定：
+
+1. 明确的 `/_mesh/device/{id}/...` 请求保持原目标。
+2. V2 SDK 使用 `new URL('/api/...', serverUrl)` 时，原生 URL 解析会丢弃基址路径。适配层在此刻保留 Mesh 设备前缀，避免等到 fetch 时再猜目标。
+3. 启动时原生内建 Server 已是明确设备基址；旧客户端裸 origin 请求的适配仍固定绑定默认设备，不随页面选择切换。
+4. 跨源外部 Server 保持原地址，交给原生传输，不进入 Mesh P2P。
+
+例如，同时访问 A 的旧会话和 B 的会话列表时，两条请求各自保留 A/B 的明确地址；不能因为首页刚选了 B，就把 A 的请求也发到 B。页面和选中 Server 用于选择当前 P2P 连接及显示状态，不覆盖请求中已有的 Server 身份。
+
+### 6.3 原生 Server 列表与设备切换
+
+设备发现通过 `/_mesh/devices` 获取设备，再探测在线设备的 `/api/info`。JSON 响应且版本以 `2.` 开头的设备会被补充到原生 Server 列表。配置中的主设备身份在暂时离线/探测超时时仍保留，不改指另一台设备。按 URL 去重，不覆盖用户名称、外部地址或其他存储字段。
+
+V2.0.6 原生入口硬编码 `location.origin`，没有外部启动配置钩子。`src/frontend.py` 因而只在版本隔离的 `/_mesh/ui/1/{device_id}/_assets/...` 资源命名空间中，精确替换已验证的唯一入口 getter，并让入口模块等待 `window.__ocmBootstrap.ready`。新命名空间防止复用旧 immutable 资源。若入口契约变化则返回明确错误，而不是猜测替换其他 JavaScript。
+
+发现与存储迁移在原生应用启动前完成，不再迟到刷新用户正在编辑的页面。仅移除同源 origin 的重复 Server 列表项，迁移其默认选择、首页选择和已知 PWA 旧路由；明确设备条目优先保留用户改名。原生 canonical Server 改为明确设备后，既有 `local` 项目状态保留给原生迁移逻辑处理；不清空 localStorage 或数据库。
+
+设备切换时，适配层会：
 
 1. 更新当前路由设备 ID。
 2. 关闭旧设备的 P2P peer、流和 pending 请求。
 3. 按新设备重新获取 manifest 和建立传输。
 4. 在新连接尚未就绪时，让请求继续通过 Relay。
 
-这样可以避免旧设备的连接状态影响当前页面正在访问的设备。
+请求和 WebSocket 捕获创建时的通道；异步读取上传体、发送二进制帧或取消请求时，仍使用该通道，而不是后来切换出的全局通道。旧通道不可用时报告失败，不把旧请求发给新设备。
+
+WebSocket 在 `ws_open` 发出前被关闭时，本地确定终止并清理；已发出后则按发送队列顺序关闭，迟到数据不再交给终端，终止事件幂等。
 
 ## 7. 消息分片与可靠性边界
 
@@ -237,7 +288,9 @@ P2P DataChannel 和 Agent 控制 WebSocket 都需要面对单帧大小、缓冲�
 - `data` 使用严格 base64 编码。
 - 请求、响应、流和 WebSocket 数据均受统一大小上限约束。
 - 未完成装配、完成墓碑和错误墓碑都受数量和 TTL 限制。
-- DataChannel 背压等待超过超时后关闭当前 P2P 通道，使请求回退 Relay。
+- DataChannel 背压等待超过超时后关闭当前 P2P 通道，使在途操作失败、后续请求可走 Relay，不重放结果未知的请求。
+
+浏览器 P2P 请求体上限为 32 MiB，为 base64 和 JSON 信封开销留出空间。已知超限的请求零读取转 Relay；未知大小的流由唯一 reader 读取至超过上限（最多保留上限加一个源块），然后将已读块和剩余 reader 按序交给受消费者背压控制的 Relay 流。读取期间取消会立即释放源流，不使用 clone/tee 全量缓冲。这不是已发送请求的重试，Relay 自身的大小限制仍然有效。
 
 具体字段、控制消息类型和稳定错误 reason 以 [`protocol.md`](./protocol.md) 为准。
 
@@ -273,9 +326,9 @@ Agent  --agent_token--> Gateway 控制 WebSocket
 | HTTP/SSE 响应过大 | 在边界处拒绝或中断，返回稳定错误 |
 | 流队列溢出 | 发送显式流错误，避免静默丢事件 |
 | 请求被取消 | 双向传播 `cancel`，释放 future、队列和装配器 |
-| 设备切换 | 关闭旧设备传输，所有新请求绑定新设备 |
+| 设备切换 | 重建当前 P2P 连接；每个请求仍按自身明确 Server 路由，其他 Server 可走 Relay |
 
-可靠性回归测试位于 `tests/test_mesh_reliability.py`，覆盖分片顺序、大小限制、重复结束、P2P 状态清理和真实 Agent 消息处理路径。
+可靠性回归测试位于 `tests/test_mesh_reliability.py`，覆盖分片顺序、大小限制、重复结束、P2P 状态清理和真实 Agent 消息处理路径。`tests/test_v2_transport.py` 使用实际 Node URL/Request/Abort 行为和 Agent HTTP 请求捕获，覆盖设备作用域、上传体、取消、逐跳头及原生 Server 名称保留。
 
 ## 10. 文件架构
 
@@ -288,6 +341,7 @@ opencode-mesh/
 ├── src/
 │   ├── __init__.py
 │   ├── main.py
+│   ├── frontend.py
 │   ├── p2p.py
 │   └── static_adapter.py
 ├── config/
@@ -301,6 +355,7 @@ opencode-mesh/
 │   ├── install.sh
 │   ├── uninstall.sh
 │   ├── deploy-agent.sh
+│   ├── deploy-release.sh
 │   ├── bootstrap.sh
 │   └── check_auth.py
 ├── docs/
@@ -309,7 +364,12 @@ opencode-mesh/
 │   ├── opencode-web-capability-matrix.md
 │   └── opencode-web-route-catalog.json
 └── tests/
-    └── test_mesh_reliability.py
+    ├── test_mesh_reliability.py
+    ├── test_v2_transport.py
+    ├── test_v2_bootstrap.py
+    ├── test_v2_errors.py
+    ├── test_v2_upload_backpressure.py
+    └── test_v2_websocket.py
 ```
 
 ### 10.1 Python 核心代码
@@ -326,6 +386,10 @@ opencode-mesh/
 - HTML 注入入口和 uvicorn 启动参数。
 
 这是当前项目最大的单体文件，职责按 `Gateway`、`Agent` 和公共辅助函数分区。
+
+#### `src/frontend.py`
+
+集中适配已验证的 V2 入口 getter，隔离静态资源缓存，并迁移旧 Gateway origin 页面书签。未知启动契约显式失败，不猜测改写其他模块。
 
 #### `src/p2p.py`
 
@@ -344,9 +408,10 @@ P2P 和分片基础设施：
 
 - P2P 建连、重连和设备切换。
 - P2P/Relay 请求选择。
-- Fetch、XHR、WebSocket、EventSource 适配。
+- fetch、WebSocket 适配及受限的 URL 基址保留。
+- 原生 Server 列表的 V2 设备补充和请求设备归属。
 - 浏览器侧分片信封发送和接收。
-- SSE 解析、事件重连和传输状态栏。
+- fetch 响应流桥接、取消和传输状态栏。
 
 ### 10.2 配置与部署文件
 
@@ -362,20 +427,22 @@ P2P 和分片基础设施：
 - `scripts/install.sh`：安装依赖、写入配置、生成 systemd 服务，并处理 root/普通用户两种安装范围。
 - `scripts/uninstall.sh`：显式按 `agent`、`gateway` 或 `all` 卸载，Agent 模式会先尝试注销设备，并支持保留设备身份。
 - `scripts/deploy-agent.sh`：通过 SSH 将 Agent 部署到远程 Linux 设备。
+- `scripts/deploy-release.sh`：按已提交 revision 部署本机或远程 Gateway/Agent，保留源码备份并记录 `.mesh-revision`。
+- `scripts/bootstrap.sh`：本地开发环境初始化。
+- `scripts/check_auth.py`：使用 ASGI transport 验证认证、注册所有权、请求头隔离、注销和文件权限。
 
 ### 10.4 版本控制
 
 `src/__init__.py` 中的 `__version__` 是唯一的软件版本来源，`pyproject.toml` 通过 setuptools 动态读取。Gateway 注入浏览器的状态栏显示该版本；`transport-manifest.version` 仍然是协议版本。发布使用 `vX.Y.Z` Git tag，`scripts/install.sh` 默认安装 `main`，设置 `MESH_VERSION=vX.Y.Z` 可固定到指定发布版本。
-- `scripts/bootstrap.sh`：本地开发环境初始化。
-- `scripts/check_auth.py`：使用 ASGI transport 验证认证、注册所有权、请求头隔离、注销和文件权限。
 
-### 10.4 文档与测试
+### 10.5 文档与测试
 
 - `docs/architecture.md`：本文，解释系统原理和组件关系。
 - `docs/protocol.md`：控制消息和 P2P 分片协议规格。
-- `docs/opencode-web-capability-matrix.md`：OpenCode Web 路径能力和验收矩阵。
-- `docs/opencode-web-route-catalog.json`：机器可读的 OpenCode 路由目录。
+- `docs/opencode-web-capability-matrix.md`：历史 OpenCode Web 路径能力和验收矩阵。
+- `docs/opencode-web-route-catalog.json`：历史机器可读路由目录。
 - `tests/test_mesh_reliability.py`：可靠性回归测试。
+- `tests/test_v2_transport.py`：V2 请求透明性和浏览器适配行为测试。
 
 ## 11. 启动和请求示例
 
@@ -395,12 +462,12 @@ python -m src.main --mode agent --config config/agent.json
 
 Agent 启动后主动注册 Gateway，并连接本机 OpenCode。浏览器无需直接访问 Agent 的监听端口。
 
-### 11.3 一次普通请求的生命周期
+### 11.3 一次 Relay 请求的生命周期
 
 ```text
 浏览器 fetch
   ↓
-浏览器适配层选择 P2P 或 Relay
+浏览器适配层固定 Server 目标，选择 Relay
   ↓
 Gateway 生成 request id
   ↓
@@ -444,5 +511,6 @@ P2P 和 Relay 切换可能发生在请求已经部分发送之后。对带副作
 - Relay 和 P2P 是否使用同样的业务语义。
 - 请求、响应、流和 WebSocket 是否都有大小上限。
 - timeout、cancel、close、disconnect 是否释放所有状态。
-- 设备切换和重连是否仍绑定当前设备 ID。
+- 设备切换和重连是否保留每个在途请求、流和终端创建时的设备归属。
+- 明确 Server 请求和裸 origin 默认 Server 是否会被页面选择意外改写。
 - 文档中的协议字段是否与 `protocol.md` 和测试保持一致。

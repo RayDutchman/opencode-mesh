@@ -127,7 +127,7 @@ def test_discovery_preserves_native_server_names_and_skips_v1():
       {type:'http',displayName:'External',http:{url:'https://external.test'}}];
     const storage=new Map([['opencode.global.dat:server',JSON.stringify({list:original})]]);
     const localStorage={getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v)};
-    const state={}; const renderBar=()=>{};
+    const state={}; const window={__ocmBootstrap:{}}; const renderBar=()=>{};
     const nativeFetch=async url=>{
       if(url==='/_mesh/devices') return Response.json({devices:[
         {device_id:'gti',name:'Renamed host',online:true},
@@ -189,6 +189,99 @@ def test_p2p_upload_keeps_device_and_cancellation(scenario):
       controller.enqueue(new TextEncoder().encode('{}'));controller.close();
       await assert.rejects(operation,scenario==='abort'?/abort/i:/channel unavailable/);
       assert.equal(sent.length,0);
+    })().then(()=>{completed=true}).catch(e=>{completed=true;console.error(e);process.exitCode=1});
+    """
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_bounded_probe_discards_on_abort_without_replay():
+    """探测读取期间 abort 立即拒绝；底层流被释放；不发送任何 mutation。
+
+    当前实现先 clone().arrayBuffer() 全量缓冲后才检查中止信号，读取未完成的流时
+    abort 无法打断；有界探测必须在读取过程中立即响应取消。
+    """
+    adapter = TRANSPORT_ADAPTER.split('<script id="ocm-transport-adapter">', 1)[1].split('</script>', 1)[0]
+    script = """
+    const assert=require('node:assert/strict');
+    global.window=global;
+    global.location={origin:'https://mesh.test',host:'mesh.test',pathname:'/',href:'https://mesh.test/'};
+    global.document={readyState:'loading',addEventListener(){}};
+    global.history={pushState(){},replaceState(){}};
+    global.localStorage={getItem(){return null}};
+    global.addEventListener=()=>{};
+    global.setTimeout=global.setInterval=()=>0;
+    global.fetch=()=>new Promise(()=>{});
+    global.WebSocket=class {};
+    """ + adapter.replace('__OCM_VERSION_JSON__', '"test"') + """
+    let completed=false;
+    process.on('beforeExit',()=>assert.ok(completed,'async assertions did not complete'));
+    (async()=>{
+      const s=window.__ocmTransport;
+      s.manifest={device_id:'gti'};
+      s.channel={readyState:'open',bufferedAmount:0,send:frame=>{throw new Error('send must not run on abort')}};
+      const ac=new AbortController();
+      let released=false;
+      // 只推 1 字节后暂停的流：探测读第一块后停在 pending read 上
+      const body=new ReadableStream({start(c){c.enqueue(new Uint8Array(1));},cancel(){released=true;}});
+      const operation=window.fetch('https://mesh.test/_mesh/device/gti/api/session/test/prompt',
+        {method:'POST',body,duplex:'half',signal:ac.signal});
+      // setImmediate 未被适配器 mock 覆盖；在探测已停在 pending read 上后触发取消
+      setImmediate(()=>ac.abort(new DOMException('Aborted','AbortError')));
+      await assert.rejects(operation,/abort/i);
+      await new Promise(r=>setImmediate(r));
+      assert.ok(released,'探测中止后底层请求体流必须被释放');
+    })().then(()=>{completed=true}).catch(e=>{completed=true;console.error(e);process.exitCode=1});
+    """
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_bounded_probe_relays_oversize_stream_without_full_buffering():
+    """未知大小流超过 P2P 上限后立即走 Relay 并释放残余源流，不做全量缓冲。
+
+    永不结束的流：有界探测只读约上限字节就进入 Relay；若沿用全量缓冲实现，
+    arrayBuffer() 将永远等待，测试超时失败（行为回归测试）。
+    """
+    adapter = TRANSPORT_ADAPTER.split('<script id="ocm-transport-adapter">', 1)[1].split('</script>', 1)[0]
+    script = """
+    const assert=require('node:assert/strict');
+    global.window=global;
+    global.location={origin:'https://mesh.test',host:'mesh.test',pathname:'/',href:'https://mesh.test/'};
+    global.document={readyState:'loading',addEventListener(){}};
+    global.history={pushState(){},replaceState(){}};
+    global.localStorage={getItem(){return null}};
+    global.addEventListener=()=>{};
+    global.setTimeout=global.setInterval=()=>0;
+    global.relayInput=null;
+    global.enqueued=0;
+    global.released=false;
+    // nativeFetch 真身：拦截设备发现路径，Relay 请求即时吊销 body 并返回 204
+    global.fetch=async input=>{
+      if(typeof input==='string'&&input.startsWith('/_mesh/')) return new Promise(()=>{});
+      global.relayInput=input;
+      if(input&&input.body){try{await input.body.cancel();}catch(_){}}
+      return new Response(null,{status:204});
+    };
+    global.WebSocket=class {};
+    """ + adapter.replace('__OCM_VERSION_JSON__', '"test"') + """
+    let completed=false;
+    process.on('beforeExit',()=>assert.ok(completed,'async assertions did not complete'));
+    (async()=>{
+      const s=window.__ocmTransport;
+      s.manifest={device_id:'gti'};
+      s.channel={readyState:'open'};
+      // 永不结束的推流源；setImmediate 不受适配器 mock 影响，cancel 回调负责停泵并标记释放
+      const body=new ReadableStream({start(c){
+        const pump=()=>{if(global.released)return;c.enqueue(new Uint8Array(1024*1024));global.enqueued+=1024*1024;if(!global.released)setImmediate(pump);};
+        pump();
+      },cancel(){global.released=true;}});
+      const url='https://mesh.test/_mesh/device/gti/api/upload';
+      assert.equal((await window.fetch(url,{method:'POST',body,duplex:'half'})).status,204);
+      assert.ok(global.relayInput instanceof Request,'Relay 必须收到 Request');
+      // 有界探测只读约上限字节（33MiB 出头），不能任其无限增长
+      assert.ok(global.enqueued < 33*1024*1024+4*1024*1024,'探测必须在上限附近停止');
+      assert.ok(global.released,'转入 Relay 后残余源流必须被释放');
     })().then(()=>{completed=true}).catch(e=>{completed=true;console.error(e);process.exitCode=1});
     """
     result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
