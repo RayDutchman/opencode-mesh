@@ -422,7 +422,7 @@ P2P 和分片基础设施：
 
 - `scripts/install.sh`：安装依赖、写入配置、生成 systemd 服务，并处理 root/普通用户两种安装范围。
 - `scripts/uninstall.sh`：显式按 `agent`、`gateway` 或 `all` 卸载，Agent 模式会先尝试注销设备，并支持保留设备身份。
-- `scripts/upgrade.sh`：按已提交 revision 升级本机或远程 Gateway/Agent，保留源码备份并记录 `.mesh-revision`。
+- `scripts/upgrade.sh`：按已提交 revision 升级本机或远程 Gateway/Agent，记录 `.mesh-revision`；无参数自动发现本机安装，恢复资料仅临时保留，成功后清理、恢复失败才保留。
 - `tests/test_auth_boundaries.py`：随 pytest 使用 ASGI transport 验证认证、注册所有权、请求头隔离、注销和文件权限。
 
 ### 10.4 版本控制

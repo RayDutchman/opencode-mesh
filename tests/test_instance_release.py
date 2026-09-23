@@ -305,11 +305,8 @@ def test_apply_restarts_running_same_root_agent_instances_and_gateway(
     assert (root / "src" / "MARKER").read_text(encoding="utf-8") == "NEW"
     assert (root / ".mesh-revision").read_text(encoding="utf-8") == f"{REVISION}\n"
     assert (root / "scripts" / "upgrade.sh").read_text(encoding="utf-8") == "# archive-script-v2\n"
-    backups = list((root / ".mesh-backups").glob("source.*.tar.gz"))
-    assert len(backups) == 1
-    with tarfile.open(backups[0], "r:gz") as tf:
-        assert tf.extractfile("src/MARKER").read().decode() == "OLD"
-        assert tf.extractfile(".mesh-revision").read().decode() == "rev-old\n"
+    assert not (root / ".mesh-backups").exists()
+    assert not list(root.glob('.mesh-stage.*'))
 
     # 最终状态：两个 agent 实例与 gateway 都在运行（已重启），inactive 保持 inactive，
     # 其它目录单元保持 active 且从未被碰
@@ -362,6 +359,9 @@ def test_apply_pip_failure_rolls_back_source_and_restores_all_originally_active(
     py_log = Path(log_path.parent / "mock-python.log")
     pip_calls = [line for line in py_log.read_text(encoding="utf-8").splitlines() if "pip install" in line]
     assert len(pip_calls) >= 2
+    recovery = list(root.glob('.mesh-stage.*/rollback.tar.gz'))
+    assert len(recovery) == 1
+    assert '恢复未完全成功' in proc.stderr
 
 
 def test_apply_partial_stop_failure_restores_every_originally_active(tmp_path, mock_env, deploy_script):
@@ -413,6 +413,19 @@ def test_apply_default_single_instance_user_scope(tmp_path, mock_env, deploy_scr
     assert subjects(ops, "restart") == {"opencode-mesh-agent.service"}
     assert (root / ".mesh-revision").read_text(encoding="utf-8") == f"{REVISION}\n"
     assert (root / "src" / "MARKER").read_text(encoding="utf-8") == "NEW"
+
+
+def test_same_revision_does_not_restart(tmp_path, mock_env, deploy_script):
+    bin_dir, state_path, log_path = mock_env
+    root = make_install_root(tmp_path)
+    (root / '.mesh-revision').write_text(REVISION + '\n')
+    write_state(state_path, 'user', {'opencode-mesh-agent.service': {
+        'state_file': 'enabled', 'active': 'active', 'wd': str(root)}})
+    archive, digest = make_release_archive(tmp_path)
+    result = run_apply(deploy_script, root, archive, digest, 'agent', 'user', bin_dir, state_path, log_path)
+    assert result.returncode == 0
+    assert not subjects(read_ops(log_path), 'restart')
+    assert (root / 'src/MARKER').read_text() == 'OLD'
 
 
 @pytest.mark.parametrize("role,units", [

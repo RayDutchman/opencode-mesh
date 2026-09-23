@@ -31,7 +31,7 @@ Gateway 提供页面、设备发现和 WebRTC 信令。直连建立后，消息�
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | \
-  MESH_VERSION=v0.3.0 bash -s -- agent
+  MESH_VERSION=v0.3.1 bash -s -- agent
 ```
 
 安装完成后会打印实际运行版本。升级时修改 `MESH_VERSION` 后重新执行安装；需要回滚时指定较早的 tag。版本号的唯一来源是 `src/__init__.py`，发布前需同步创建对应的 Git tag。
@@ -104,15 +104,17 @@ bash -c 'curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/
 统一使用 Git tag 或 commit 部署，无需逐个同步 Python 文件：
 
 ```bash
-bash scripts/upgrade.sh root@your-vps /root/opencode-mesh gateway system v0.3.0
-bash scripts/upgrade.sh user@device /home/user/.local/share/opencode-mesh agent user v0.3.0
+bash scripts/upgrade.sh root@your-vps /root/opencode-mesh gateway system v0.3.1
+bash scripts/upgrade.sh user@device /home/user/.local/share/opencode-mesh agent user v0.3.1
 # 本机以 Git 工作区运行的 Agent：工作区须干净，且 HEAD 与部署 ref 一致
 bash scripts/upgrade.sh local "$PWD" agent user HEAD
 ```
 
 脚本将指定 Git ref 的 `src/`、`scripts/`、`pyproject.toml` 打包，通过 SHA-256 校验后更新，安装依赖并重启服务；不复制本地配置、密钥或 data。目标机沿用原有 systemd 单元、配置和虚拟环境，需已完成首次安装。
 
-安装目录的 `.mesh-revision` 记录完整 commit；`.mesh-backups/` 保留更新前源码。安装或服务启动失败时自动恢复旧源码并尝试重新安装、启动旧版（共享虚拟环境的依赖不是完整快照）。`active` 检查不代表 Agent 已连通 Gateway，联网状态仍需从设备列表确认。
+直接运行 `bash ~/opencode-mesh/scripts/upgrade.sh` 会自动发现本机已安装的 systemd 服务与真实安装目录，默认升级到脚本所在源码仓库的 HEAD；只有多个安装目标时才需要选择。确认前显示版本、短提交号和关联服务；输入编号错误可重新选择，已安装同一提交则不重启。请先自行更新源码仓库，脚本不会自动执行 git pull。远程升级保留上面的显式位置参数用法。
+
+安装目录的 `.mesh-revision` 记录完整 commit。旧源码仅临时保存在本次 `.mesh-stage.*` 工作目录，成功或完整回滚后自动清理；恢复失败才保留并打印位置。历史版本产生的 `.mesh-backups/` 不会被本次升级自动删除。安装或服务启动失败时尝试恢复旧源码、依赖和原运行服务（共享虚拟环境的依赖不是完整快照）。`active` 检查不代表 Agent 已连通 Gateway，联网状态仍需从设备列表确认。
 
 只打包**已提交的代码**。正式发布先递增 `src.__version__`、更新 CHANGELOG、测试并创建新的 `vX.Y.Z` tag，再部署该 tag；不要移动旧发布 tag。回滚可指定旧 tag，开发工作区需先切换到相应提交。
 
@@ -160,7 +162,7 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 
 旧单实例配置仍可使用原命令运行。新增实例前如需调整为统一配置，应备份配置、保留原设备身份，并核对服务工作目录与内部状态路径；安装脚本不会自动覆盖旧配置。`config/agents.json` 已被 Git 忽略；示例文件不包含真实凭据。Agent 不使用 `listen_host`、`listen_port`，这两个字段仅属于 Gateway。
 
-`scripts/` 仅保留安装 `install.sh`、卸载 `uninstall.sh`、升级 `upgrade.sh` 三个入口；认证检查统一随 pytest 执行。有控制终端时直接 `bash scripts/upgrade.sh` 或 `bash scripts/uninstall.sh` 可按提示选择目标并确认；自动化仍可使用位置参数。安装具名实例使用 `bash scripts/install.sh agent NAME`，连接参数通过终端提示填写。
+`scripts/` 仅保留安装 `install.sh`、卸载 `uninstall.sh`、升级 `upgrade.sh` 三个入口；认证检查统一随 pytest 执行。有控制终端时直接 `bash scripts/upgrade.sh` 自动发现本机安装并确认，`bash scripts/uninstall.sh` 按提示选择卸载角色与实例；自动化仍可使用位置参数。安装具名实例使用 `bash scripts/install.sh agent NAME`，连接参数通过终端提示填写。
 
 ## 更多文档
 
