@@ -270,6 +270,19 @@ V2.0.6 原生入口硬编码 `location.origin`，没有外部启动配置钩子�
 
 WebSocket 在 `ws_open` 发出前被关闭时，本地确定终止并清理；已发出后则按发送队列顺序关闭，迟到数据不再交给终端，终止事件幂等。
 
+### 6.4 重连触发与退避
+
+浏览器适配层监听 `window` 的 `online` 事件和可用的 `navigator.connection` 变化，作为网络恢复的提示，不建立真实网络探测：
+
+- 提示经过 300ms 防抖合并，事件风暴只产生一次协商；一次提示驱动的尝试后 5s 内忽略新的提示（冷却）。
+- `online` 只是提示：已打开的 P2P 通道不被拆线，也绝不据此关闭 Relay 兜底。
+- 提示会取消任意尚未打开阶段的旧协商（初始或重试、ICE gathering、等待 DataChannel 打开）并立即重新协商，不等旧的指数退避；限频只来自防抖+冷却。已打开的通道是唯一例外。
+- 切回前台（含 bfcache 恢复的 `pageshow`）且上次尝试晚于 15s 时，通过同一个受防抖/冷却控制的提示入口提前重试；重叠的提示合并为单次尝试。
+- 每次协商都有 40s 总时限，超时中断包括 `createOffer`/`setLocalDescription`/`setRemoteDescription`、本地等待（ICE gathering、DATA 通道打开）在内的全部阶段；过期协商不会向新网络发出 offer。
+- 指数退避兜底（1s 起、上限 30s）；任一尝试成功即重置为 1s。协商链用 generation 守卫：被取消或过期的协商既不安排退避，也不重置退避值、不清理新尝试的 controller、不翻转 `isInitialAttempt`。
+- 只有页面 bootstrap 的首轮协商允许业务 fetch 借用至多 1.2s 等待；hint 重建、退避重试或切设备启动的新尝试（即使取代了首轮协商）一律立即走 Relay，不给重试增加延迟。`isInitialAttempt` 仅由 `runAttemptForCurrentDevice` 显式置为 false 或受归属守卫的首轮 finally 清理。
+- 重建旧传输时同时失效仍绑定在旧（未 open）传输上的请求/流：通道可能在 close 事件派发前就已死亡，kick 路径同样调用 `failTransport`，避免 pending/stream 悬挂。
+
 ## 7. 消息分片与可靠性边界
 
 P2P DataChannel 和 Agent 控制 WebSocket 都需要面对单帧大小、缓冲区和断线问题。因此 P2P 载荷使用统一信封：
@@ -324,6 +337,8 @@ Agent  --agent_token--> Gateway 控制 WebSocket
 |---|---|
 | P2P 初始协商失败 | 当前请求走 Relay；后台按退避策略重试 |
 | P2P DataChannel 断开 | 清理 peer 和 pending 状态，重新协商 |
+| 网络事件（online/connection 变化） | 只在防抖+冷却窗口内提前触发一次重试；取消并重建任意未打开阶段的旧协商；已打开的 P2P 不拆线 |
+| 重试协商停滞 | 40s 总时限中断从 createOffer 到通道打开的全部阶段；事件提示可随时取消并立即重建 |
 | Agent 控制连接断开 | Gateway 标记设备离线；Agent 清理旧任务后退避重连 |
 | 控制消息发送超时 | 关闭异常连接并让对应请求失败，不永久等待 |
 | HTTP/SSE 响应过大 | 在边界处拒绝或中断，返回稳定错误 |
@@ -364,6 +379,7 @@ opencode-mesh/
     ├── test_v2_transport.py
     ├── test_v2_bootstrap.py
     ├── test_v2_errors.py
+    ├── test_v2_reconnect_network.py
     ├── test_v2_upload_backpressure.py
     └── test_v2_websocket.py
 ```
@@ -408,6 +424,7 @@ P2P 和分片基础设施：
 - 原生 Server 列表的 V2 设备补充和请求设备归属。
 - 浏览器侧分片信封发送和接收。
 - fetch 响应流桥接、取消和传输状态栏。
+- 网络事件提示驱动的重连（防抖/冷却）、generation 守卫和 40s 总时限。
 
 ### 10.2 配置与部署文件
 
@@ -437,6 +454,7 @@ P2P 和分片基础设施：
 - `docs/opencode-web-route-catalog.json`：历史机器可读路由目录。
 - `tests/test_mesh_reliability.py`：可靠性回归测试。
 - `tests/test_v2_transport.py`：V2 请求透明性和浏览器适配行为测试。
+- `tests/test_v2_reconnect_network.py`：在 Node 中运行真实适配器、用可控假时钟模拟网络事件，覆盖重连提示、防抖冷却、任意未打开阶段的取消重建（初始 ICE、重试 ICE、等待打开）、旧协商链的污染防护、hint 启动的重试不继承首轮 fetch 等待、kick 失效静默死亡通道的 pending、40s 总时限（含停滞的 createOffer）和前后台/bfcache 恢复行为。
 
 ## 11. 启动和请求示例
 
@@ -489,6 +507,17 @@ Agent 只主动连接 Gateway，可以避免为每台设备配置端口转发、
 ### 12.3 为什么不让 P2P 自动重试所有请求
 
 P2P 和 Relay 切换可能发生在请求已经部分发送之后。对带副作用的 POST 或命令执行请求自动重放，可能导致业务重复执行。因此传输层只负责恢复连接和报告失败，是否重试由上层业务决定。
+
+### 12.4 为什么网络事件只是提示
+
+`online`/`navigator.connection.change` 在浏览器中只是尽力通知：`online` 表示有网络栈可达性，不代表 Gateway 与设备可达，也不代表 WebRTC 可用；`connection` 变化连可达性都不保证。因此适配层只把它们当作提示，用防抖和冷却压缩触发频率，并且：
+
+- 不拆掉已经打开的 P2P 通道（也不为此触发未节流的 RTT 探测，RTT 只走既有节流路径）。
+- 取消并立即重建任意尚未打开阶段的旧协商——包括首轮协商：页面冷启动时事件频繁，但防抖+冷却已经限频，单次 hint 带来的重建代价有界。
+- 停滞在任意阶段（manifest、answer、ICE gathering、等待通道打开）的协商都可被提示取消重启；网关/对端可能已经恢复，原地等待旧退避反而更慢。
+- 后台重试不占用业务请求等待时间：只有页面 bootstrap 的首轮协商允许 fetch 等 1.2s，hint 重建或退避启动的新尝试（即使取代了首轮）一律走 Relay。
+
+这样保证 hint 带来的收益（更早恢复 P2P）有上界，不会因事件风暴放大协商次数、产生并发协商或延迟业务请求。
 
 ## 13. 阅读和修改建议
 

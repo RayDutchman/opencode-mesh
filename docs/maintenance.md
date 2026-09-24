@@ -110,6 +110,16 @@ UI 或传输行为变更应按受影响范围检查：
 
 ## 7. 压缩或结束会话前的交接模板
 
+### 浏览器适配器重连事件监听（2026-09-24，未发布）
+
+- 基线 `b40be41`（0.3.1），工作区此前干净；本轮改动未提交：`src/static_adapter.py`、`docs/architecture.md`、`docs/maintenance.md`，新增 `tests/test_v2_reconnect_network.py`。
+- 任务：为浏览器适配器的 Relay 重连加入网络事件监听（`window.online` + 可选 `navigator.connection` change）、300ms 防抖 + 5s 冷却、取消任意未打开阶段（初始 ICE、重试 ICE、等待通道打开）的旧协商并立即新尝试、单一有效 attempt 与 generation 守卫、旧协商链的 close/catch/finally 不得污染新尝试、已 open P2P 不拆线、前台恢复/bfcache 恢复（>15s 陈旧）经同一受冷却控制的提示入口提前重试、后台重试不让业务 fetch 等待 1.2s（仅首轮保留）、指数退避兜底、40s 总 deadline 中断从 createOffer 到通道打开的全部阶段、事件风暴不产生并发/资源泄漏。`online` 只是 hint，不据此关闭 Relay。
+- 关键决定：hint 取消并立即重建任意尚未打开阶段的旧协商——包括首轮协商（防抖+冷却已限频，单次 hint 的重建代价有界），已打开的通道是唯一例外；旧版本写成"进入 WebRTC 阶段回到退避、首轮不打断"，经独立审查后按已批准方案修正，相关测试同步更正。统一 teardown `releaseCurrentAttempt`：先推进 generation、解绑旧通道 handler、abort controller、关闭旧 peer、清理双 timer，再立即跑新尝试，避免旧链 catch/finally 经生成期匹配污染新链（退避安排、退避值、controller 槽、`isInitialAttempt`）以及 close 同步回调重入。协商链的 then/catch/finally 均以创建的 generation 守卫，`connectP2P` 的 finally 用 `state.activeController === controller` 归属守卫清理。`createOffer`/`setLocalDescription`/`setRemoteDescription` 纳入 deadline/取消等待，过期链不再向新网络发 offer。foreground/pageshow 走同一防抖+冷却 hint 入口，重叠提示合并单飞。`runAttemptForCurrentDevice` 显式置 `isInitialAttempt=false`（它从不服务页面 bootstrap），hint 取消首轮后启动的新尝试不继承 1.2s 等待；kick 路径同样调用 `failTransport` 失效未 open 旧传输上的 pending/stream，防止通道已死但 close 未派发时悬挂（原测试断言 `isInitialAttempt===true` 仅用于归属验证，现按策略改为 false）。manifest 解析后把 `routeDeviceId` 同步为实际服务设备，避免无显式选择页面被 2s 周期检查误判为设备切换。
+- 证据：20 项 Node 行为测试运行真实 TRANSPORT_ADAPTER（可控假时钟 + 脚本化 fetch/RTCPeerConnection/channel，且 `Date.now` 与假时钟同步；新增 ICE/OFFER 停滞开关、静默关闭通道与 pageshow 触发）。按修正意图先更新测试，两次红阶段分别为 `8 failed, 10 passed` 与追加 2 项后的 `3 failed, 17 passed`；实施后 `20 passed`，全套 `207 passed`（`-W error::DeprecationWarning`），compileall、`node --check` 提取的适配器、`git diff --check` 均通过。
+- 测试侧更正说明：原第 4 项（"提示期间初始协商保持"）与第 12 项（"提示后开等回到退避"）固化了驳回的错误意图，已改写为"初始协商可被提示失效重建"与"开等被提示立即取消重建且不等旧 30s 退避"；测试 6 因 foreground 走防抖入口需 `advance(300)`；测试 3 增加新 controller 不被旧 finally 清空的断言。
+- 未验证：全部为模拟网络事件的 Node 行为测试，未做真实浏览器/真实网络复现（用户此前要求停止真实复现）；`navigator.connection` 缺失分支仅由 harness 空对象覆盖；createOffer 停滞与 40s 总时限未在上游真实页面复核。
+- 下一步（如需继续）：用户独立审查 diff；如需真实复验，按 `docs/maintenance.md` 浏览器验收方法进行，并将结果追加到本文档。
+
 ### V2 预加载资源作用域修复（2026-09-23，未发布）
 
 - 基线提交 `9a32167`。真实上游 2.0.14 的预加载器将依赖路径拼为 `/_assets/...`；同一 CSS 在 Gateway 根路径返回 404，在明确设备路径返回 200，确认请求丢失来源设备。

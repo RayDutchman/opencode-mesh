@@ -23,7 +23,18 @@ TRANSPORT_ADAPTER = r"""
   const dec = new TextDecoder();
   const b64 = bytes => { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s); };
   const unb64 = text => Uint8Array.from(atob(text || ''), c => c.charCodeAt(0));
-  const timeout = (promise, ms) => Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))]);
+  // Wait for a local (non-fetch) stage while the 40s deadline can still interrupt it.
+  const waitWithDeadline = (promise, ms, label, controller) => new Promise((resolve, reject) => {
+    let timer;
+    const onAbort = () => { clearTimeout(timer); controller.signal.removeEventListener('abort', onAbort); reject(new Error(label + ' aborted')); };
+    if (controller.signal.aborted) { onAbort(); return; }
+    controller.signal.addEventListener('abort', onAbort, { once: true });
+    timer = setTimeout(() => { controller.signal.removeEventListener('abort', onAbort); reject(new Error(label + ' timeout')); }, ms);
+    promise.then(
+      value => { clearTimeout(timer); controller.signal.removeEventListener('abort', onAbort); resolve(value); },
+      error => { clearTimeout(timer); controller.signal.removeEventListener('abort', onAbort); reject(error); }
+    );
+  });
   const makeId = () => {
     if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') return globalThis.crypto.randomUUID();
     return 'ocm-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
@@ -36,10 +47,16 @@ TRANSPORT_ADAPTER = r"""
   const SEND_TIMEOUT_MS = 10000;
   // Bound the whole P2P setup, including manifest and answer fetches.
   const CONNECT_TIMEOUT_MS = 40000;
+  // Hints are debounced so an online/connection-change storm collapses into one attempt.
+  const NETWORK_DEBOUNCE_MS = 300;
+  // After a hint-driven attempt a new hint is ignored until the cooldown lapses.
+  const NETWORK_COOLDOWN_MS = 5000;
+  // A foreground resume only retries when the last attempt is older than this.
+  const FOREGROUND_RETRY_MS = 15000;
   // Sanity cap: a real round-trip is far below this; anything larger is a clock-jump artifact (lock screen / background timer freeze) and must be discarded.
   const RTT_MAX_MS = 10000;
 
-  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), incoming: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, devices: [], defaultDevice: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null, p2pSendTail: Promise.resolve() };
+  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), incoming: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, networkTimer: null, lastNetworkAttempt: null, lastAttemptTime: null, activeController: null, isInitialAttempt: false, devices: [], defaultDevice: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null, p2pSendTail: Promise.resolve() };
 
   const BAR_CSS = `
   #ocm-mesh-bar{display:flex;align-items:center;gap:8px;height:36px;padding:0 10px;font-size:13px;line-height:20px;flex:0 0 auto;border-bottom:1px solid var(--v2-border-border-base);background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-muted);-webkit-user-select:none;user-select:none}
@@ -493,18 +510,95 @@ TRANSPORT_ADAPTER = r"""
     state.incoming.delete(id);
   }
 
+  // The retry chain guards every mutation with its captured generation: an
+  // aborted or expired negotiation must never schedule a backoff nor reset the
+  // backoff value for a newer attempt.
+  function runAttemptForCurrentDevice() {
+    // This runs retries, hint rebuilds and device-switch attempts, never the
+    // page bootstrap: a fresh attempt here must not borrow the initial fetch
+    // wait, even when it replaces the initial negotiation.
+    state.isInitialAttempt = false;
+    const generation = state.generation;
+    state.ready = connectP2P(state.routeDeviceId)
+      .then(() => { if (generation === state.generation) state.reconnectDelay = 1000; })
+      .catch(() => {
+        if (generation !== state.generation) return null;
+        state.reconnectDelay = Math.min(state.reconnectDelay * 2, 30000);
+        scheduleReconnect();
+        return null;
+      });
+    return state.ready;
+  }
+
+  // Release whatever the current attempt left behind so a still-settling old
+  // chain can no longer mutate state or reach the network. Clearing both timers
+  // drops any pending hint or backoff plan. The channel is unbound before the
+  // peer closes so a synchronous close callback cannot re-enter; aborting the
+  // controller also interrupts any local wait parked on it.
+  function releaseCurrentAttempt(bump) {
+    if (bump) state.generation += 1;
+    if (state.networkTimer) { clearTimeout(state.networkTimer); state.networkTimer = null; }
+    if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
+    const oldChannel = state.channel;
+    if (oldChannel) { oldChannel.onclose = null; oldChannel.onerror = null; oldChannel.onmessage = null; }
+    if (state.activeController) state.activeController.abort();
+    if (state.pc) { try { state.pc.close(); } catch (_) {} }
+    state.pc = null; state.channel = null;
+  }
+
   function scheduleReconnect() {
     if (state.reconnectTimer) return;
-    const generation = state.generation;
+    // A hint or a late event must not tear down a channel that is already open.
+    if (state.channel && state.channel.readyState === 'open') return;
+    // A channel close can leave the open wait hanging while this runs: abort
+    // the in-flight negotiation so the old chain cannot pollute the backoff's
+    // attempt once it settles, and give that attempt its own generation.
+    releaseCurrentAttempt(Boolean(state.activeController));
     failTransport(new Error('P2P disconnected; request outcome may be unknown'));
-    state.pc = null; state.channel = null; state.closed = true;
+    state.closed = true;
+    const generation = state.generation;
     state.reconnectTimer = setTimeout(() => {
       state.reconnectTimer = null;
       if (generation !== state.generation) return;
-      state.ready = connectP2P(state.routeDeviceId)
-        .then(() => { state.reconnectDelay = 1000; })
-        .catch(() => { state.reconnectDelay = Math.min(state.reconnectDelay * 2, 30000); scheduleReconnect(); });
+      runAttemptForCurrentDevice();
     }, state.reconnectDelay);
+  }
+
+  // A network hint resumes P2P right away: an old negotiation in any stage is
+  // cancelled and immediately rebuilt, with the already-open channel as the
+  // only exception. Rate limiting comes from the debounce + cooldown, not from
+  // ignoring hints (the initial attempt may be invalidated and rebuilt too).
+  function kickReconnectNow() {
+    if (state.channel && state.channel.readyState === 'open') return false;
+    releaseCurrentAttempt(Boolean(state.activeController));
+    // A channel can die without its close event being delivered yet: fail
+    // everything still bound to the old not-open transport instead of leaking
+    // pending requests and streams.
+    failTransport(new Error('P2P disconnected; request outcome may be unknown'));
+    runAttemptForCurrentDevice();
+    return true;
+  }
+
+  function onNetworkHint() {
+    if (state.networkTimer) return;
+    const now = Date.now();
+    if (state.lastNetworkAttempt != null && now - state.lastNetworkAttempt < NETWORK_COOLDOWN_MS) return;
+    state.networkTimer = setTimeout(() => {
+      state.networkTimer = null;
+      if (kickReconnectNow()) state.lastNetworkAttempt = Date.now();
+    }, NETWORK_DEBOUNCE_MS);
+  }
+
+  // Resume from the background only when the last attempt is stale, then re-enter
+  // through the same debounced, cooldown-controlled hint path: a background-frozen
+  // negotiation older than the threshold is cancelled and retried, and overlapping
+  // hints collapse into a single flight. Recent attempts are left alone (the
+  // caller already refreshed the probes).
+  function onForegroundResume() {
+    if (state.channel && state.channel.readyState === 'open') return;
+    if (state.lastAttemptTime == null) return;
+    if (Date.now() - state.lastAttemptTime < FOREGROUND_RETRY_MS) return;
+    onNetworkHint();
   }
 
   async function connectP2P(deviceId) {
@@ -514,6 +608,8 @@ TRANSPORT_ADAPTER = r"""
     const abandoned = () => state.generation !== myGeneration;
     // Bound setup stages without their own timeout so sockets cannot stay CONNECTING.
     const controller = new AbortController();
+    state.activeController = controller;
+    state.lastAttemptTime = Date.now();
     const totalTimer = setTimeout(() => controller.abort(), CONNECT_TIMEOUT_MS);
     let pc = null;
     const dispose = () => { clearTimeout(totalTimer); if (pc) { try { pc.close(); } catch (_) {} } };
@@ -526,6 +622,9 @@ TRANSPORT_ADAPTER = r"""
       if (abandoned()) return dispose();
       state.manifest = manifest;
       state.deviceId = manifest.device_id || null;
+      // The server picks the default device when no explicit route was known;
+      // keep the route in sync so periodic re-checks do not treat it as a switch.
+      state.routeDeviceId = deviceId || manifest.device_id || state.routeDeviceId;
       if (!manifest.p2p || !manifest.p2p.enabled || !window.RTCPeerConnection) throw new Error('p2p unavailable');
       pc = new RTCPeerConnection({ iceServers: (manifest.stun_servers || []).map(urls => ({ urls })) });
       const channel = pc.createDataChannel('opencode-mesh', { ordered: true });
@@ -535,15 +634,21 @@ TRANSPORT_ADAPTER = r"""
       channel.onerror = () => { if (alive()) scheduleReconnect(); };
       channel.onmessage = event => { if (!alive()) return; try { settle(JSON.parse(typeof event.data === 'string' ? event.data : dec.decode(event.data))); } catch (_) {} };
       state.pc = pc; state.channel = channel;
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      await timeout(new Promise(resolve => { if (pc.iceGatheringState === 'complete') resolve(); else pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') resolve(); }; }), 15000);
+      // Every setup stage joins the total deadline and the cancel wait, so the
+      // 40s covers the whole negotiation and a stale chain can never send an
+      // offer for the new network.
+      const offer = await waitWithDeadline(pc.createOffer(), CONNECT_TIMEOUT_MS, 'p2p create offer', controller);
+      if (abandoned()) return dispose();
+      await waitWithDeadline(pc.setLocalDescription(offer), CONNECT_TIMEOUT_MS, 'p2p set local description', controller);
+      if (abandoned()) return dispose();
+      await waitWithDeadline(new Promise(resolve => { if (pc.iceGatheringState === 'complete') resolve(); else pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') resolve(); }; }), 15000, 'p2p gathering', controller);
       const answerResponse = await nativeFetch(manifest.p2p.offer, { method: 'POST', credentials: 'same-origin', signal: controller.signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: pc.localDescription.type, sdp: pc.localDescription.sdp, device_id: manifest.device_id }) });
       const answer = await answerResponse.json();
       if (abandoned()) return dispose();
       if (!answerResponse.ok || answer.error) throw new Error(answer.error || 'p2p answer failed');
-      await pc.setRemoteDescription(answer);
-      await timeout(new Promise((resolve, reject) => { if (channel.readyState === 'open') resolve(); else { channel.onopen = resolve; channel.onerror = reject; } }), 10000).catch(() => { throw new Error('p2p channel timeout'); });
+      await waitWithDeadline(pc.setRemoteDescription(answer), CONNECT_TIMEOUT_MS, 'p2p set remote description', controller);
+      if (abandoned()) return dispose();
+      await waitWithDeadline(new Promise((resolve, reject) => { if (channel.readyState === 'open') resolve(); else { channel.onopen = resolve; channel.onerror = reject; } }), 10000, 'p2p channel open', controller);
       if (abandoned()) return dispose();
       // Restore the guarded handler after waiting for open to catch later errors.
       channel.onerror = () => { if (alive()) scheduleReconnect(); };
@@ -553,6 +658,13 @@ TRANSPORT_ADAPTER = r"""
     } catch (error) {
       dispose();
       throw error;
+    } finally {
+      // A newer attempt owns the controller slot; only our own finally may
+      // clear it or flip isInitialAttempt.
+      if (state.activeController === controller) {
+        state.activeController = null;
+        state.isInitialAttempt = false;
+      }
     }
   }
 
@@ -568,17 +680,14 @@ TRANSPORT_ADAPTER = r"""
   async function reconnectForDevice() {
     const deviceId = activeDeviceId();
     if (deviceId === state.routeDeviceId) return;
-    state.generation += 1;
-    if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
-    // Remove old handlers before close to prevent duplicate reconnect scheduling.
-    const oldChannel = state.channel;
-    if (oldChannel) { oldChannel.onclose = null; oldChannel.onerror = null; oldChannel.onmessage = null; }
-    if (state.pc) { try { state.pc.close(); } catch (_) {} }
-    state.pc = null; state.channel = null; state.manifest = null;
+    releaseCurrentAttempt(true);
+    // The old device's manifest no longer applies; requests bound to its open
+    // channel must fail instead of being replayed to the new device.
+    state.manifest = null;
     failTransport(new Error('device switched'));
     state.closed = false;
     state.routeDeviceId = deviceId;
-    state.ready = connectP2P(deviceId).then(() => { state.reconnectDelay = 1000; }).catch(() => { scheduleReconnect(); return null; });
+    runAttemptForCurrentDevice();
   }
 
   for (const name of ['pushState', 'replaceState']) {
@@ -842,7 +951,11 @@ TRANSPORT_ADAPTER = r"""
   }
 
   state.routeDeviceId = activeDeviceId();
-  state.ready = connectP2P(state.routeDeviceId).catch(() => { scheduleReconnect(); return null; });
+  state.isInitialAttempt = true;
+  const bootstrapGeneration = state.generation;
+  state.ready = connectP2P(state.routeDeviceId)
+    .then(() => { if (state.generation === bootstrapGeneration) state.reconnectDelay = 1000; })
+    .catch(() => { if (state.generation !== bootstrapGeneration) return null; scheduleReconnect(); return null; });
   window.__ocmTransport = state;
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', renderBar, { once: true });
   else renderBar();
@@ -858,8 +971,9 @@ TRANSPORT_ADAPTER = r"""
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);
     if (url.origin !== location.origin || (url.pathname.startsWith('/_mesh/') && !url.pathname.startsWith('/_mesh/device/')) || (virtualDeviceId(url.pathname) && virtualDeviceId(url.pathname) !== state.manifest?.device_id)) return nativeFetch(input, init);
     if (state.channel && state.channel.readyState === 'open') return p2pFetch(input, init);
-    // Only wait for the initial P2P attempt; never add latency while running on Relay.
-    if (state.pc && !state.closed && !state.reconnectTimer) {
+    // Only the initial P2P attempt may borrow a short wait; retry attempts never
+    // add latency while the transport runs on Relay.
+    if (state.pc && state.isInitialAttempt && !state.closed && !state.reconnectTimer) {
       await Promise.race([state.ready, new Promise(resolve => setTimeout(resolve, 1200))]);
       if (state.channel && state.channel.readyState === 'open') return p2pFetch(input, init);
     }
@@ -884,8 +998,22 @@ TRANSPORT_ADAPTER = r"""
     }
     measureRelayRtt();
   }
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) resetRttAfterBackground(); });
-  window.addEventListener('pageshow', event => { if (event.persisted) resetRttAfterBackground(); });
+  // A network hint only nudges the transport; it never tears down a channel
+  // that is already open.
+  window.addEventListener('online', onNetworkHint);
+  if (navigator.connection && typeof navigator.connection.addEventListener === 'function') {
+    navigator.connection.addEventListener('change', onNetworkHint);
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    resetRttAfterBackground();
+    onForegroundResume();
+  });
+  window.addEventListener('pageshow', event => {
+    if (!event.persisted) return;
+    resetRttAfterBackground();
+    onForegroundResume();
+  });
 
   window.addEventListener('beforeunload', () => { if (state.pc) state.pc.close(); });
 })();
