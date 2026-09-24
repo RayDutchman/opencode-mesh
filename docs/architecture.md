@@ -145,7 +145,9 @@ V2 页面使用原生路由：
 
 没有设备上下文的页面入口由 Gateway 根据 `default_device` 和在线状态选择前端资源来源，Gateway 本身不注册为业务 Server。直接访问裸 origin 的 `/api/*` 返回 `400 device_required`；业务请求使用明确设备基址。显式设备请求不会因默认设备变化而改投另一台设备。旧 origin 会话书签仅对同源页面跳转迁移到默认设备的明确地址。
 
-设备状态由控制连接、心跳和最后活跃时间共同决定，过期连接不会继续被当作健康设备使用。
+设备状态由控制连接、心跳和最后活跃时间共同决定。所有入口共用同一判据：`/_mesh/devices` 的 `online`、路由选择、浏览器 WebSocket 切入点、`transport-manifest` 的 `p2p.enabled` 和 P2P offer 收单都以「控制连接存在且 `last_seen` 在 45 秒内（缺 `last_seen` 的旧状态仍视为在线）」为准，浏览器看到的状态与 Gateway 实际采用的传输永远一致。过期连接不会继续被当作健康设备使用，也不会被转发新的 P2P offer。浏览器 WebSocket 对过期设备的显式连接以 4403 拒绝，且不关闭在途 Agent 连接（HTTP 代理路径为释放路由会关闭过期 `ws`，探针/刷新不得打断在途连接）。
+
+设备离线页只会在原目标设备恢复后自动刷新，绝不自动改投其他设备或重放操作。页面用 `textContent` 直示目标设备名称（对任意名称安全），列出实时 online/offline 状态，并为每个在线设备提供路径型切换入口 `/_mesh/device/{id}`（与前端适配器用作设备身份与探测的地址一致）；无目标且仍有在线设备时不会宣称“无设备在线”。轮询失败会清空上一轮结果并显示“状态未知”，下一次成功轮询自动恢复；轮询保持 `no-store`。每次轮询有 10 秒 deadline：请求永不返回时用 AbortController 终止（不可用时仍按超时处理）、状态置为未知并释放轮询守卫，迟到响应被丢弃，不会把过时绿灯当成实时结果。
 
 ### 4.2 Agent 注册和控制连接
 
@@ -379,6 +381,7 @@ opencode-mesh/
     ├── test_v2_transport.py
     ├── test_v2_bootstrap.py
     ├── test_v2_errors.py
+    ├── test_v2_offline_page.py
     ├── test_v2_reconnect_network.py
     ├── test_v2_upload_backpressure.py
     └── test_v2_websocket.py
@@ -455,6 +458,7 @@ P2P 和分片基础设施：
 - `tests/test_mesh_reliability.py`：可靠性回归测试。
 - `tests/test_v2_transport.py`：V2 请求透明性和浏览器适配行为测试。
 - `tests/test_v2_reconnect_network.py`：在 Node 中运行真实适配器、用可控假时钟模拟网络事件，覆盖重连提示、防抖冷却、任意未打开阶段的取消重建（初始 ICE、重试 ICE、等待打开）、旧协商链的污染防护、hint 启动的重试不继承首轮 fetch 等待、kick 失效静默死亡通道的 pending、40s 总时限（含停滞的 createOffer）和前后台/bfcache 恢复行为。
+- `tests/test_v2_offline_page.py`：在 Node 中运行真实离线页脚本（脚本化 fetch + DOM shim + 假时钟），并直接驱动 ASGI websocket 通道验证浏览器切入点，覆盖统一在线判据（列表/路由/P2P/ws gate，隔离 `state_file`）、目标设备名称安全显示、在线设备切换入口、仅目标恢复时 reload、无目标不自动改投、轮询失败的状态未知与恢复、永不返回轮询的 10 秒 abort 与迟到响应丢弃。
 
 ## 11. 启动和请求示例
 

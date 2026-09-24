@@ -133,6 +133,20 @@ def filter_response_headers(headers) -> dict[str, str]:
     return {k: v for k, v in headers.items() if k.lower() not in blocked}
 
 
+def device_online(device: dict[str, Any] | None, stale_after: float = 45) -> bool:
+    """A device counts as online only while its control connection is fresh.
+
+    This single criterion drives the device list endpoint, routing and P2P
+    gating so the status presented to browsers never disagrees with the
+    transport Gateway actually uses. A missing ``last_seen`` (state written
+    before heartbeat tracking) stays compatible with the old behavior.
+    """
+    if not device or not device.get("ws"):
+        return False
+    last_seen = device.get("last_seen")
+    return not last_seen or (time.time() - float(last_seen)) <= stale_after
+
+
 DEFAULT_STUN_SERVERS = ["stun:stun.l.google.com:19302"]
 
 OFFLINE_PAGE = """<!doctype html>
@@ -153,38 +167,113 @@ li{display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid rg
 .dot{width:8px;height:8px;border-radius:50%;background:#9ca3af}
 .dot.on{background:#22c55e}
 .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+a.name{color:inherit;text-decoration:underline;cursor:pointer}
 .state{opacity:.6;font-size:12px}
+.state.unknown{opacity:.8;color:#f59e0b}
 </style>
 </head>
 <body>
 <div class="card">
 <h1>OpenCode Mesh</h1>
-<p id="msg">No device is online. This page refreshes automatically.</p>
+<p id="msg">Checking device status…</p>
 <ul id="list"></ul>
 </div>
 <script>
 var target = __TARGET__;
 var msg = document.getElementById('msg');
 var list = document.getElementById('list');
+function deviceLink(id){ return '/_mesh/device/' + encodeURIComponent(id); }
 function render(devices){
   list.textContent = '';
   devices.forEach(function(d){
     var li = document.createElement('li');
     var dot = document.createElement('span'); dot.className = 'dot' + (d.online ? ' on' : '');
-    var name = document.createElement('span'); name.className = 'name'; name.textContent = d.name || d.device_id;
     var state = document.createElement('span'); state.className = 'state'; state.textContent = d.online ? 'online' : 'offline';
-    li.append(dot, name, state); list.append(li);
+    if (d.online){
+      // Manual switch entry only: the path-type device entry the frontend
+      // adapter already uses for discovery and Server identity.
+      var link = document.createElement('a');
+      link.className = 'name';
+      link.href = deviceLink(d.device_id);
+      link.textContent = d.name || d.device_id;
+      li.append(dot, link, state);
+    } else {
+      var name = document.createElement('span'); name.className = 'name'; name.textContent = d.name || d.device_id;
+      li.append(dot, name, state);
+    }
+    list.append(li);
   });
-  var ready = target ? devices.some(function(d){ return d.device_id === target && d.online; }) : devices.some(function(d){ return d.online; });
-  if (ready) location.reload();
 }
+function setUnknown(){
+  // A failed poll must not keep a previous poll's dots as live state: clear the
+  // list and say the status is unknown; the next successful poll recovers.
+  list.textContent = '';
+  var li = document.createElement('li');
+  var state = document.createElement('span'); state.className = 'state unknown';
+  state.textContent = 'Status unknown — retrying';
+  li.append(state);
+  list.append(li);
+  msg.textContent = 'Cannot reach the device list; status is unknown. This page keeps retrying automatically.';
+}
+function update(devices){
+  render(devices);
+  var anyOnline = devices.some(function(d){ return d.online; });
+  if (target){
+    var targetDevice = null;
+    devices.forEach(function(d){ if (d.device_id === target) targetDevice = d; });
+    // Reload only when the original target recovers; never auto-switch the page
+    // to another device nor replay any operation.
+    if (targetDevice && targetDevice.online){ location.reload(); return; }
+    var name = targetDevice ? (targetDevice.name || target) : target;
+    msg.textContent = anyOnline
+      ? 'Device "' + name + '" is offline; another device is online. Choose it below or wait for this device — the page refreshes automatically.'
+      : 'Device "' + name + '" is offline. This page refreshes automatically.';
+    return;
+  }
+  // No original target: list the realtime state and let the user pick; never
+  // claim no device is online while the list shows one.
+  msg.textContent = anyOnline
+    ? 'Choose an online device below to continue.'
+    : 'No device is online. This page refreshes automatically.';
+}
+var fetching = false;
 function tick(){
-  fetch('/_mesh/devices', {credentials:'same-origin', cache:'no-store'}).then(function(r){ return r.ok ? r.json() : null; }).then(function(data){
-    if (!data) return;
-    var devices = Array.isArray(data.devices) ? data.devices : [];
-    msg.textContent = target ? 'Device is offline. This page refreshes automatically.' : 'No device is online. This page refreshes automatically.';
-    render(devices);
-  }).catch(function(){});
+  if (fetching) return;
+  fetching = true;
+  // Bound every poll: a request that never settles must not block polling
+  // forever. After 10s the poll is aborted (AbortController when available),
+  // the status is expressed as unknown, and the guard is released so the next
+  // tick retries. A response that settles after the deadline is discarded by
+  // the timedOut guard and never overwrites the unknown state with stale dots.
+  var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  var timedOut = false;
+  var timer = null;
+  var finished = false;
+  function finish(){
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
+    fetching = false;
+  }
+  timer = setTimeout(function(){
+    timedOut = true;
+    if (controller) controller.abort();
+    finish();
+    setUnknown();
+  }, 10000);
+  fetch('/_mesh/devices', {credentials:'same-origin', cache:'no-store',
+                           signal: controller ? controller.signal : undefined})
+    .then(function(r){ return r.ok ? r.json() : null; })
+    .then(function(data){
+      if (timedOut) return;
+      if (!data || !Array.isArray(data.devices)) { setUnknown(); return; }
+      update(data.devices);
+    })
+    .catch(function(){
+      if (timedOut) return;
+      setUnknown();
+    })
+    .then(finish, finish);
 }
 tick();
 setInterval(tick, 3000);
@@ -222,7 +311,7 @@ class Registry:
     def public(self):
         result = []
         for d in self.devices.values():
-            result.append({k: v for k, v in d.items() if k not in {"auth_token", "ws"}} | {"online": bool(d.get("ws"))})
+            result.append({k: v for k, v in d.items() if k not in {"auth_token", "ws"}} | {"online": device_online(d)})
         return result
 
 
@@ -304,11 +393,8 @@ class Gateway:
 
     @staticmethod
     def is_online(device: dict[str, Any] | None, stale_after: float = 45) -> bool:
-        """A device counts as online only while its control connection is fresh."""
-        if not device or not device.get("ws"):
-            return False
-        last_seen = device.get("last_seen")
-        return not last_seen or (time.time() - float(last_seen)) <= stale_after
+        """Routing alias of the shared freshness criterion used by the device list too."""
+        return device_online(device, stale_after)
 
     def choose_device(self) -> tuple[str, dict[str, Any]] | None:
         preferred = str(self.cfg.get("default_device") or "")
@@ -488,7 +574,7 @@ class Gateway:
                 "server_url": f"{str(req.base_url).rstrip('/')}/_mesh/device/{quote(str(device_id), safe='')}" if device_id else None,
                 "relay": str(req.base_url).rstrip("/"),
                 "lan": self.cfg.get("lan_base_url"),
-                "p2p": {"enabled": bool(device and device.get("ws")), "offer": "/_mesh/p2p/offer"},
+                "p2p": {"enabled": bool(device and self.is_online(device)), "offer": "/_mesh/p2p/offer"},
                 "stun_servers": self.cfg.get("stun_servers") or DEFAULT_STUN_SERVERS,
                 "capabilities": {"http": True, "sse": True, "websocket": True, "pty": True},
             }
@@ -502,7 +588,9 @@ class Gateway:
             device_id = str(data.get("device_id") or self.cfg.get("default_device") or "")
             device = self.registry.devices.get(device_id) if device_id else None
             agent_ws = device.get("ws") if device else None
-            if not agent_ws:
+            if not device or not self.is_online(device):
+                # Same freshness criterion as routing; this only refuses the offer,
+                # it does not add lifecycle close handling for the stale connection.
                 return JSONResponse({"error": "Device offline"}, status_code=503)
             if len(json.dumps(data)) > int(self.cfg.get("max_p2p_offer_bytes", 1024 * 1024)):
                 return JSONResponse({"error": "P2P signaling too large"}, status_code=413)
@@ -550,10 +638,15 @@ class Gateway:
             else:
                 selected = self.choose_device()
                 device_id, d = selected if selected else (None, None)
-            agent_ws = d.get("ws") if d else None
-            if not agent_ws:
+            if not device_online(d):
+                # Browser links use the same freshness criterion as the device
+                # list: a stale control connection is not a live target. Reject
+                # with 4403 and leave the in-flight Agent connection untouched
+                # (the HTTP proxy path frees the route by closing stale ws; a
+                # probe/refresh must never kill an in-flight connection).
                 await client.close(code=4403)
                 return
+            agent_ws = d["ws"]
             await client.accept()
             bridge_id = secrets.token_urlsafe(12)
             self.browser_ws[bridge_id] = client

@@ -30,6 +30,7 @@
 | `src/frontend.py` | 集中启动契约适配、静态资源命名空间、旧书签迁移 |
 | `tests/test_mesh_reliability.py` | 代理、分片及生命周期回归 |
 | `tests/test_v2_*.py` | 实际 Node 浏览器接口行为及 V2 错误、启动、上传、WS 边界 |
+| `tests/test_v2_offline_page.py` | 统一在线判据（列表/路由/P2P/浏览器 ws gate）、离线页行为与轮询失败/永不返回恢复（ASGI 直驱 websocket + Node 真实页面脚本） |
 
 原生 OpenCode 管理 Server 名称、项目、会话和终端 UI；Mesh 仍注入适配脚本与状态栏。当前活动设备使用一条 P2P 通道，其他 Server 请求按明确地址走 Relay。
 
@@ -109,6 +110,18 @@ UI 或传输行为变更应按受影响范围检查：
 精简重复代码字面的说明；将会话式排查叙述迁入记录；保留通道绑定、取消顺序、预算和身份归属等设计原因。单独审阅注释 diff，避免大范围语言替换掩盖逻辑修改。
 
 ## 7. 压缩或结束会话前的交接模板
+
+### 统一设备在线判据与离线页行为（2026-09-24，未发布）
+
+- 基线 `88c0d09`，工作区此前干净；本轮改动未提交：`src/main.py`、新增 `tests/test_v2_offline_page.py`、`docs/maintenance.md`、`docs/architecture.md`。
+- 任务：统一 `/_mesh/devices` 的 `online` 与 `Gateway.is_online` 为同一判据（`ws` 存在且 `last_seen` 在 45 秒内，缺 `last_seen` 的旧状态保持在线兼容）；离线页明确当前目标设备名称（仅 `textContent`，防 XSS）、其他设备在线时不再宣称无设备、列出实时 online/offline 与在线设备的路径型切换入口 `/_mesh/device/{id}`；仅原目标恢复才 `location.reload()`，无 target 时绝不自动改投/重放；轮询失败清空旧绿灯、显示状态未知，下一次成功轮询恢复；保留 `no-store` 与 3s 轮询；`transport-manifest.p2p.enabled` 与 `p2p/offer` 改用同一新鲜度判据，但不新增陈旧连接的 close 生命周期逻辑。评审收尾两项：浏览器 WebSocket 显式设备分支从「仅看 `ws` 布尔」统一为同一新鲜度判据（stale 以 4403 拒绝且不动在途 Agent 连接）；每次轮询加 10 秒 deadline（AbortController + 定时器清理），永不 settle 的请求被终止、状态未知、守卫释放、迟到响应不得覆盖未知状态。
+- 关键决定：提取模块级 `device_online(device, stale_after=45)` 为唯一实现，`Registry.public()`、`Gateway.is_online()`、manifest/P2P gate、浏览器 WebSocket 入口全部引用；切换入口使用前端适配器已用作设备身份与探测的路径型条目 `/_mesh/device/{id}`（与 `serverTabUrl` 同款，已被既有 bootstrap 测试验证），不猜测其他路由；离线页 `update()` 中目标在线时仅 reload；`setUnknown()` 清空列表，避免上一轮绿灯被当作实时结果；`fetching` 守卫防止轮询叠加，且必须由 10 秒超时终止旧请求（`AbortController` 可用时 abort；不可用时超时仍释放守卫并丢弃迟到结果），成功路径 `finish()` 清理定时器。家庭 PVE 原“绿灯”是真实在线状态，判据统一后仍在线的设备保持绿灯。
+- 红绿：首轮新增 8 项行为测试先写后改，红阶段 `7 failed, 1 passed`，实施后 `8 passed`。评审收尾再增 5 项（3 项 ASGI 浏览器 ws gate ＋ 2 项 Node 真实脚本 hung/deadline），修正驱动 websocket 的辅助器嵌套 `asyncio.run` 后红阶段 `3 failed, 10 passed`（stale 分支被 accept、无 deadline 时 hung 永久卡住轮询与迟到数据覆盖，均按预期失败），实施后文件 `13 passed`；全套 `220 passed`（`-W error::DeprecationWarning`，基线 215 ＋ 5），compileall、`git diff --check`、提取页面脚本 `node --check` 通过。
+- 测试：ASGI 用隔离 `state_file` 覆盖 stale/fresh/legacy 设备的 `online`、`default_device`、离线页 `no-store`、manifest/P2P 判据；直接驱动 ASGI websocket 通道覆盖显式设备的 stale→4403（不动在途连接）、fresh→桥接、未注册→4403；Node 执行真实 OFFLINE_PAGE 脚本（脚本化 fetch + DOM shim + 假时钟，新增 `hang` 永不返回与 `delay` 迟到两种响应、记录 fetch 的 `signal`），覆盖目标离线他机在线不 reload 且切换链接正确、目标恢复 reload 恰好一次、无 target 时在线设备不被隐藏且不自动切换、已知/未知敌对设备名仅作文本不执行、轮询失败（网络错误与 500 响应）状态未知与恢复、hung 轮询 10 秒后 abort 且下一轮恢复、迟到响应不覆盖未知状态，避免纯字符串断言。
+- 未验证：均为 Node/ASGI 行为测试，未做真实浏览器复验（延续此前停止真实复现的要求）；未部署。离线页依赖 `li.append`/`encodeURIComponent` 等现代浏览器 API，未在旧浏览器验证。
+- 下一步：用户独立审阅 diff；如需真实浏览器验收按本文档第 4 节执行，并把结果追加到本文档。
+
+部署前复核：新增迟到轮询完成不得释放新轮询守卫的行为用例，先失败再将 `finish()` 改为幂等；旧迟到响应测试曾依赖提前释放守卫，现按第二轮 22 秒超时、24 秒再次轮询的正确时间线断言。主维护者独立全套验证 **221 passed**。用户已授权提交并部署三端，真实页面观察由用户进行；本记录的“未部署”描述为验证时点状态，实际部署以各端 `.mesh-revision` 为准。临时验收设备已通过其设备身份注销接口清理，四台正式设备保留。
 
 ### 浏览器适配器重连事件监听（2026-09-24，未发布）
 
