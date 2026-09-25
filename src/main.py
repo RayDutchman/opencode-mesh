@@ -1040,7 +1040,10 @@ class Agent:
                     while True:
                         msg = await queue.get()
                         if msg.get("type") == "ws_close":
-                            await target.close(code=int(msg.get("code", 1000)), reason=str(msg.get("reason", "")) or None)
+                            # websockets requires a string when serializing close frames;
+                            # missing or null reasons mean an empty wire reason.
+                            await target.close(code=int(msg.get("code", 1000)),
+                                               reason=str(msg.get("reason") or ""))
                             return
                         if msg.get("type") == "ws_data":
                             data = decode_strict(msg["data"]) if msg.get("kind") == "bytes" else msg.get("data", "")

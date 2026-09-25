@@ -27,6 +27,7 @@ import tomllib
 from pathlib import Path
 
 import httpx
+import websockets
 
 from src.main import (Agent, Gateway, StreamState, backoff_delay, filter_response_headers,
                       forwarding_headers, inject_mesh_bar,
@@ -422,6 +423,72 @@ def test_agent_accepts_consecutive_ws_data_frames_for_one_socket():
     assert [item["data"] for item in received[:2]] == ["a", "b"]
     assert received[2]["type"] == "ws_close"
     assert errors == []
+
+
+# ---------- Real upstream WebSocket close-frame serialization ----------
+
+def test_agent_local_ws_close_frame_reaches_real_upstream():
+    """Agent.local_ws must send a valid close frame to a real upstream WebSocket.
+
+    websockets serializes close frames via Close.serialize() -> reason.encode(),
+    so an empty/missing reason must stay "" on the wire. Passing None (what the
+    old `str(...) or None` produced for "" or a missing reason) raises
+    AttributeError before any frame is written, leaving the upstream with an
+    abnormal closure instead of the requested code/reason.
+    """
+    async def scenario():
+        wire: list[tuple[int | None, str | None]] = []
+        control_seen: list[str] = []
+
+        class Control:
+            async def send(self, payload: str):
+                control_seen.append(payload)
+
+        async def handler(ws):
+            await ws.wait_closed()
+            wire.append((ws.close_code, ws.close_reason))
+
+        server = await websockets.serve(handler, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            async def run_once(close_msg: dict, expected_wire: tuple[int, str]) -> None:
+                wire.clear()
+                control_seen.clear()
+                agent = Agent({"opencode_url": f"http://127.0.0.1:{port}"})
+                task = asyncio.create_task(agent.local_ws(
+                    {"id": close_msg["id"], "path": "/ws", "headers": {}}, Control()))
+                for _ in range(200):
+                    if any("ws_opened" in line for line in control_seen):
+                        break
+                    await asyncio.sleep(0.01)
+                await agent.ws_queues[close_msg["id"]].put(close_msg)
+                async with asyncio.timeout(10):
+                    await task
+                # The upstream records the close frame when its close handling
+                # finishes, which may lag the agent task completion by a tick.
+                for _ in range(200):
+                    if wire:
+                        break
+                    await asyncio.sleep(0.01)
+                assert wire == [expected_wire], f"upstream close frame: {wire}"
+                control = [json.loads(line) for line in control_seen]
+                assert not any(m.get("type") == "ws_error" for m in control), control
+                closed = [m for m in control if m.get("type") == "ws_closed"]
+                assert closed and closed[0]["code"] == expected_wire[0], control
+
+            # Gateway shutdown path (src/main.py) omits code/reason entirely; both default.
+            await run_once({"type": "ws_close", "id": "s-missing"}, (1000, ""))
+            # Frontend default close(): empty reason.
+            await run_once({"type": "ws_close", "id": "s-empty", "code": 1000, "reason": ""}, (1000, ""))
+            # Non-empty reason must arrive verbatim with its code retained.
+            await run_once({"type": "ws_close", "id": "s-reason", "code": 1002, "reason": "mesh bye"}, (1002, "mesh bye"))
+            # Explicit null reason must behave like "no reason", never the literal string "None".
+            await run_once({"type": "ws_close", "id": "s-null", "code": 1000, "reason": None}, (1000, ""))
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())
 
 
 def test_agent_guard_accepts_request_body_at_limit():

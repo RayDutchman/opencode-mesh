@@ -111,7 +111,38 @@ UI 或传输行为变更应按受影响范围检查：
 
 ## 7. 压缩或结束会话前的交接模板
 
+### 当前维护状态（2026-09-25）
+
+- 线上运行提交为 `dff5709`，已推送远端 `main`，包含前台 P2P 健康探针。Gateway、远程 Agent、本机两个 Agent 的服务状态及 revision 已核对；四台设备 API 返回 200，公网 HTML 确认包含最终探针代码。这是部署检查，不是完整浏览器验收。
+- 用户在安卓 16 手机浏览器实测锁屏恢复有明显改善，继续浏览器验证；尚未宣称所有移动网络/终端恢复场景验收完成。
+- `v0.3.1` 标签之后的变更已汇总到 `CHANGELOG.md` 的 Unreleased；运行版本仍为 0.3.1，待验证稳定后另行安排版本号、标签与发布。
+- 本轮收尾范围：修复 Agent WebSocket 空关闭原因异常并补回归、同步维护记录。不将它认定为锁屏故障根因。
+- Android 工作暂缓，保留未提交源码、测试与既有预览包；0.1.1-preview 内置旧适配器，不会随 Gateway 更新获得锁屏恢复修复。多设备 P2P 连接池暂不推进。
+- 下方记录保留各阶段验证证据；其中“未发布”表示未制作新版本标签，不代表尚未部署。历史验证时点状态以本节及对应后续记录更新为准。
+
+### WebSocket 关闭原因收尾（2026-09-25，部署已授权）
+
+- `Agent.local_ws` 曾将缺省或空关闭原因转为 `None`；实际 websockets 17.1 在序列化关闭帧时调用字符串编码，因而抛出 `AttributeError`。现在缺省、空串及显式 null 均传空字符串，正常非空原因与关闭码保持原值。
+- 在 `tests/test_mesh_reliability.py` 增加真实本地 WebSocket 服务与客户端回归，覆盖上述四种输入并断言上游收到的关闭码/原因及控制端结果。修复前复现异常关闭 1006 和序列化异常，修复后四种输入均通过；不以宽容 mock 代替帧验证。
+- 主维护者复核实际 diff 并独立运行完整 pytest（`-W error::DeprecationWarning`）：`275 passed in 7.63s`，`git diff --check` 通过。关闭码转换未改动；修复的是连接处理任务的异常，不据此宣称整个 Agent 进程会崩溃。
+- 未做跨进程部署或浏览器/真机端到端验收，也未验证所有受支持的 websockets 版本。本缺陷与此前锁屏无响应的因果关系未证实。
+- 用户已授权提交、推送并部署本项代码、测试、CHANGELOG 和状态更正；提交前完整复跑 `275 passed in 7.79s`。部署结果以各端 `.mesh-revision` 与服务检查为准；既有 Android 工作保留，版本标签发布仍待用户浏览器验证稳定。
+
+### 前后台恢复旧 P2P 前台健康探针（2026-09-25，未发布）
+
+- 实施基线 `258 passed`，分支 `feat/android-apk`；探针代码、回归测试与相关文档已提交为 `dff5709` 并部署。原有 Android 未提交工作保留。
+- 任务（用户已批准）：修复用户现场安卓 16 锁屏后 P2P 无延迟但 API 全挂——页面从后台恢复时遗留的旧 open P2P 通道可能陈旧（通道活着但 Agent 侧不再转发）。实现前台健康探针：`visibilitychange` 可见或 bfcache `pageshow` 恢复时若遗留旧 open P2P 通道，立即发送探针 ping 并在 3s 内等待匹配 pong；无 pong 则淘汰旧通道并后台重建；验证期间新 HTTP/WebSocket 请求暂时走 Relay；mutation 不重放、迟到结果不影响新连接。
+- 关键决定：探针用独立 `state.probe = { channel, generation, pingT, timer }` + `state.probing` 标志，绝不占用周期 ping 槽位（`pingSent`）；`failProbe` 先清探针、按 channel+generation 身份守卫后走 `releaseCurrentAttempt(true)` + `failTransport(new Error('P2P disconnected; request outcome may be unknown'))` + `runAttemptForCurrentDevice()`，文案沿用现有断开路径；`clearProbe()` 挂入 `failTransport` 顶部，覆盖 close/kick/切设备全部 teardown；visibilitychange hidden 分支直接 `clearProbe()`（不淘汰通道），visible/pageshow 保持原顺序调 `resetRttAfterBackground()` + `beginForegroundProbe()` + `onForegroundResume()`；移除旧的立即 ping 块由探针取代其作用；pong 匹配先探针（`message.t === probe.pingT`）再周期 `pingSent`；fetch/WS 包装器在 probing 时走 Relay、`transportInfo` 显示 Relay；重复 visibility/pageshow 不重启不延长 3s 时限，探针期间再次隐藏取消在途探针不执行过期淘汰，重新可见开启新完整窗口；初始可见不当作锁屏恢复、不触发探针；服务端 pong 用 envelope（`data` 内层含 `t`），不用丢 `t` 的旧 `deliver` helper。
+- 红绿：新增 13 项 Node 行为测试先写后改，红阶段 `13 failed`，实施后文件 `13 passed`；全套 `271 passed`（基线 258＋13，`-W error::DeprecationWarning`），compileall、`git diff --check`、提取适配器 `node --check` 通过。独立探针 `/tmp/opencode/probe_background_stale_open.py` 的场景 A 断言在修复后按设计失效，属预期。
+- 测试说明：`s.closed === true` 不可观察——`runAttemptForCurrentDevice→connectP2P` 入口立即置 `closed=false`，改用旧通道 disposed + 传输绑定到新 negotiating channel 断言；探针 ping 同步 `send()` 入 `channel.sent`，`deliverPong` 需守卫重建后已 detach 的旧通道 `onmessage`。
+- 主 agent 收尾复核：新增 3 项边界回归，分别先复现同毫秒取消/重启探针误认旧 pong、事件循环延迟时超时 pong 抢先于定时器保留旧连接，以及初始建连等待结束后绕过探测门禁。红阶段分别为 `2 failed, 13 passed` 和 `1 failed, 15 passed`。探针 `pingT` 改为独立唯一字符串标识（Agent 原样回传 `t`），另存 `startedAt` 测延迟；完成路径校验 channel/generation 和实际截止时间；初始 fetch 等待前后均检查 probing。
+- 最终验证：完整 `.venv/bin/python -m pytest -q -p no:cacheprovider -W error::DeprecationWarning` 为 `274 passed in 7.53s`（前台健康测试共 16 项）；`git diff --check` 和实际适配器 `node --check` 通过。独立 reviewer 服务报错未完成，由主 agent 复核并补上述红绿证据。未提交、未部署、未重新打包 APK；安卓浏览器锁屏现场仍待用户验证。
+- 后续状态：上述最终验证段末尾的“未提交、未部署”为部署前时点；此后已提交、推送和部署 `dff5709`，用户报告安卓浏览器锁屏恢复明显改善。未重新打包 APK，未进行开发者真机全链路验收。
+- 下一步：用户继续浏览器验证，特别是反复锁屏、网络变化和终端恢复；结果回填本节。
+
 ### 统一设备在线判据与离线页行为（2026-09-24，未发布）
+
+后续部署状态：本项已提交为 `bc7d86c` 并推送、部署三端，服务 revision 与正式设备 API 检查通过。以下“未提交/未部署”仅描述当时开发验证阶段，不表示仍待部署；真实离线页浏览器验收尚无完整记录。
 
 - 基线 `88c0d09`，工作区此前干净；本轮改动未提交：`src/main.py`、新增 `tests/test_v2_offline_page.py`、`docs/maintenance.md`、`docs/architecture.md`。
 - 任务：统一 `/_mesh/devices` 的 `online` 与 `Gateway.is_online` 为同一判据（`ws` 存在且 `last_seen` 在 45 秒内，缺 `last_seen` 的旧状态保持在线兼容）；离线页明确当前目标设备名称（仅 `textContent`，防 XSS）、其他设备在线时不再宣称无设备、列出实时 online/offline 与在线设备的路径型切换入口 `/_mesh/device/{id}`；仅原目标恢复才 `location.reload()`，无 target 时绝不自动改投/重放；轮询失败清空旧绿灯、显示状态未知，下一次成功轮询恢复；保留 `no-store` 与 3s 轮询；`transport-manifest.p2p.enabled` 与 `p2p/offer` 改用同一新鲜度判据，但不新增陈旧连接的 close 生命周期逻辑。评审收尾两项：浏览器 WebSocket 显式设备分支从「仅看 `ws` 布尔」统一为同一新鲜度判据（stale 以 4403 拒绝且不动在途 Agent 连接）；每次轮询加 10 秒 deadline（AbortController + 定时器清理），永不 settle 的请求被终止、状态未知、守卫释放、迟到响应不得覆盖未知状态。
@@ -125,6 +156,8 @@ UI 或传输行为变更应按受影响范围检查：
 
 ### 浏览器适配器重连事件监听（2026-09-24，未发布）
 
+后续部署状态：本项已提交为 `88c0d09` 并推送、部署三端；用户现场网络切换效果与后续前台健康探针验证分别记录，不以 Node 测试替代真实浏览器验收。
+
 - 基线 `b40be41`（0.3.1），工作区此前干净；本轮改动未提交：`src/static_adapter.py`、`docs/architecture.md`、`docs/maintenance.md`，新增 `tests/test_v2_reconnect_network.py`。
 - 任务：为浏览器适配器的 Relay 重连加入网络事件监听（`window.online` + 可选 `navigator.connection` change）、300ms 防抖 + 5s 冷却、取消任意未打开阶段（初始 ICE、重试 ICE、等待通道打开）的旧协商并立即新尝试、单一有效 attempt 与 generation 守卫、旧协商链的 close/catch/finally 不得污染新尝试、已 open P2P 不拆线、前台恢复/bfcache 恢复（>15s 陈旧）经同一受冷却控制的提示入口提前重试、后台重试不让业务 fetch 等待 1.2s（仅首轮保留）、指数退避兜底、40s 总 deadline 中断从 createOffer 到通道打开的全部阶段、事件风暴不产生并发/资源泄漏。`online` 只是 hint，不据此关闭 Relay。
 - 关键决定：hint 取消并立即重建任意尚未打开阶段的旧协商——包括首轮协商（防抖+冷却已限频，单次 hint 的重建代价有界），已打开的通道是唯一例外；旧版本写成"进入 WebRTC 阶段回到退避、首轮不打断"，经独立审查后按已批准方案修正，相关测试同步更正。统一 teardown `releaseCurrentAttempt`：先推进 generation、解绑旧通道 handler、abort controller、关闭旧 peer、清理双 timer，再立即跑新尝试，避免旧链 catch/finally 经生成期匹配污染新链（退避安排、退避值、controller 槽、`isInitialAttempt`）以及 close 同步回调重入。协商链的 then/catch/finally 均以创建的 generation 守卫，`connectP2P` 的 finally 用 `state.activeController === controller` 归属守卫清理。`createOffer`/`setLocalDescription`/`setRemoteDescription` 纳入 deadline/取消等待，过期链不再向新网络发 offer。foreground/pageshow 走同一防抖+冷却 hint 入口，重叠提示合并单飞。`runAttemptForCurrentDevice` 显式置 `isInitialAttempt=false`（它从不服务页面 bootstrap），hint 取消首轮后启动的新尝试不继承 1.2s 等待；kick 路径同样调用 `failTransport` 失效未 open 旧传输上的 pending/stream，防止通道已死但 close 未派发时悬挂（原测试断言 `isInitialAttempt===true` 仅用于归属验证，现按策略改为 false）。manifest 解析后把 `routeDeviceId` 同步为实际服务设备，避免无显式选择页面被 2s 周期检查误判为设备切换。
@@ -132,18 +165,6 @@ UI 或传输行为变更应按受影响范围检查：
 - 测试侧更正说明：原第 4 项（"提示期间初始协商保持"）与第 12 项（"提示后开等回到退避"）固化了驳回的错误意图，已改写为"初始协商可被提示失效重建"与"开等被提示立即取消重建且不等旧 30s 退避"；测试 6 因 foreground 走防抖入口需 `advance(300)`；测试 3 增加新 controller 不被旧 finally 清空的断言。
 - 未验证：全部为模拟网络事件的 Node 行为测试，未做真实浏览器/真实网络复现（用户此前要求停止真实复现）；`navigator.connection` 缺失分支仅由 harness 空对象覆盖；createOffer 停滞与 40s 总时限未在上游真实页面复核。
 - 下一步（如需继续）：用户独立审查 diff；如需真实复验，按 `docs/maintenance.md` 浏览器验收方法进行，并将结果追加到本文档。
-
-### 前后台恢复旧 P2P 前台健康探针（2026-09-25，未发布）
-
-- 基线 `258 passed`，分支 `feat/android-apk`（Android 与 docs 未提交改动保留）；本轮改动未提交：`src/static_adapter.py`、新增 `tests/test_v2_foreground_health.py`、`docs/architecture.md`、`docs/maintenance.md`。
-- 任务（用户已批准）：修复用户现场安卓 16 锁屏后 P2P 无延迟但 API 全挂——页面从后台恢复时遗留的旧 open P2P 通道可能陈旧（通道活着但 Agent 侧不再转发）。实现前台健康探针：`visibilitychange` 可见或 bfcache `pageshow` 恢复时若遗留旧 open P2P 通道，立即发送探针 ping 并在 3s 内等待匹配 pong；无 pong 则淘汰旧通道并后台重建；验证期间新 HTTP/WebSocket 请求暂时走 Relay；mutation 不重放、迟到结果不影响新连接。
-- 关键决定：探针用独立 `state.probe = { channel, generation, pingT, timer }` + `state.probing` 标志，绝不占用周期 ping 槽位（`pingSent`）；`failProbe` 先清探针、按 channel+generation 身份守卫后走 `releaseCurrentAttempt(true)` + `failTransport(new Error('P2P disconnected; request outcome may be unknown'))` + `runAttemptForCurrentDevice()`，文案沿用现有断开路径；`clearProbe()` 挂入 `failTransport` 顶部，覆盖 close/kick/切设备全部 teardown；visibilitychange hidden 分支直接 `clearProbe()`（不淘汰通道），visible/pageshow 保持原顺序调 `resetRttAfterBackground()` + `beginForegroundProbe()` + `onForegroundResume()`；移除旧的立即 ping 块由探针取代其作用；pong 匹配先探针（`message.t === probe.pingT`）再周期 `pingSent`；fetch/WS 包装器在 probing 时走 Relay、`transportInfo` 显示 Relay；重复 visibility/pageshow 不重启不延长 3s 时限，探针期间再次隐藏取消在途探针不执行过期淘汰，重新可见开启新完整窗口；初始可见不当作锁屏恢复、不触发探针；服务端 pong 用 envelope（`data` 内层含 `t`），不用丢 `t` 的旧 `deliver` helper。
-- 红绿：新增 13 项 Node 行为测试先写后改，红阶段 `13 failed`，实施后文件 `13 passed`；全套 `271 passed`（基线 258＋13，`-W error::DeprecationWarning`），compileall、`git diff --check`、提取适配器 `node --check` 通过。独立探针 `/tmp/opencode/probe_background_stale_open.py` 的场景 A 断言在修复后按设计失效，属预期。
-- 测试说明：`s.closed === true` 不可观察——`runAttemptForCurrentDevice→connectP2P` 入口立即置 `closed=false`，改用旧通道 disposed + 传输绑定到新 negotiating channel 断言；探针 ping 同步 `send()` 入 `channel.sent`，`deliverPong` 需守卫重建后已 detach 的旧通道 `onmessage`。
-- 主 agent 收尾复核：新增 3 项边界回归，分别先复现同毫秒取消/重启探针误认旧 pong、事件循环延迟时超时 pong 抢先于定时器保留旧连接，以及初始建连等待结束后绕过探测门禁。红阶段分别为 `2 failed, 13 passed` 和 `1 failed, 15 passed`。探针 `pingT` 改为独立唯一字符串标识（Agent 原样回传 `t`），另存 `startedAt` 测延迟；完成路径校验 channel/generation 和实际截止时间；初始 fetch 等待前后均检查 probing。
-- 最终验证：完整 `.venv/bin/python -m pytest -q -p no:cacheprovider -W error::DeprecationWarning` 为 `274 passed in 7.53s`（前台健康测试共 16 项）；`git diff --check` 和实际适配器 `node --check` 通过。独立 reviewer 服务报错未完成，由主 agent 复核并补上述红绿证据。未提交、未部署、未重新打包 APK；安卓浏览器锁屏现场仍待用户验证。
-- 未验证：均为 Node/ASGI 行为测试，未做真实浏览器/安卓复验（延续停止真实复现的要求）；未部署、未提交未推送。
-- 下一步：用户独立审阅 diff；如需真实浏览器验收按本文档第 4 节执行，并把结果追加到本文档。
 
 ### Relay → P2P 切换在途请求调查（2026-09-25，隔离测试完成，现场未复现）
 
