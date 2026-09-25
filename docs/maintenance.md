@@ -133,6 +133,30 @@ UI 或传输行为变更应按受影响范围检查：
 - 未验证：全部为模拟网络事件的 Node 行为测试，未做真实浏览器/真实网络复现（用户此前要求停止真实复现）；`navigator.connection` 缺失分支仅由 harness 空对象覆盖；createOffer 停滞与 40s 总时限未在上游真实页面复核。
 - 下一步（如需继续）：用户独立审查 diff；如需真实复验，按 `docs/maintenance.md` 浏览器验收方法进行，并将结果追加到本文档。
 
+### 前后台恢复旧 P2P 前台健康探针（2026-09-25，未发布）
+
+- 基线 `258 passed`，分支 `feat/android-apk`（Android 与 docs 未提交改动保留）；本轮改动未提交：`src/static_adapter.py`、新增 `tests/test_v2_foreground_health.py`、`docs/architecture.md`、`docs/maintenance.md`。
+- 任务（用户已批准）：修复用户现场安卓 16 锁屏后 P2P 无延迟但 API 全挂——页面从后台恢复时遗留的旧 open P2P 通道可能陈旧（通道活着但 Agent 侧不再转发）。实现前台健康探针：`visibilitychange` 可见或 bfcache `pageshow` 恢复时若遗留旧 open P2P 通道，立即发送探针 ping 并在 3s 内等待匹配 pong；无 pong 则淘汰旧通道并后台重建；验证期间新 HTTP/WebSocket 请求暂时走 Relay；mutation 不重放、迟到结果不影响新连接。
+- 关键决定：探针用独立 `state.probe = { channel, generation, pingT, timer }` + `state.probing` 标志，绝不占用周期 ping 槽位（`pingSent`）；`failProbe` 先清探针、按 channel+generation 身份守卫后走 `releaseCurrentAttempt(true)` + `failTransport(new Error('P2P disconnected; request outcome may be unknown'))` + `runAttemptForCurrentDevice()`，文案沿用现有断开路径；`clearProbe()` 挂入 `failTransport` 顶部，覆盖 close/kick/切设备全部 teardown；visibilitychange hidden 分支直接 `clearProbe()`（不淘汰通道），visible/pageshow 保持原顺序调 `resetRttAfterBackground()` + `beginForegroundProbe()` + `onForegroundResume()`；移除旧的立即 ping 块由探针取代其作用；pong 匹配先探针（`message.t === probe.pingT`）再周期 `pingSent`；fetch/WS 包装器在 probing 时走 Relay、`transportInfo` 显示 Relay；重复 visibility/pageshow 不重启不延长 3s 时限，探针期间再次隐藏取消在途探针不执行过期淘汰，重新可见开启新完整窗口；初始可见不当作锁屏恢复、不触发探针；服务端 pong 用 envelope（`data` 内层含 `t`），不用丢 `t` 的旧 `deliver` helper。
+- 红绿：新增 13 项 Node 行为测试先写后改，红阶段 `13 failed`，实施后文件 `13 passed`；全套 `271 passed`（基线 258＋13，`-W error::DeprecationWarning`），compileall、`git diff --check`、提取适配器 `node --check` 通过。独立探针 `/tmp/opencode/probe_background_stale_open.py` 的场景 A 断言在修复后按设计失效，属预期。
+- 测试说明：`s.closed === true` 不可观察——`runAttemptForCurrentDevice→connectP2P` 入口立即置 `closed=false`，改用旧通道 disposed + 传输绑定到新 negotiating channel 断言；探针 ping 同步 `send()` 入 `channel.sent`，`deliverPong` 需守卫重建后已 detach 的旧通道 `onmessage`。
+- 主 agent 收尾复核：新增 3 项边界回归，分别先复现同毫秒取消/重启探针误认旧 pong、事件循环延迟时超时 pong 抢先于定时器保留旧连接，以及初始建连等待结束后绕过探测门禁。红阶段分别为 `2 failed, 13 passed` 和 `1 failed, 15 passed`。探针 `pingT` 改为独立唯一字符串标识（Agent 原样回传 `t`），另存 `startedAt` 测延迟；完成路径校验 channel/generation 和实际截止时间；初始 fetch 等待前后均检查 probing。
+- 最终验证：完整 `.venv/bin/python -m pytest -q -p no:cacheprovider -W error::DeprecationWarning` 为 `274 passed in 7.53s`（前台健康测试共 16 项）；`git diff --check` 和实际适配器 `node --check` 通过。独立 reviewer 服务报错未完成，由主 agent 复核并补上述红绿证据。未提交、未部署、未重新打包 APK；安卓浏览器锁屏现场仍待用户验证。
+- 未验证：均为 Node/ASGI 行为测试，未做真实浏览器/安卓复验（延续停止真实复现的要求）；未部署、未提交未推送。
+- 下一步：用户独立审阅 diff；如需真实浏览器验收按本文档第 4 节执行，并把结果追加到本文档。
+
+### Relay → P2P 切换在途请求调查（2026-09-25，隔离测试完成，现场未复现）
+
+- 用户在浏览器和 APK 中均遇到子任务入口无响应，刷新可恢复；会话内标签切换曾报 `ClientError: Transport`，原因分别为 `TypeError: Failed to fetch` 和 `AbortError: Aborted`。用户认为常发生于 Relay → P2P 切换，不限定设备。尚未复现因果链。
+- 已核对交付 APK 0.1.0/0.1.1 的传输脚本与当前源码；线上入口的内联适配器与 APK 0.1.1 相同（仅忽略首尾空白）。错误栈中的 `mesh-transport.js:968:232` 对应原生 fetch 旁路分支，但缺少现场请求 URL，不能认定命中了其中哪一个条件。
+- APK 固定前端 2.0.15，受查设备入口的上游为 2.0.6。两版子会话导航和请求队列实现一致；2.0.15 另有工具运行时自动刷新消息的行为，不将版本差异本身当作根因。正常 Server 选择和会话导航走 SPA 状态/路由，不是新窗口或主帧重新加载。
+- 共享 P2P 取消处理会把信号原因改为固定 `AbortError`，超时原因可能因此丢失；这是已确认的语义差异，不等于已定位无响应原因。上游队列的响应头超时不覆盖排队和响应体读取；响应头释放队列槽位也不等于释放整个会话同步去重键，不宣称请求总时长有 60/120 秒上界。
+- 当前授权：在隔离 Node harness 中执行真实适配器，覆盖 Relay 请求尚未结束时 P2P 成功建立、响应体仍在读取、旧请求失败/取消及后续新请求的通道归属；检查未知结果 mutation 不重放。先记录测试证据，尚未授权生产断网、重启、清理存储或部署。
+- 若需要运行时诊断，只记录相对时间、临时关联编号、方法/API 路径类别、通道及协商代次、结果/取消原因名称；不记录凭据、URL 查询参数、会话标识、请求体或响应内容。尚未加入运行时诊断代码。
+- 隔离结果：新增 `tests/test_v2_relay_p2p_switch.py`，运行真实适配器配合模拟 fetch/WebRTC 和假时钟。7 项覆盖响应头尚未返回的设备作用域 GET/POST 跨通道建立、响应体/SSE 在途、旧 Relay 取消/失败、新请求通道归属、初始 1.2 秒等待和建连失败回退，以及 P2P 断连后的已发 mutation 失败且不重放。补测时修正了测试自身的冷却时序，并让模拟先收到协商 answer 再打开通道；重连后的新请求也验证至响应体结束和 pending/streams 清空。
+- 主 agent 独立验证：新文件 `7 passed`；`.venv/bin/python -m pytest -q -p no:cacheprovider -W error::DeprecationWarning` 为 `258 passed in 8.14s`；`git diff --check` 通过。未修改产品适配器、Android 或部署；保留既有未提交 Android 工作。
+- 结论边界：这些受控时序中未发现“P2P 打开直接打断旧 Relay 请求”，不是用户故障已修复，也未覆盖真实网络/浏览器事件、上游队列与同步去重、原生 WebView。下一步需把现场请求进入适配器、响应头、正文结束、取消及通道变化关联起来，定位卡在请求排队、传输还是应用同步状态；不凭模拟通过新增猜测性修复。
+
 ### V2 预加载资源作用域修复（2026-09-23，未发布）
 
 - 基线提交 `9a32167`。真实上游 2.0.14 的预加载器将依赖路径拼为 `/_assets/...`；同一 CSS 在 Gateway 根路径返回 404，在明确设备路径返回 200，确认请求丢失来源设备。

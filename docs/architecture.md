@@ -284,6 +284,11 @@ WebSocket 在 `ws_open` 发出前被关闭时，本地确定终止并清理；�
 - 指数退避兜底（1s 起、上限 30s）；任一尝试成功即重置为 1s。协商链用 generation 守卫：被取消或过期的协商既不安排退避，也不重置退避值、不清理新尝试的 controller、不翻转 `isInitialAttempt`。
 - 只有页面 bootstrap 的首轮协商允许业务 fetch 借用至多 1.2s 等待；hint 重建、退避重试或切设备启动的新尝试（即使取代了首轮协商）一律立即走 Relay，不给重试增加延迟。`isInitialAttempt` 仅由 `runAttemptForCurrentDevice` 显式置为 false 或受归属守卫的首轮 finally 清理。
 - 重建旧传输时同时失效仍绑定在旧（未 open）传输上的请求/流：通道可能在 close 事件派发前就已死亡，kick 路径同样调用 `failTransport`，避免 pending/stream 悬挂。
+- 从后台恢复（`visibilitychange` 变为可见或 bfcache `pageshow`）时，若遗留**旧 open P2P 通道**，立即用探针 ping 验证并在 3s 内等待匹配 pong；探针绑定发起时的通道与 generation、使用独立时间槽（周期 ping 的 `pingSent` 不会覆盖它），验证期间新 HTTP/WebSocket 请求暂时走 Relay：
+  - 3s 内匹配 pong：通道健康，恢复 P2P 路由且不拆线；在线/`navigator.connection` 变化等 hint 依旧永不拆开已 open 通道。
+  - 3s 无 pong：旧通道按断开处理（失败旧 pending/stream/ws，已发 mutation 结果未知不重放），随后后台重建 P2P。
+  - 迟到 pong 或迟到探针超时不影响新连接；重复 visibility/pageshow 既不重启也不延长 3s 时限；探针期间再次隐藏会取消在途探针而不执行过期淘汰，重新可见开启新的完整窗口。
+  - 初始可见页面不当作锁屏恢复、不触发探针；无 open 通道的恢复保持原有 hint/退避路径。
 
 ## 7. 消息分片与可靠性边界
 
@@ -347,6 +352,7 @@ Agent  --agent_token--> Gateway 控制 WebSocket
 | 流队列溢出 | 发送显式流错误，避免静默丢事件 |
 | 请求被取消 | 双向传播 `cancel`，释放 future、队列和装配器 |
 | 设备切换 | 重建当前 P2P 连接；每个请求仍按自身明确 Server 路由，其他 Server 可走 Relay |
+| 后台冻结后遗留旧 open P2P 通道 | 前台恢复时探针 ping，3s 无匹配 pong 则淘汰旧通道并后台重建；验证期新 HTTP/WS 请求走 Relay，mutation 不重放 |
 
 可靠性回归测试位于 `tests/test_mesh_reliability.py`，覆盖分片顺序、大小限制、重复结束、P2P 状态清理和真实 Agent 消息处理路径。`tests/test_v2_transport.py` 使用实际 Node URL/Request/Abort 行为和 Agent HTTP 请求捕获，覆盖设备作用域、上传体、取消、逐跳头及原生 Server 名称保留。
 
@@ -428,6 +434,7 @@ P2P 和分片基础设施：
 - 浏览器侧分片信封发送和接收。
 - fetch 响应流桥接、取消和传输状态栏。
 - 网络事件提示驱动的重连（防抖/冷却）、generation 守卫和 40s 总时限。
+- 前后台/bfcache 恢复时的前台健康探针：旧 open 通道 3s 探针验证、无 pong 淘汰重建、验证期 Relay 兜底。
 
 ### 10.2 配置与部署文件
 
@@ -459,6 +466,7 @@ P2P 和分片基础设施：
 - `tests/test_v2_transport.py`：V2 请求透明性和浏览器适配行为测试。
 - `tests/test_v2_reconnect_network.py`：在 Node 中运行真实适配器、用可控假时钟模拟网络事件，覆盖重连提示、防抖冷却、任意未打开阶段的取消重建（初始 ICE、重试 ICE、等待打开）、旧协商链的污染防护、hint 启动的重试不继承首轮 fetch 等待、kick 失效静默死亡通道的 pending、40s 总时限（含停滞的 createOffer）和前后台/bfcache 恢复行为。
 - `tests/test_v2_offline_page.py`：在 Node 中运行真实离线页脚本（脚本化 fetch + DOM shim + 假时钟），并直接驱动 ASGI websocket 通道验证浏览器切入点，覆盖统一在线判据（列表/路由/P2P/ws gate，隔离 `state_file`）、目标设备名称安全显示、在线设备切换入口、仅目标恢复时 reload、无目标不自动改投、轮询失败的状态未知与恢复、永不返回轮询的 10 秒 abort 与迟到响应丢弃。
+- `tests/test_v2_foreground_health.py`：在 Node 中运行真实适配器、用可控假时钟驱动 visibilitychange/pageshow 恢复，覆盖旧 open P2P 通道 3s 探针验活、探针/周期 pong 匹配顺序、迟到 pong 与迟到探针超时不影响新连接、验证期 fetch/WS 走 Relay、周期 ping 不覆盖探针槽位、重复恢复不延长时限、探针期间再次隐藏不误淘汰、初始可见不触发探针与 mutation 不重放。
 
 ## 11. 启动和请求示例
 

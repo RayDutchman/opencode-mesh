@@ -55,8 +55,11 @@ TRANSPORT_ADAPTER = r"""
   const FOREGROUND_RETRY_MS = 15000;
   // Sanity cap: a real round-trip is far below this; anything larger is a clock-jump artifact (lock screen / background timer freeze) and must be discarded.
   const RTT_MAX_MS = 10000;
+  // A foreground resume verifies the old open P2P channel with a probe ping and
+  // only keeps the channel when a pong matches inside this window.
+  const PROBE_TIMEOUT_MS = 3000;
 
-  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), incoming: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, networkTimer: null, lastNetworkAttempt: null, lastAttemptTime: null, activeController: null, isInitialAttempt: false, devices: [], defaultDevice: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null, p2pSendTail: Promise.resolve() };
+  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), incoming: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, networkTimer: null, lastNetworkAttempt: null, lastAttemptTime: null, activeController: null, isInitialAttempt: false, devices: [], defaultDevice: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null, p2pSendTail: Promise.resolve(), probing: false, probe: null };
 
   const BAR_CSS = `
   #ocm-mesh-bar{display:flex;align-items:center;gap:8px;height:36px;padding:0 10px;font-size:13px;line-height:20px;flex:0 0 auto;border-bottom:1px solid var(--v2-border-border-base);background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-muted);-webkit-user-select:none;user-select:none}
@@ -107,6 +110,11 @@ TRANSPORT_ADAPTER = r"""
   }
 
   function transportInfo() {
+    // While a foreground probe is verifying the old channel, new requests are
+    // routed over Relay; the bar shows the effective transport of new requests.
+    if (state.probing) {
+      return { kind: 'relay', label: state.relayRtt != null ? 'Relay ' + state.relayRtt + 'ms' : 'Relay' };
+    }
     if (state.channel && state.channel.readyState === 'open') {
       return { kind: 'p2p', label: state.rtt != null ? 'P2P ' + state.rtt + 'ms' : 'P2P' };
     }
@@ -323,6 +331,7 @@ TRANSPORT_ADAPTER = r"""
   }
 
   function failTransport(error) {
+    clearProbe();
     state.closed = true;
     if (state.pingTimer) { clearInterval(state.pingTimer); state.pingTimer = null; }
     state.rtt = null; state.pingSent = null;
@@ -345,8 +354,83 @@ TRANSPORT_ADAPTER = r"""
     state.sockets.clear();
   }
 
+  // The foreground health probe verifies that the old open P2P channel is still
+  // alive after a background round (lock screen / frozen tab). It is bound to
+  // the exact channel and generation it started on, owns its own ping timestamp
+  // (never `state.pingSent`, so the periodic ping cannot overwrite it) and has a
+  // single 3s deadline: repeated resume events neither restart nor extend it.
+  function beginForegroundProbe() {
+    // Only an open channel left over from the background can be verified; a
+    // visible bootstrap or a relay-only resume never probes (not a lock screen).
+    if (!state.channel || state.channel.readyState !== 'open') return;
+    if (state.probe) return;
+    const channel = state.channel;
+    // The Agent echoes t verbatim. A unique token cannot collide with periodic
+    // timestamps or a cancelled probe restarted in the same millisecond.
+    const probe = { channel, generation: state.generation, pingT: 'probe:' + makeId(), startedAt: Date.now(), timer: null };
+    state.probe = probe;
+    state.probing = true;
+    renderBar();
+    probe.timer = setTimeout(() => failProbe(probe), PROBE_TIMEOUT_MS);
+    send({ type: 'ping', t: probe.pingT }, channel).catch(() => {
+      // A send failure means the channel is already dead; fail immediately.
+      if (state.probe === probe) failProbe(probe);
+    });
+  }
+
+  // A pong carrying the probe timestamp arrived: the channel is healthy, keep it
+  // and restore P2P routing without any teardown.
+  function completeProbe(probe) {
+    if (!state.probe || state.probe !== probe) return; // late pong from a superseded probe
+    if (probe.channel !== state.channel || probe.generation !== state.generation) return;
+    if (Date.now() - probe.startedAt >= PROBE_TIMEOUT_MS) { failProbe(probe); return; }
+    clearTimeout(probe.timer);
+    state.probe = null;
+    state.probing = false;
+    // Only the current channel may keep the freshly measured latency.
+    if (probe.channel === state.channel && probe.channel.readyState === 'open') {
+      const rtt = Date.now() - probe.startedAt;
+      if (rtt >= 0 && rtt <= RTT_MAX_MS) state.rtt = rtt;
+    }
+    renderBar();
+  }
+
+  // The probe deadline lapsed (or its ping could not be sent): the old channel
+  // is stale. Fail everything still bound to it with the documented
+  // unknown-outcome error (already-sent mutations are never replayed) and
+  // rebuild P2P in the background.
+  function failProbe(probe) {
+    if (!state.probe || state.probe !== probe) return;
+    clearTimeout(probe.timer);
+    state.probe = null;
+    state.probing = false;
+    // The probe only ever applies to the channel and generation it was started
+    // for; a superseded or already-replaced channel must not be failed by a late
+    // timeout, and a teardown here never affects a newer connection.
+    if (probe.channel !== state.channel || probe.generation !== state.generation) return;
+    releaseCurrentAttempt(true);
+    failTransport(new Error('P2P disconnected; request outcome may be unknown'));
+    state.closed = true;
+    runAttemptForCurrentDevice();
+  }
+
+  // Drop any in-flight probe (used when a teardown invalidates its channel).
+  function clearProbe() {
+    if (!state.probe) return;
+    clearTimeout(state.probe.timer);
+    state.probe = null;
+    state.probing = false;
+  }
+
   function settleMessage(message) {
     if (message.type === 'pong') {
+      // A foreground probe owns its own timestamp; its pong completes the
+      // probe even when a periodic ping with another timestamp is in flight.
+      const probe = state.probe;
+      if (probe && message.t === probe.pingT) {
+        completeProbe(probe);
+        return;
+      }
       if (state.pingSent != null && message.t === state.pingSent) {
         const rtt = Date.now() - state.pingSent;
         state.pingSent = null;
@@ -970,12 +1054,14 @@ TRANSPORT_ADAPTER = r"""
   window.fetch = async (input, init) => {
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);
     if (url.origin !== location.origin || (url.pathname.startsWith('/_mesh/') && !url.pathname.startsWith('/_mesh/device/')) || (virtualDeviceId(url.pathname) && virtualDeviceId(url.pathname) !== state.manifest?.device_id)) return nativeFetch(input, init);
-    if (state.channel && state.channel.readyState === 'open') return p2pFetch(input, init);
+    // While a foreground probe verifies the old open channel, new requests go
+    // to Relay; P2P is only restored after a matching pong.
+    if (!state.probing && state.channel && state.channel.readyState === 'open') return p2pFetch(input, init);
     // Only the initial P2P attempt may borrow a short wait; retry attempts never
     // add latency while the transport runs on Relay.
-    if (state.pc && state.isInitialAttempt && !state.closed && !state.reconnectTimer) {
+    if (!state.probing && state.pc && state.isInitialAttempt && !state.closed && !state.reconnectTimer) {
       await Promise.race([state.ready, new Promise(resolve => setTimeout(resolve, 1200))]);
-      if (state.channel && state.channel.readyState === 'open') return p2pFetch(input, init);
+      if (!state.probing && state.channel && state.channel.readyState === 'open') return p2pFetch(input, init);
     }
     return nativeFetch(...scopeNativeRequest(input, init));
   };
@@ -983,7 +1069,7 @@ TRANSPORT_ADAPTER = r"""
     constructor(input, protocols) {
       const [scopedInput] = scopeNativeRequest(input);
       const url = new URL(scopedInput, location.href);
-      if (url.host !== location.host || (virtualDeviceId(url.pathname) && virtualDeviceId(url.pathname) !== state.manifest?.device_id) || !state.channel || state.channel.readyState !== 'open') {
+      if (url.host !== location.host || (virtualDeviceId(url.pathname) && virtualDeviceId(url.pathname) !== state.manifest?.device_id) || state.probing || !state.channel || state.channel.readyState !== 'open') {
         return new nativeWebSocket(scopedInput, protocols);
       }
       super(scopedInput, protocols);
@@ -992,10 +1078,9 @@ TRANSPORT_ADAPTER = r"""
   function resetRttAfterBackground() {
     state.rtt = null; state.relayRtt = null; state.pingSent = null;
     renderBar();
-    if (state.channel && state.channel.readyState === 'open') {
-      state.pingSent = Date.now();
-      send({ type: 'ping', t: state.pingSent }).catch(() => { state.pingSent = null; });
-    }
+    // The foreground probe (see beginForegroundProbe) replaces the former
+    // immediate ping: it both re-measures latency and deadlines the stale-open
+    // channel, with its own timestamp slot.
     measureRelayRtt();
   }
   // A network hint only nudges the transport; it never tears down a channel
@@ -1005,13 +1090,21 @@ TRANSPORT_ADAPTER = r"""
     navigator.connection.addEventListener('change', onNetworkHint);
   }
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) return;
+    if (document.hidden) {
+      // Hiding again cancels an in-flight probe without executing its expiry
+      // (timers may be frozen while hidden); the next visible transition starts
+      // a fresh full window.
+      clearProbe();
+      return;
+    }
     resetRttAfterBackground();
+    beginForegroundProbe();
     onForegroundResume();
   });
   window.addEventListener('pageshow', event => {
     if (!event.persisted) return;
     resetRttAfterBackground();
+    beginForegroundProbe();
     onForegroundResume();
   });
 
