@@ -25,7 +25,9 @@
   - 红测包含慢消费者积压、并发协商超过限制、失败/取消释放、Connection 扩展头及重复任务取消所有权。
 - [x] 主审：协调两端预算/协议兼容，检查正常大请求、SSE、PTY、锁屏恢复及取消行为；独立完整回归和代码审查。
 - [x] 更新架构、协议、CHANGELOG 与维护交接，区分已修复、受限去重窗口及待真机验收项。
-- [ ] 仅提交本轮修复及记录，推送并部署 VPS、本机两个 Agent、ehang-box；核对实际 revision、服务状态和逐设备 API，保留 Android 工作。
+- [x] 仅提交本轮修复及记录，推送并部署 VPS、本机两个 Agent、ehang-box；核对实际 revision、服务状态和逐设备 API，保留 Android 工作。
+
+部署完成：运行提交 `ea60ebe370fd8010201a6ad660ab063098c74c47` 已推送至 `origin/main`；VPS Gateway、ehang-box Agent、本机默认及 Windows Agent 均为 active，安装 revision 匹配。设备列表四台在线，各自 `/api/info` 均返回 200 JSON。PVE 未部署，APK 未重打包，Android 未提交工作保持原样。产品版本仍为 0.3.2，已有发布标签未移动。
 
 ## 验证命令
 
