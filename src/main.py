@@ -197,6 +197,7 @@ var target = __TARGET__;
 var msg = document.getElementById('msg');
 var list = document.getElementById('list');
 function deviceLink(id){ return '/?mesh_device=' + encodeURIComponent(id); }
+function canAttemptDevice(d){ return d.online === true && (d.upstream_health === undefined || d.upstream_health === 'healthy' || d.upstream_health === 'unknown'); }
 function deviceState(d){
   if (d.online !== true) return d.online === false ? {dot:'failed', text:'Agent offline'} : {dot:'unknown', text:'Unknown'};
   if (d.upstream_health === 'healthy' && d.available === true) return {dot:'healthy', text:'Healthy'};
@@ -212,7 +213,7 @@ function render(devices){
     var view = deviceState(d);
     var dot = document.createElement('span'); dot.className = 'dot ' + view.dot;
     var state = document.createElement('span'); state.className = 'state'; state.textContent = view.text;
-    if (d.available === true){
+    if (canAttemptDevice(d)){
       // A root-page handoff lets the adapter establish the native Server
       // selection before the V2 entry module starts.
       var link = document.createElement('a');
@@ -240,7 +241,8 @@ function setUnknown(){
 }
 function update(devices){
   render(devices);
-  var anyAvailable = devices.some(function(d){ return d.available === true; });
+  var anyAvailable = devices.some(canAttemptDevice);
+  var anyOtherAvailable = devices.some(function(d){ return d.device_id !== target && canAttemptDevice(d); });
   if (target){
     var targetDevice = null;
     devices.forEach(function(d){ if (d.device_id === target) targetDevice = d; });
@@ -249,7 +251,7 @@ function update(devices){
     if (targetDevice && targetDevice.available === true){ location.reload(); return; }
     var name = targetDevice ? (targetDevice.name || target) : target;
     var targetState = targetDevice ? deviceState(targetDevice).text : 'Unknown';
-    msg.textContent = anyAvailable
+    msg.textContent = anyOtherAvailable
       ? 'Device "' + name + '" is ' + targetState + '; another device is available. Choose it below or wait for this device — the page refreshes automatically.'
       : 'Device "' + name + '" is ' + targetState + '. This page refreshes automatically.';
     return;

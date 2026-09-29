@@ -181,6 +181,14 @@ TRANSPORT_ADAPTER = r"""
     return panel;
   }
 
+  // A control-online legacy Agent has no upstream observation. It may be tried,
+  // but is never presented as healthy until the Gateway reports that result.
+  function deviceHealth(item) { return item?.upstream_health === undefined ? 'unknown' : item.upstream_health; }
+  function canAttemptDevice(item) {
+    const health = deviceHealth(item);
+    return item?.online === true && (health === 'healthy' || health === 'unknown');
+  }
+
   function deviceMenuItems() {
     return [...(document.getElementById('ocm-device-menu')?.querySelectorAll('.ocm-device-menu-item') || [])].filter(item => !item.disabled);
   }
@@ -222,9 +230,10 @@ TRANSPORT_ADAPTER = r"""
         row.setAttribute('role', 'menuitem');
         row.dataset.ocmDeviceId = item.device_id;
         const online = item.online === true;
-        const health = item.upstream_health || 'unknown';
+        const health = deviceHealth(item);
+        const canAttempt = canAttemptDevice(item);
         const available = item.available === true;
-        row.disabled = !available;
+        row.disabled = !canAttempt;
         if (item.device_id === current) row.setAttribute('aria-current', 'true');
         const dot = document.createElement('span');
         dot.className = 'ocm-device-menu-dot';
@@ -238,9 +247,10 @@ TRANSPORT_ADAPTER = r"""
           : health === 'healthy' ? 'Healthy'
             : health === 'auth_failed' ? 'OpenCode authentication failed'
               : health === 'unreachable' ? 'OpenCode unavailable'
-                : health === 'unhealthy' ? 'OpenCode unhealthy' : 'OpenCode status unknown';
+                : health === 'unhealthy' ? 'OpenCode unhealthy'
+                  : health === 'unknown' ? 'OpenCode status unknown' : 'OpenCode health invalid';
         row.append(dot, name, status);
-        if (available) row.addEventListener('click', () => {
+        if (canAttempt) row.addEventListener('click', () => {
           if (row.disabled) return;
           closeDeviceMenu();
           location.assign('/?mesh_device=' + encodeURIComponent(item.device_id));
@@ -372,7 +382,7 @@ TRANSPORT_ADAPTER = r"""
     const id = routeId || (state.manifest && state.manifest.device_id) || state.defaultDevice;
     const device = state.devices.find(item => item.device_id === id);
     return { name: (device && device.name) || id || 'no device', online: device ? !!device.online : undefined,
-      health: device?.upstream_health || 'unknown', available: device?.available === true };
+      health: device?.upstream_health === undefined ? 'unknown' : device.upstream_health, available: device?.available === true };
   }
 
   function deviceHealthInfo(info) {
@@ -381,7 +391,8 @@ TRANSPORT_ADAPTER = r"""
     if (info.health === 'auth_failed') return { state: 'unavailable', label: 'OpenCode authentication failed' };
     if (info.health === 'unreachable') return { state: 'unavailable', label: 'OpenCode unavailable' };
     if (info.health === 'unhealthy') return { state: 'unavailable', label: 'OpenCode unhealthy' };
-    return { state: 'unknown', label: 'OpenCode status unknown' };
+    if (info.health === 'unknown') return { state: 'unknown', label: 'OpenCode status unknown' };
+    return { state: 'unavailable', label: 'OpenCode health invalid' };
   }
 
   function transportInfo() {
@@ -521,7 +532,8 @@ TRANSPORT_ADAPTER = r"""
        state.defaultDevice = payload.default_device || null;
        renderBar();
       const unsupported = new Set();
-       const devices = (await Promise.all(state.devices.filter(device => device.available === true).map(async device => {
+      const canAttempt = device => device.online === true && (device.upstream_health === undefined || device.upstream_health === 'healthy' || device.upstream_health === 'unknown');
+      const devices = (await Promise.all(state.devices.filter(canAttempt).map(async device => {
         try {
           const info = await nativeFetch(serverTabUrl(device.device_id) + '/api/info', {
             credentials: 'same-origin', signal: AbortSignal.timeout(5000)
@@ -537,12 +549,18 @@ TRANSPORT_ADAPTER = r"""
       // An explicit click is not a preference: keeping the query and retrying is
       // safer than silently opening another device when discovery, reachability,
       // or the V2 probe has not confirmed the requested target.
-       if (handoffDevice && (!requested || requested.available !== true || !devices.some(device => device.device_id === handoffDevice))) {
+       if (handoffDevice && (!requested || !canAttempt(requested) || !devices.some(device => device.device_id === handoffDevice))) {
         throw new Error('Requested device handoff is unavailable or not an OpenCode V2 server');
       }
-       const primary = requested || state.devices.find(device => device.available === true && device.device_id === payload.configured_default_device)
+       const primary = requested || state.devices.find(device => canAttempt(device) && device.device_id === payload.configured_default_device)
         || devices.find(device => device.device_id === payload.default_device) || devices[0];
       if (!primary) throw new Error('No OpenCode V2 device available');
+      // Preserve the configured target during a transient failure, but do not
+      // initialize an unknown-health target without a successful V2 probe.
+      if ((primary.upstream_health === undefined || primary.upstream_health === 'unknown')
+          && !devices.some(device => device.device_id === primary.device_id)) {
+        throw new Error('Default device has not been verified as an OpenCode V2 server');
+      }
       if (unsupported.has(primary.device_id)) {
         throw new Error('Default device is not an OpenCode V2 server');
       }

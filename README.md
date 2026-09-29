@@ -168,7 +168,7 @@ sudo journalctl -u opencode-mesh-gateway.service -f
 
 `config/agents.json` 是共享配置：若只修改一个实例（例如 `agents.default.device_name`），只重启该实例，不必重启同机其他 Agent。`device_name` 仅是注册显示名；重启会重新注册其显示信息，但不会改写程序管理的 `data/agent-state*.json` 身份、`device_id` 或 `agent_token`。只有修改 systemd unit 文件时才先执行对应 scope 的 `daemon-reload`，再重启服务：用户级用 `systemctl --user daemon-reload`，系统级用 `sudo systemctl daemon-reload`。
 
-上游健康状态由 Agent 报告，需要升级 Agent 才能使用；旧 Agent 显示健康状态未知。浏览器验收分两步：保留 Agent、停止并恢复 OpenCode，观察上游不可用与恢复；再停止并恢复对应 Mesh Agent，观察 Agent 离线与恢复。每步恢复正常后再进行下一步，设备身份无需重新创建。
+上游健康状态由 Agent 报告，需要升级 Agent 才能使用；旧 Mesh 未报告健康时显示灰色未知，但仍可手动尝试，浏览器会实际验证目标 `/api/info` 是否为 OpenCode V2 后才进入。健康设备正常连接；Agent 离线或明确报告 OpenCode 不可达、认证失败、异常时不可选。浏览器验收分两步：保留 Agent、停止并恢复 OpenCode，观察上游不可用与恢复；再停止并恢复对应 Mesh Agent，观察 Agent 离线与恢复。每步恢复正常后再进行下一步，设备身份无需重新创建。
 
 ## 配置参考
 

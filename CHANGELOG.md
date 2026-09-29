@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- 在线但上游健康未知的设备仍可手动连接；旧 Mesh Agent 缺少健康字段或报告过期时保持灰色，通过实际 OpenCode V2 `/api/info` 验证后进入，不再将未知状态误判为不可连接。
 - Agent 独立探测本机 OpenCode V2 `/api/info`，连续失败与恢复上报分层健康状态；设备菜单和离线页区分 Agent 离线、OpenCode 不可用及状态未知，不再把控制连接在线直接当作业务可用。
 - P2P offer 的 HTTP 断连、取消及未成功答复会撤销对应 Agent 协商；未建立 DataChannel 的 peer 限期清理，重复 offer 不替换原连接。
 - 控制连接的活动请求 ID 不重复执行；完成或取消的请求 ID 在 256 条、300 秒有限窗口内拒绝重用，不缓存或重放业务响应正文。

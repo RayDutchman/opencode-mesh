@@ -15,7 +15,7 @@ Agent 在独立循环中探测本机 OpenCode 的 `/api/info`，完成后间隔 
 
 `upstream_health` 为运行时状态：`unknown` 表示没有可接受的近期报告，`healthy` 表示探测到兼容的 OpenCode V2，`unreachable` 表示连接或超时失败，`auth_failed` 表示本机上游认证被拒绝，`unhealthy` 表示其余非健康响应。Gateway 只接受 0～30 秒的数值年龄（不含布尔值），以自己的单调时钟换算检查时间；检查时间超过 30 秒或报告格式无效时降为 `unknown`。该状态不持久化，Agent 重连后从 `unknown` 重新开始。
 
-设备控制连接的 `online` 与上游健康分离：`available` 仅在 `online` 且 `upstream_health=healthy` 时为真。健康探测失败不会关闭 Agent 控制连接，不对 HTTP、SSE、WebSocket 或 P2P 路由进行 fail-fast，也不会触发请求重放。
+设备控制连接的 `online` 与上游健康分离：`available` 仍仅在 `online` 且 `upstream_health=healthy` 时为真。`online + unknown`（包括旧 Mesh 未报告健康字段或报告过期）不等于上游失败：浏览器可以将其作为灰色候选项手动尝试，并由启动适配器实际请求 `/api/info` 验证兼容的 V2；这不是 V1 兼容承诺。`unreachable`、`auth_failed`、`unhealthy` 和 Agent 离线均不可选。健康探测失败不会关闭 Agent 控制连接，不对 HTTP、SSE、WebSocket 或 P2P 路由进行 fail-fast，也不会触发请求重放。
 
 ## 控制消息
 

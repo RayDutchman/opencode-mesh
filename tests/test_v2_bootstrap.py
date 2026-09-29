@@ -216,6 +216,47 @@ def test_root_handoff_selects_only_a_discovered_online_v2_device_and_consumes_it
     assert result.returncode == 0, result.stderr
 
 
+def test_root_handoff_allows_unknown_legacy_agent_only_after_v2_probe():
+    function = 'async function syncNativeServers' + TRANSPORT_ADAPTER.split('async function syncNativeServers', 1)[1].split('  function rejectEntry', 1)[0]
+    script = r'''
+    const assert=require('node:assert/strict');const origin='https://mesh.test',target=origin+'/_mesh/device/device-b';
+    const store=new Map([['opencode.global.dat:server',JSON.stringify({list:[]})],['opencode.global.dat:layout',JSON.stringify({home:{selection:{server:origin+'/_mesh/device/device-a'}}})]]);
+    const localStorage={getItem:k=>store.get(k),setItem:(k,v)=>store.set(k,v)};
+    const location={origin,pathname:'/',search:'?mesh_device=device-b',hash:'',href:origin+'/?mesh_device=device-b'};
+    const history={state:null,replaceState(state,title,url){this.replaced=url;}};global.window={__ocmBootstrap:{}};
+    const state={routeDeviceId:'device-a',transportStarted:false};const readJson=(k,f)=>JSON.parse(store.get(k)||'null')??f;const serverTabUrl=id=>origin+'/_mesh/device/'+id;const encodeServer=s=>Buffer.from(s).toString('base64url');const renderBar=()=>{};const reconnectForDevice=()=>{throw Error('handoff starts after bootstrap')};
+    const nativeFetch=async url=>url==='/_mesh/devices'?{ok:true,json:async()=>({configured_default_device:'device-a',default_device:'device-a',devices:[{device_id:'device-a',online:true,upstream_health:'healthy',available:true},{device_id:'device-b',online:true}]})}:{ok:true,headers:new Headers({'content-type':'application/json'}),json:async()=>({version:'2.0.18'})};
+    ''' + function + r'''
+    syncNativeServers().then(()=>{
+      assert.equal(window.__ocmBootstrap.serverUrl,target);assert.equal(state.defaultDevice,'device-b');assert.equal(history.replaced,'/');
+    }).catch(error=>{console.error(error);process.exitCode=1});
+    '''
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize('handoff', [True, False])
+def test_unknown_handoff_probe_failure_keeps_the_explicit_target_retryable(handoff):
+    function = 'async function syncNativeServers' + TRANSPORT_ADAPTER.split('async function syncNativeServers', 1)[1].split('  function rejectEntry', 1)[0]
+    script = r'''
+    const assert=require('node:assert/strict');const origin='https://mesh.test';
+    const store=new Map([['opencode.global.dat:server',JSON.stringify({list:[]})],['opencode.global.dat:layout',JSON.stringify({home:{selection:{server:origin+'/_mesh/device/device-a'}}})]]);
+    const localStorage={getItem:k=>store.get(k),setItem:(k,v)=>store.set(k,v)};const location={origin,pathname:'/',search:'?mesh_device=device-b',hash:'',href:origin+'/?mesh_device=device-b'};
+    const history={replaceState(){throw Error('failed unknown handoff must retain its query')},state:null};global.window={__ocmBootstrap:{}};
+    const state={routeDeviceId:'device-a'};const readJson=(k,f)=>JSON.parse(store.get(k)||'null')??f;const serverTabUrl=id=>origin+'/_mesh/device/'+id;const encodeServer=s=>Buffer.from(s).toString('base64url');const renderBar=()=>{};const reconnectForDevice=()=>{throw Error('must not fall back')};
+    const nativeFetch=async url=>url==='/_mesh/devices'?{ok:true,json:async()=>({configured_default_device:'device-a',default_device:'device-a',devices:[{device_id:'device-a',online:true,upstream_health:'healthy',available:true},{device_id:'device-b',online:true,upstream_health:'unknown',available:false}]})}:url.includes('/device-a/')?{ok:true,headers:new Headers({'content-type':'application/json'}),json:async()=>({version:'2.0.18'})}:Promise.reject(Error('legacy probe failed'));
+    ''' + ('' if handoff else "location.search='';") + function + r'''
+    syncNativeServers().then(()=>{throw Error('failed unknown handoff must not select another device')},error=>{
+      assert.match(String(error),/handoff|verified/i);assert.equal(window.__ocmBootstrap.serverUrl,undefined);
+      assert.equal(JSON.parse(store.get('opencode.global.dat:layout')).home.selection.server,origin+'/_mesh/device/device-a');
+    }).catch(error=>{console.error(error);process.exitCode=1});
+    '''
+    if not handoff:
+        script = script.replace("configured_default_device:'device-a'", "configured_default_device:'device-b'")
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize('devices', [
     "[{device_id:'device-a',online:true,upstream_health:'healthy',available:true}]",
     "[{device_id:'device-a',online:true,upstream_health:'healthy',available:true},{device_id:'device-b',online:false,upstream_health:'unknown',available:false}]",

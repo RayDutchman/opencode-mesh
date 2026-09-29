@@ -279,7 +279,7 @@ global.document = {
 const reloads = [];
 global.location = { origin: 'https://mesh.test', host: 'mesh.test', reload: () => reloads.push(__now) };
 const fetchCalls = [];
-const devicePayload = data => data && Array.isArray(data.devices) ? ({...data, devices:data.devices.map(device => ({
+const devicePayload = data => data && Array.isArray(data.devices) && !data.raw ? ({...data, devices:data.devices.map(device => ({
   ...device,
   upstream_health:device.upstream_health || (device.online ? 'healthy' : 'unknown'),
   available:device.available ?? device.online,
@@ -398,6 +398,24 @@ def test_offline_page_names_target_and_lists_online_switch_without_reload():
     run_offline('device-a', [
         {'devices': [{'device_id': 'device-a', 'name': 'Alpha', 'online': False},
                      {'device_id': 'device-b', 'name': 'Beta', 'online': True}]},
+    ], body)
+
+
+def test_offline_page_legacy_unknown_is_selectable_but_never_auto_reloads():
+    body = FINISHER + r"""
+  await flush();
+  assert.equal(reloads.length, 0, 'unknown is not a recovery');
+  assert.equal(getLinks().length, 1, 'a control-online legacy Agent remains manually selectable');
+  assert.equal(getLinks()[0].href, '/?mesh_device=device-a');
+  assert.ok(String(getRows()[0].children[0].className).includes('unknown'), 'legacy health remains gray');
+  advance(3000); await flush(); await flush();
+  assert.equal(reloads.length, 0, 'unknown target never auto-reloads');
+  completed = true;
+})().then(() => { completed = true; }).catch(e => { completed = true; console.error(e); process.exitCode = 1; });
+"""
+    run_offline('device-a', [
+        {'raw': True, 'devices': [{'device_id': 'device-a', 'name': 'Legacy', 'online': True}]},
+        {'raw': True, 'devices': [{'device_id': 'device-a', 'name': 'Legacy', 'online': True}]},
     ], body)
 
 
