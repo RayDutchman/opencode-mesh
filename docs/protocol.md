@@ -26,6 +26,12 @@ Gateway 与 Agent 使用一条长期 WebSocket 控制连接。浏览器请求可
 
 普通响应至少包含 `id`、`status`、`headers` 和 base64 `body`。流首帧包含 `status`/`headers`，流数据包含 base64 `body`。连接级错误应包含稳定的 `reason`，不要让客户端依赖异常文本。
 
+`p2p_offer` 使用 Gateway 生成的 `p2p-` 会话 ID。浏览器在 Gateway 等待 answer 时断开，或 answer 等待超时/失败且尚未返回 answer，Gateway 会清理本地 answer 状态，并在原 Agent 控制连接上发送同一 ID 的 `cancel`。Agent 将 `p2p-` 前缀的 `cancel` 仅解释为 P2P 会话取消：取消对应 offer 任务并关闭该会话 peer；它不与普通 HTTP/SSE request ID 共用命名空间。
+
+普通控制 `request` 和 `stream_request` 的 ID 在 Agent 上是有界的执行/重放守卫，而不是结果缓存：相同 ID 仍在执行时忽略重复消息，不能替换已在途操作；完成或取消后仅保留无 body 墓碑，最多 256 条、最长 300 秒。窗口内同 ID 普通请求返回 `409`，流请求返回 `stream_error`，改用 `ws_open` 复用该 ID 返回 `ws_error`；窗口之外不承诺永久去重或 exactly-once。活动 WS bridge 的重复 open 也被忽略，但 WS 关闭本身不生成普通请求墓碑。
+
+滚动部署先更新 Agent，再更新 Gateway；旧 Gateway 没有协商取消通知时，新 Agent 的未连接期限仍可兜底清理。
+
 ## P2P 分片信封
 
 P2P 上所有浏览器请求、响应 body、流数据和 WebSocket 控制/数据消息都使用以下信封：
@@ -64,7 +70,7 @@ P2P 上所有浏览器请求、响应 body、流数据和 WebSocket 控制/数�
 
 稳定错误 reason 包括请求超限、响应超限、payload 超限、非法编码、帧序列错误、流缓冲溢出和连接失败。可重试错误由浏览器或 Agent 退避重试；不可重试错误关闭当前流或连接。
 
-所有 close、cancel、disconnect 和 timeout 路径必须幂等，不能留下 pending future、流队列、P2P peer、WebSocket bridge 或分片装配状态。
+所有 close、cancel、disconnect 和 timeout 路径必须幂等，不能留下 pending future、流队列、P2P peer、WebSocket bridge 或分片装配状态。已 answer 的 P2P peer 不因正常闲置被 watchdog 关闭；watchdog 只限制 answer 后尚未打开 DataChannel 的会话。
 
 ## 验收
 

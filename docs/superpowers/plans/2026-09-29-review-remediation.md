@@ -48,3 +48,15 @@ bash -n scripts/uninstall.sh
 修复期间确认另有既存 offer 取消后暂留孤儿 peer 的生命周期问题；本轮原子槽位预留不解决它，待明确取消关联或期限策略。控制连接的重复 ID 处理没有改成结果缓存；single-flight 新修复针对 P2P 同通道活动请求。
 
 Android 全工作树构建证明、完整 assets 输入校验及真机矩阵属于已披露的增强/验收项，随 APK 工作恢复处理。本轮不借修复范围引入登录页、V1 兼容或多设备 P2P 连接池。
+
+## 第二轮：协商取消与控制请求防重（已批准，执行中）
+
+用户批准仅修两项已确认缺陷，不修未经确认的问题，明确不实施双 P2P 连接池。沿用原服务端实现与审查会话，模型 GPT-5.6 Terra；验证后按 Agent → Gateway 顺序部署，保留 Android 工作。
+
+- [x] Offer：真实 HTTP 断连与调用任务取消传播；内部取消关闭 peer，协商 task 已结束仍可按 session 取消，重复 offer 不覆盖原连接。
+- [x] Agent：未建立 DataChannel 的有限期限清理；已 open 的空闲通道保留；reset 释放 session、watchdog、槽位。
+- [x] 控制 request/stream：active 同 ID 不打断、不重复执行；completed/cancelled 有界 256 条、300 秒防重，不缓存响应正文；WS 生命周期独立。
+- [x] 行为验证：直驱 ASGI disconnect、真实控制消息调度、类型冲突、late cancel、取消后重发、watchdog/open 竞态；审查发现已修正。
+- [ ] 更新当前文档，选择性提交推送，先更新 Agent 再更新 Gateway；核对部署 revision、服务和逐设备 API。
+
+首轮实现只覆盖 task.cancel 和墓碑容量，未达到交付条件。随后独立测试暴露发送 answer 失败后残留、已 open channel 未通知 ready、重复 offer 覆盖与 watchdog 完成记录残留，均先红后绿修复。真实 ASGI 断连使用消费完 body 后的 receive 监听；清理在 Starlette 取消 scope 中屏蔽重复取消，通知仍受两秒发送期限约束。HTTP/stream 墓碑阻止跨类型 WS 重用，返回 WS 自身的错误信封，不误用 HTTP response。未新增依赖（取消 scope 使用现有 FastAPI/Starlette 依赖 AnyIO），未实施连接池，未重打包 APK。

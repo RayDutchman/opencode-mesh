@@ -1,5 +1,7 @@
 from __future__ import annotations
 import argparse, asyncio, base64, contextlib, hmac, json, os, platform, random, re, secrets, socket, time
+from collections import OrderedDict
+import anyio
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -680,19 +682,49 @@ class Gateway:
                 return JSONResponse({"error": "Device offline"}, status_code=503)
             if len(json.dumps(data)) > int(self.cfg.get("max_p2p_offer_bytes", 1024 * 1024)):
                 return JSONResponse({"error": "P2P signaling too large"}, status_code=413)
-            session_id = secrets.token_urlsafe(18)
+            session_id = "p2p-" + secrets.token_urlsafe(18)
             future = asyncio.get_running_loop().create_future()
             self.p2p_answers[session_id] = future
             self.p2p_owners[session_id] = agent_ws
+            answered = False
+            answer_wait = None
+            async def wait_disconnect():
+                # The body is consumed; await the disconnect instead of polling
+                # through middleware receive wrappers with a cancelled scope.
+                while True:
+                    if (await req.receive())["type"] == "http.disconnect":
+                        return
+            disconnected = asyncio.create_task(wait_disconnect())
             try:
                 await self.send_control(agent_ws, {"type": "p2p_offer", "id": session_id,
-                                                   "offer": data, "stun_servers": self.cfg.get("stun_servers") or DEFAULT_STUN_SERVERS})
-                return JSONResponse(await asyncio.wait_for(future, 20))
+                                                    "offer": data, "stun_servers": self.cfg.get("stun_servers") or DEFAULT_STUN_SERVERS})
+                answer_wait = asyncio.create_task(asyncio.wait_for(future, 20))
+                done, _ = await asyncio.wait({answer_wait, disconnected},
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if disconnected in done:
+                    answer_wait.cancel()
+                    return Response(status_code=499)
+                answer = answer_wait.result()
+                answered = True
+                return JSONResponse(answer)
             except Exception:
                 return JSONResponse({"error": "P2P connection failed"}, status_code=502)
             finally:
+                disconnected.cancel()
+                if answer_wait is not None:
+                    if not answer_wait.done():
+                        answer_wait.cancel()
                 self.p2p_answers.pop(session_id, None)
                 self.p2p_owners.pop(session_id, None)
+                # Starlette's cancelled scope otherwise interrupts cleanup at
+                # every await. Keep the cancellation notification bounded.
+                with anyio.CancelScope(shield=True):
+                    if answer_wait is not None:
+                        await asyncio.gather(answer_wait, return_exceptions=True)
+                    await asyncio.gather(disconnected, return_exceptions=True)
+                    if not answered:
+                        with contextlib.suppress(Exception):
+                            await self.send_control(agent_ws, {"type": "cancel", "id": session_id}, timeout=2)
 
         @app.websocket("/_mesh/ws/{path:path}")
         @app.websocket("/_mesh/device/{path:path}")
@@ -1104,6 +1136,9 @@ class Agent:
         self.p2p_sequence: dict[tuple[int, str], int] = {}
         self.p2p_reservations = 0
         self.p2p_reservation_lock = asyncio.Lock()
+        self.p2p_sessions: dict[str, Any] = {}
+        self.p2p_session_watchdogs: dict[str, asyncio.Task] = {}
+        self.control_tombstones: OrderedDict[str, float] = OrderedDict()
         self.ws_queue_bytes: dict[str, int] = {}
         self.ws_queue_overflowed: set[str] = set()
         self.ws_queue_closing: set[str] = set()
@@ -1498,6 +1533,12 @@ class Agent:
         self.p2p_assemblers.clear()
         self.p2p_sequence.clear()
         self.p2p_reservations = 0
+        sessions = list(self.p2p_sessions)
+        for session_id in sessions:
+            await self.cancel_p2p_offer(session_id)
+        for watchdog in list(self.p2p_session_watchdogs.values()):
+            watchdog.cancel()
+        self.p2p_session_watchdogs.clear()
         self.ws_queues.clear()
         peers = list(self.p2p_peers)
         self.p2p_peers.clear()
@@ -1508,6 +1549,7 @@ class Agent:
                 await peer.close()
 
     async def handle_p2p_offer(self, item: dict[str, Any], control) -> None:
+        session_id = str(item["id"])
         limit = int(self.cfg.get("max_p2p_peers", 4))
         async with self.p2p_reservation_lock:
             if len(self.p2p_peers) + self.p2p_reservations >= limit:
@@ -1522,6 +1564,9 @@ class Agent:
             return
         peer_holder: dict[str, Any] = {}
         channels: set[int] = set()
+        ready = asyncio.Event()
+        async def mark_ready():
+            ready.set()
         async def receive(channel, message):
             channels.add(id(channel))
             await self.p2p_message(channel, message)
@@ -1529,6 +1574,10 @@ class Agent:
             peer = peer_holder.get("peer")
             if peer:
                 self.p2p_peers.discard(peer)
+            self.p2p_sessions.pop(session_id, None)
+            watchdog = self.p2p_session_watchdogs.pop(session_id, None)
+            if watchdog is not None and watchdog is not asyncio.current_task():
+                watchdog.cancel()
             for key, task in list(self.p2p_tasks.items()):
                 if key[0] in channels:
                     task.cancel()
@@ -1541,17 +1590,64 @@ class Agent:
                 item["offer"], receive, peer_closed,
                 item.get("stun_servers") or [],
                 loopback_candidate=bool(self.cfg.get("p2p_loopback_candidate", True)),
+                on_ready=mark_ready,
             )
             peer_holder["peer"] = peer
             self.p2p_peers.add(peer)
+            self.p2p_sessions[session_id] = peer
+            async def close_if_unready():
+                try:
+                    await asyncio.wait_for(ready.wait(), float(self.cfg.get("p2p_unready_seconds", 30)))
+                except asyncio.TimeoutError:
+                    if self.p2p_sessions.get(session_id) is peer:
+                        await self.cancel_p2p_offer(session_id)
+                finally:
+                    if self.p2p_session_watchdogs.get(session_id) is asyncio.current_task():
+                        self.p2p_session_watchdogs.pop(session_id, None)
+            self.p2p_session_watchdogs[session_id] = asyncio.create_task(close_if_unready())
             await self.send_control(control, {"type": "p2p_answer", "id": item["id"], "answer": answer})
+        except asyncio.CancelledError:
+            await self.cancel_p2p_offer(session_id)
+            raise
         except (P2PUnavailable, Exception):
+            await self.cancel_p2p_offer(session_id)
             with contextlib.suppress(Exception):
                 await self.send_control(control, {"type": "p2p_answer", "id": item["id"],
                                                   "answer": {"error": "P2P negotiation failed"}})
         finally:
             async with self.p2p_reservation_lock:
                 self.p2p_reservations = max(0, self.p2p_reservations - 1)
+
+    async def cancel_p2p_offer(self, session_id: str) -> None:
+        """Close a negotiated peer whose browser no longer awaits its offer answer."""
+        peer = self.p2p_sessions.pop(session_id, None)
+        watchdog = self.p2p_session_watchdogs.pop(session_id, None)
+        if watchdog is not None and watchdog is not asyncio.current_task():
+            watchdog.cancel()
+        if peer is not None:
+            self.p2p_peers.discard(peer)
+            with contextlib.suppress(Exception):
+                await peer.close()
+
+    def remember_control_id(self, request_id: str) -> None:
+        """Keep a bounded, body-free replay guard for completed control requests."""
+        now = time.monotonic()
+        for key, stamp in list(self.control_tombstones.items()):
+            if now - stamp > 300:
+                self.control_tombstones.pop(key, None)
+        self.control_tombstones[request_id] = now
+        self.control_tombstones.move_to_end(request_id)
+        while len(self.control_tombstones) > 256:
+            self.control_tombstones.popitem(last=False)
+
+    def is_completed_control_id(self, request_id: str) -> bool:
+        stamp = self.control_tombstones.get(request_id)
+        if stamp is None:
+            return False
+        if time.monotonic() - stamp > 300:
+            self.control_tombstones.pop(request_id, None)
+            return False
+        return True
 
     async def handle_request(self, item: dict[str, Any], ws):
         try:
@@ -1680,6 +1776,7 @@ class Agent:
                     additional_headers={"X-Mesh-Agent-Token": data['agent_token']},
                     max_size=None, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
                     tasks = {}
+                    task_kinds = {}
                     await self.reset_p2p_state()
                     heartbeat = asyncio.create_task(self.control_heartbeat(ws))
                     await self.send_control(ws, {"type": "agent_hello"})
@@ -1691,22 +1788,52 @@ class Agent:
                             if handler:
                                 request_id = item["id"]
                                 previous = tasks.get(request_id)
-                                if previous: previous.cancel()
+                                if previous:
+                                    # A duplicate control ID must never replace an in-flight mutation.
+                                    continue
+                                if self.is_completed_control_id(request_id):
+                                    if item.get("type") == "stream_request":
+                                        await self.send_control(ws, {"type": "stream_error", "id": request_id,
+                                                                     "error": "duplicate request id"})
+                                    elif item.get("type") == "ws_open":
+                                        await self.send_control(ws, {"type": "ws_error", "id": request_id,
+                                                                     "error": "duplicate request id"})
+                                    else:
+                                        payload = base64.b64encode(json.dumps({"error": "duplicate request id"}).encode()).decode()
+                                        await self.send_control(ws, {"type": "response", "id": request_id,
+                                                                     "status": 409, "headers": {"content-type": "application/json"},
+                                                                     "body": payload})
+                                    continue
                                 task = asyncio.create_task(handler(item, ws))
                                 tasks[request_id] = task
+                                task_kinds[request_id] = item.get("type")
                                 def finish(completed, key=request_id):
                                     if tasks.get(key) is completed:
                                         tasks.pop(key, None)
+                                        kind = task_kinds.pop(key, None)
+                                        if kind in {"request", "stream_request"}:
+                                            self.remember_control_id(key)
                                     if not completed.cancelled():
                                         completed.exception()
                                 task.add_done_callback(finish)
                             elif item.get("type") == "cancel":
-                                task = tasks.get(item.get("id"))
-                                if task: task.cancel()
+                                cancelled_id = str(item.get("id", ""))
+                                if cancelled_id.startswith("p2p-"):
+                                    task = tasks.get(f"p2p:{cancelled_id}")
+                                    if task:
+                                        task.cancel()
+                                    await self.cancel_p2p_offer(cancelled_id)
+                                else:
+                                    task = tasks.get(cancelled_id)
+                                    if task:
+                                        if task_kinds.get(cancelled_id) in {"request", "stream_request"}:
+                                            self.remember_control_id(cancelled_id)
+                                        task.cancel()
                             elif item.get("type") == "p2p_offer":
                                 p2p_key = f"p2p:{item.get('id')}"
                                 previous = tasks.get(p2p_key)
-                                if previous: previous.cancel()
+                                if previous is not None or str(item.get("id")) in self.p2p_sessions:
+                                    continue
                                 task = asyncio.create_task(self.handle_p2p_offer(item, ws))
                                 tasks[p2p_key] = task
                                 def finish_p2p(completed, key=p2p_key):

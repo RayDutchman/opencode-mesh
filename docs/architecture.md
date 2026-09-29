@@ -167,6 +167,8 @@ Agent 首次启动时使用共享的 `enroll_token` 注册，Gateway 返回设�
 
 同一个 `device_id` 建立新连接时，Gateway 会关闭旧连接，并使用代际检查防止旧连接的尾部消息污染新连接的状态。
 
+Gateway 为每个浏览器 offer 分配独立的 `p2p-` 会话 ID，并把 answer future 绑定到当前 Agent 控制连接。浏览器 HTTP 请求收到 `http.disconnect`，或 Gateway 的 answer 等待超时/失败且尚未取得 answer 时，Gateway 会移除该 future/owner，并沿原控制连接尽力发送同一会话 ID 的 `cancel`。取得 answer 后不再由此路径取消；不能由 HTTP handler 返回推断浏览器已收到 answer，未建立通道的残留连接仍由 Agent 期限兜底。
+
 ### 4.3 Relay 生命周期管理
 
 Gateway 为每个请求维护有限生命周期：
@@ -218,7 +220,7 @@ Agent 不理解 OpenCode 的业务语义，只负责传输和边界保护：
 
 ### 5.3 P2P 应答和资源清理
 
-Agent 接收 Gateway 转发的 P2P offer，使用 aiortc 创建 answer，并为每个 P2P peer 保存有限的装配器、序列号和任务状态。每条 DataChannel 的装配器最多保留 64 条活动/错误状态；完成 ID 的无 payload 墓碑最多 256 条、最长 300 秒，达到数量上限时淘汰最旧项。该窗口只防止近期重放，不保存完成结果，也不承诺窗口外的永久去重或 exactly-once。
+Agent 接收 Gateway 转发的 P2P offer，使用 aiortc 创建 answer，并按独立 `p2p-` 会话 ID 保存 peer、装配器、序列号和任务状态。Gateway 的同 ID `cancel` 会取消该 offer 任务并关闭 peer；控制连接重建也会清理全部会话。answer 发出后，默认仅对尚未打开 DataChannel 的会话设置 30 秒 watchdog（可由 `p2p_unready_seconds` 调整）；DataChannel ready 后取消 watchdog，正常闲置不会被此 watchdog 关闭。每条 DataChannel 的装配器最多保留 64 条活动/错误状态；完成 ID 的无 payload 墓碑最多 256 条、最长 300 秒，达到数量上限时淘汰最旧项。该窗口只防止近期重放，不保存完成结果，也不承诺窗口外的永久去重或 exactly-once。
 
 同一 DataChannel 的活动 P2P 请求按请求 ID single-flight；已完成分片在解析、校验并取得逻辑消息后，先释放 fragment 字节预算，再派发可能缓慢的上游操作。完成墓碑不持有 payload。所有并行 fragment 共享 `max_p2p_total_bytes` 预算，缺省等于单消息 P2P 限额；300 秒 TTL 在下一 frame 到达时检查，取消、断线和错误路径也释放状态。
 
@@ -228,6 +230,8 @@ Agent 接收 Gateway 转发的 P2P offer，使用 aiortc 创建 answer，并为�
 - 未完成的消息装配。
 - pending 请求和浏览器 WebSocket 桥。
 - 发送序列和接收队列。
+
+Agent 对控制 `request` 与 `stream_request` 另维护独立于 P2P 分片的 ID 守卫：活动 ID 的重复控制消息直接忽略，避免替换在途 mutation；完成或取消的 ID 仅保留无 body 墓碑，最多 256 条、最长 300 秒。窗口内重复 `request` 返回 `409`，重复 `stream_request` 返回 `stream_error`，跨类型复用为 `ws_open` 返回 `ws_error`，不会重放或缓存原结果。活动 WS 的重复 open 不重建原 bridge；WS 关闭本身不生成普通请求墓碑。窗口淘汰后不承诺永久去重或 exactly-once。
 
 ## 6. 浏览器适配层
 
@@ -349,6 +353,8 @@ Agent  --agent_token--> Gateway 控制 WebSocket
 | 故障 | 处理方式 |
 |---|---|
 | P2P 初始协商失败 | 当前请求走 Relay；后台按退避策略重试 |
+| 浏览器在等待 P2P answer 时断开，或 Gateway answer 等待失败 | Gateway 以 `p2p-` 会话 ID 发送 `cancel`；Agent 取消对应 offer 并关闭孤儿 peer |
+| P2P answer 后未打开 DataChannel | Agent 的默认 30 秒 unready watchdog 关闭会话；已 ready 的正常闲置 peer 不受该 watchdog 影响 |
 | P2P DataChannel 断开 | 清理 peer 和 pending 状态，重新协商 |
 | 网络事件（online/connection 变化） | 只在防抖+冷却窗口内提前触发一次重试；取消并重建任意未打开阶段的旧协商；已打开的 P2P 不拆线 |
 | 重试协商停滞 | 40s 总时限中断从 createOffer 到通道打开的全部阶段；事件提示可随时取消并立即重建 |
@@ -360,7 +366,7 @@ Agent  --agent_token--> Gateway 控制 WebSocket
 | 设备切换 | 重建当前 P2P 连接；每个请求仍按自身明确 Server 路由，其他 Server 可走 Relay |
 | 后台冻结后遗留旧 open P2P 通道 | 前台恢复时探针 ping，3s 无匹配 pong 则淘汰旧通道并后台重建；验证期新 HTTP/WS 请求走 Relay，mutation 不重放 |
 
-`tests/test_review_protocol_limits.py` 覆盖 Agent 分片状态的 64 条活动容量、256 条完成墓碑、300 秒窗口、预算释放时机及有限重放语义。`tests/test_v2_incoming_limits.py` 在真实浏览器适配器中覆盖浏览器接收端的 128 条入站装配、单条/总计 64 MiB、120 秒未完成 deadline，以及完成 SSE/WebSocket 帧不累计限制整个流。`tests/test_mesh_reliability.py` 保留分片顺序、大小限制、重复结束、P2P 状态清理和真实 Agent 消息处理路径；`tests/test_v2_transport.py` 使用实际 Node URL/Request/Abort 行为和 Agent HTTP 请求捕获，覆盖设备作用域、上传体、取消、逐跳头及原生 Server 名称保留。
+`tests/test_review_protocol_limits.py` 覆盖 Agent 分片预算、有限去重窗口、控制请求跨类型冲突及取消后重发，另以 ASGI disconnect 和可控 peer 验证协商取消、ready/超时清理。`tests/test_v2_incoming_limits.py` 覆盖浏览器 128 条装配、单条/总计 64 MiB、120 秒未完成期限及长流。`tests/test_mesh_reliability.py` 保留分片和真实 Agent 消息处理回归；`tests/test_v2_transport.py` 覆盖设备作用域、上传体、取消、逐跳头及原生 Server 保留。这些测试不替代手机/WebRTC 全链路验收。
 
 ## 10. 文件架构
 

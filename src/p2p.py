@@ -395,6 +395,7 @@ async def answer_offer(
     on_close: Callable[[], Awaitable[None]],
     stun_servers: list[str] | None = None,
     loopback_candidate: bool = True,
+    on_ready: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[Any, dict[str, str]]:
     """Receive a browser offer on the Agent side and return an answer with ICE candidates."""
     if loopback_candidate:
@@ -440,6 +441,15 @@ async def answer_offer(
             print("p2p datachannel closed", flush=True)
             asyncio.create_task(close_once())
 
+        @channel.on("open")
+        def on_channel_open():
+            if on_ready is not None:
+                asyncio.create_task(on_ready())
+
+        # The answering side may receive a channel that is already open.
+        if channel.readyState == "open":
+            on_channel_open()
+
     @peer.on("connectionstatechange")
     async def on_state_change():
         print(f"p2p connection state={peer.connectionState}", flush=True)
@@ -451,7 +461,7 @@ async def answer_offer(
         answer = await peer.createAnswer()
         await peer.setLocalDescription(answer)
         await wait_ice_complete(peer)
-    except Exception:
+    except BaseException:
         await close_once()
         raise
     local = peer.localDescription
