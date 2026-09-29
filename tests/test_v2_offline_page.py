@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 
 import httpx
+import pytest
 
 from src import main as mesh_main
 from src.main import Gateway, OFFLINE_PAGE
@@ -234,6 +235,7 @@ def test_browser_ws_unknown_explicit_device_keeps_4403():
 
 # ---------- Real OFFLINE_PAGE script behavior in Node ----------
 
+OFFLINE_THEME_JS = OFFLINE_PAGE.split('<script id="ocm-offline-theme">', 1)[1].split('</script>', 1)[0]
 OFFLINE_JS = OFFLINE_PAGE.split('<script>', 1)[1].split('</script>', 1)[0]
 
 HARNESS_JS = r"""
@@ -259,6 +261,7 @@ function advance(ms) {
 }
 const flush = () => new Promise(r => setImmediate(r));
 const nodes = {};
+const documentElement = { dataset: {} };
 function makeNode(tag) {
   const el = { tagName: String(tag).toUpperCase(), className: '', children: [], _text: '' };
   Object.defineProperty(el, 'textContent', {
@@ -269,6 +272,7 @@ function makeNode(tag) {
   return el;
 }
 global.document = {
+  documentElement,
   getElementById: id => nodes[id] || (nodes[id] = makeNode('div')),
   createElement: tag => makeNode(tag),
 };
@@ -301,13 +305,58 @@ process.on('beforeExit', () => assert.ok(completed, 'async assertions did not co
 """
 
 
-def run_offline(target, responses, body):
+def run_offline(target, responses, body, color_scheme=None, storage_throws=False):
     # The offline page's initial tick() runs at script evaluation, so the whole
     # poll sequence must be scripted before the script is evaluated.
-    prefix = 'const scripted = ' + json.dumps(responses) + ';\n'
-    script = (HARNESS_JS + '\n' + prefix + OFFLINE_JS.replace('__TARGET__', json.dumps(target)) + '\n' + body)
+    prefix = (
+        'const scripted = ' + json.dumps(responses) + ';\n'
+        + ('global.localStorage = {getItem(){throw new Error("storage unavailable")}};\n'
+           if storage_throws else
+           'global.localStorage = {getItem:k => k === "opencode-color-scheme" ? '
+           + json.dumps(color_scheme) + ' : null};\n')
+    )
+    script = (HARNESS_JS + '\n' + prefix + OFFLINE_THEME_JS + '\n'
+              + OFFLINE_JS.replace('__TARGET__', json.dumps(target)) + '\n' + body)
     result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(('color_scheme', 'expected'), [
+    ('light', 'light'),
+    ('dark', 'dark'),
+    ('system', None),
+    (None, None),
+])
+def test_offline_page_uses_explicit_opencode_theme_or_keeps_system_preference(color_scheme, expected):
+    body = FINISHER + r"""
+  await flush();
+  assert.equal(document.documentElement.dataset.colorScheme || null, __EXPECTED__);
+  assert.equal(fetchCalls.length, 1, 'theme selection does not block initial polling');
+  completed = true;
+})().catch(e => { console.error(e); process.exitCode = 1; });
+""".replace('__EXPECTED__', json.dumps(expected))
+    run_offline(None, [{'devices': []}], body, color_scheme=color_scheme)
+
+
+def test_offline_page_storage_error_keeps_polling_with_system_theme_fallback():
+    body = FINISHER + r"""
+  await flush();
+  assert.equal(document.documentElement.dataset.colorScheme || null, null);
+  assert.equal(fetchCalls.length, 1, 'storage errors do not block polling');
+  assert.equal(getMsg(), 'No device is online. This page refreshes automatically.');
+  completed = true;
+})().catch(e => { console.error(e); process.exitCode = 1; });
+"""
+    run_offline(None, [{'devices': []}], body, storage_throws=True)
+
+
+def test_offline_page_status_dot_tokens_match_opencode_v2018():
+    assert '.dot{width:6px;height:6px;border-radius:9999px;background:var(--offline-critical)}' in OFFLINE_PAGE
+    assert '.dot.on{background:var(--offline-success)}' in OFFLINE_PAGE
+    assert '--offline-success:#7add71' in OFFLINE_PAGE
+    assert '--offline-critical:#ed4831' in OFFLINE_PAGE
+    assert '--offline-success:#12c905' in OFFLINE_PAGE
+    assert '--offline-critical:#fc533a' in OFFLINE_PAGE
 
 
 def test_late_poll_completion_cannot_release_new_poll_guard():
@@ -333,7 +382,7 @@ def test_offline_page_names_target_and_lists_online_switch_without_reload():
   assert.ok(!getMsg().includes('No device is online'), 'online device exists');
   assert.equal(fetchCalls[0].cache, 'no-store', 'device list polling stays no-store');
   assert.equal(getLinks().length, 1, 'only the online device is a switch entry');
-  assert.equal(getLinks()[0].href, '/_mesh/device/device-b');
+  assert.equal(getLinks()[0].href, '/?mesh_device=device-b');
   assert.equal(getLinks()[0].textContent, 'Beta');
   const rowsText = getRows().map(li => li.children.map(c => c.textContent).join('|')).join('\n');
   assert.ok(rowsText.includes('Alpha') && rowsText.includes('offline'), 'offline target listed');
@@ -374,7 +423,7 @@ def test_offline_page_without_target_lists_online_device_but_never_reloads():
   assert.ok(!getMsg().includes('No device is online'), 'no misleading claim while one device is online');
   assert.equal(reloads.length, 0, 'no target: never auto-reload/auto-switch');
   assert.equal(getLinks().length, 1);
-  assert.equal(getLinks()[0].href, '/_mesh/device/device-b');
+  assert.equal(getLinks()[0].href, '/?mesh_device=device-b');
   completed = true;
 })().then(() => { completed = true; }).catch(e => { completed = true; console.error(e); process.exitCode = 1; });
 """

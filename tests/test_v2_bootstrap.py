@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import time
 import subprocess
 
@@ -173,6 +174,85 @@ def test_bootstrap_retries_failed_discovery_before_starting_ui():
       assert.equal(window.__ocmBootstrap.error,null);
       assert.equal(window.__ocmBootstrap.serverUrl,'https://mesh.test/_mesh/device/device-a');process.exit(0);
     }).catch(error=>{console.error(error);process.exit(1)});
+    '''
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_root_handoff_selects_only_a_discovered_online_v2_device_and_consumes_its_query():
+    function = 'async function syncNativeServers' + TRANSPORT_ADAPTER.split('async function syncNativeServers', 1)[1].split('  function rejectEntry', 1)[0]
+    script = r'''
+    const assert=require('node:assert/strict');
+    const origin='https://mesh.test', defaultUrl=origin+'/_mesh/device/device-a', selectedUrl=origin+'/_mesh/device/device-b';
+    const store=new Map([
+      ['opencode.global.dat:server',JSON.stringify({list:[{type:'http',displayName:'external',http:{url:'https://elsewhere.test'}}],projects:{keep:1}})],
+      ['opencode.settings.dat:defaultServerUrl','https://elsewhere.test'],
+      ['opencode.global.dat:layout',JSON.stringify({home:{directory:'/legacy',selection:{server:defaultUrl},other:'keep'},tabs:{keep:1}})]
+    ]);
+    const localStorage={getItem:k=>store.get(k),setItem:(k,v)=>store.set(k,v)};
+    const location={origin,pathname:'/',search:'?keep=yes&mesh_device=device-b',hash:'#section',href:origin+'/?keep=yes&mesh_device=device-b#section'};
+    const history={state:{x:1},replaceState(state,title,url){this.replaced=url;location.href=origin+url;const parsed=new URL(location.href);location.search=parsed.search;location.hash=parsed.hash;}};
+    global.window={__ocmBootstrap:{}};
+    const state={routeDeviceId:'device-a',defaultDevice:null,transportStarted:true};
+    const readJson=(k,f)=>JSON.parse(store.get(k)||'null')??f;
+    const serverTabUrl=id=>origin+'/_mesh/device/'+id;
+    const encodeServer=s=>Buffer.from(s).toString('base64url');
+    const renderBar=()=>{};
+    let reconnects=0;const reconnectForDevice=()=>{reconnects++;state.routeDeviceId=state.defaultDevice;};
+    const fetches=[];const nativeFetch=async url=>{fetches.push(String(url));if(url==='/_mesh/devices')return {ok:true,json:async()=>({configured_default_device:'device-a',default_device:'device-a',devices:[{device_id:'device-a',online:true},{device_id:'device-b',online:true}]})};return {ok:true,headers:new Headers({'content-type':'application/json'}),json:async()=>({version:'2.0.18'})};};
+    ''' + function + r'''
+    syncNativeServers().then(()=>{
+      assert.equal(window.__ocmBootstrap.serverUrl,selectedUrl);
+      assert.equal(state.defaultDevice,'device-b');assert.equal(state.routeDeviceId,'device-b');assert.equal(reconnects,1);
+      assert.equal(store.get('opencode.settings.dat:defaultServerUrl'),'https://elsewhere.test','external default preference is not overwritten');
+      const layout=JSON.parse(store.get('opencode.global.dat:layout'));
+      assert.equal(layout.home.selection.server,selectedUrl);assert.equal(layout.home.directory,undefined);assert.equal(layout.home.other,'keep');assert.deepEqual(layout.tabs,{keep:1});
+      assert.equal(history.replaced,'/?keep=yes#section');
+      assert.ok(fetches.includes(selectedUrl+'/api/info'),'the chosen device is verified through its actual device route');
+    }).catch(error=>{console.error(error);process.exitCode=1});
+    '''
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize('devices', [
+    "[{device_id:'device-a',online:true}]",
+    "[{device_id:'device-a',online:true},{device_id:'device-b',online:false}]",
+    "[{device_id:'device-a',online:true},{device_id:'device-b',online:true}]",
+])
+def test_invalid_root_handoff_never_falls_back_or_consumes_the_retryable_query(devices):
+    function = 'async function syncNativeServers' + TRANSPORT_ADAPTER.split('async function syncNativeServers', 1)[1].split('  function rejectEntry', 1)[0]
+    # The three cases are absent, offline, and V2-incompatible respectively.
+    incompatible = devices.endswith("online:true}]") and "device-b" in devices
+    script = r'''
+    const assert=require('node:assert/strict');const origin='https://mesh.test';
+    const store=new Map([['opencode.global.dat:server',JSON.stringify({list:[]})],['opencode.global.dat:layout',JSON.stringify({home:{selection:{server:origin+'/_mesh/device/device-a'}}})]]);
+    const localStorage={getItem:k=>store.get(k),setItem:(k,v)=>store.set(k,v)};
+    const location={origin,pathname:'/',search:'?mesh_device=device-b&keep=yes',hash:'#retry',href:origin+'/?mesh_device=device-b&keep=yes#retry'};
+    const history={replaceState(){throw Error('invalid handoff must retain its query')},state:null};global.window={__ocmBootstrap:{}};
+    const state={routeDeviceId:'device-a'};const readJson=(k,f)=>JSON.parse(store.get(k)||'null')??f;const serverTabUrl=id=>origin+'/_mesh/device/'+id;const encodeServer=s=>Buffer.from(s).toString('base64url');const renderBar=()=>{};const reconnectForDevice=()=>{throw Error('must not reconnect to another device')};
+    const nativeFetch=async url=>url==='/_mesh/devices'?{ok:true,json:async()=>({configured_default_device:'device-a',default_device:'device-a',devices:__DEVICES__})}:{ok:true,headers:new Headers({'content-type':'application/json'}),json:async()=>({version:__VERSION__})};
+    '''.replace('__DEVICES__', devices).replace('__VERSION__', "'1.9.0'" if incompatible else "'2.0.18'") + function + r'''
+    syncNativeServers().then(()=>{throw Error('invalid handoff unexpectedly selected a fallback')},error=>{
+      assert.match(String(error),/handoff/i);assert.equal(location.search,'?mesh_device=device-b&keep=yes');
+      assert.equal(JSON.parse(store.get('opencode.global.dat:layout')).home.selection.server,origin+'/_mesh/device/device-a');
+    }).catch(error=>{console.error(error);process.exitCode=1});
+    '''
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_session_deep_link_does_not_let_handoff_query_override_its_device():
+    function = 'async function syncNativeServers' + TRANSPORT_ADAPTER.split('async function syncNativeServers', 1)[1].split('  function rejectEntry', 1)[0]
+    key = base64.urlsafe_b64encode(b'https://mesh.test/_mesh/device/device-a').decode().rstrip('=')
+    script = r'''
+    const assert=require('node:assert/strict');const origin='https://mesh.test',route=__ROUTE__;
+    const store=new Map([['opencode.global.dat:server',JSON.stringify({list:[]})],['opencode.global.dat:layout',JSON.stringify({home:{selection:{server:origin+'/_mesh/device/device-a'}}})]]);
+    const localStorage={getItem:k=>store.get(k),setItem:(k,v)=>store.set(k,v)};const location={origin,pathname:route,search:'?mesh_device=device-b',hash:'',href:origin+route+'?mesh_device=device-b'};const history={replaceState(){throw Error('deep-link query must remain')},state:null};global.window={__ocmBootstrap:{}};
+    const state={routeDeviceId:'device-a'};const readJson=(k,f)=>JSON.parse(store.get(k)||'null')??f;const serverTabUrl=id=>origin+'/_mesh/device/'+id;const encodeServer=s=>Buffer.from(s).toString('base64url');const renderBar=()=>{};const reconnectForDevice=()=>{throw Error('deep-link device must not be changed')};
+    const nativeFetch=async url=>url==='/_mesh/devices'?{ok:true,json:async()=>({configured_default_device:'device-a',default_device:'device-a',devices:[{device_id:'device-a',online:true},{device_id:'device-b',online:true}]})}:{ok:true,headers:new Headers({'content-type':'application/json'}),json:async()=>({version:'2.0.18'})};
+    '''.replace('__ROUTE__', json.dumps('/server/' + key + '/session/ses_keep')) + function + r'''
+    syncNativeServers().then(()=>{assert.equal(window.__ocmBootstrap.serverUrl,origin+'/_mesh/device/device-a');assert.equal(location.search,'?mesh_device=device-b')}).catch(error=>{console.error(error);process.exitCode=1});
     '''
     result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr

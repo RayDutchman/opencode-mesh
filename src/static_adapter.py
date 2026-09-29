@@ -58,17 +58,38 @@ TRANSPORT_ADAPTER = r"""
   // A foreground resume verifies the old open P2P channel with a probe ping and
   // only keeps the channel when a pong matches inside this window.
   const PROBE_TIMEOUT_MS = 3000;
+  // A root handoff is an explicit device boundary, not a default preference.
+  // Do not let bootstrap's pre-existing selection start traffic before discovery
+  // and the V2 probe have accepted that requested device.
+  const rootHandoffDevice = location.pathname === '/' ? new URLSearchParams(location.search).get('mesh_device') : null;
 
-  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), incoming: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, networkTimer: null, lastNetworkAttempt: null, lastAttemptTime: null, activeController: null, isInitialAttempt: false, devices: [], defaultDevice: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null, p2pSendTail: Promise.resolve(), probing: false, probe: null };
+  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), incoming: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, networkTimer: null, lastNetworkAttempt: null, lastAttemptTime: null, activeController: null, isInitialAttempt: false, devices: [], defaultDevice: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null, p2pSendTail: Promise.resolve(), probing: false, probe: null, transportStarted: false, handoffPending: !!rootHandoffDevice };
 
   const BAR_CSS = `
   #ocm-mesh-bar{display:flex;align-items:center;gap:8px;height:36px;padding:0 10px;font-size:13px;line-height:20px;flex:0 0 auto;border-bottom:1px solid var(--v2-border-border-base);background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-muted);-webkit-user-select:none;user-select:none}
   #ocm-mesh-bar .ocm-title{font-weight:600;color:var(--v2-text-text-base)}
   #ocm-mesh-bar .ocm-version{font-size:11px;color:var(--v2-text-text-faint);white-space:nowrap}
-  #ocm-mesh-bar .ocm-device{border:1px solid var(--v2-border-border-base);border-radius:6px;padding:2px 8px;background:var(--v2-background-bg-layer-02);color:var(--v2-text-text-base);max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  #ocm-mesh-bar .ocm-device[data-offline="true"]{color:var(--v2-text-text-faint)}
+  #ocm-mesh-bar .ocm-device-menu-wrap{position:relative;min-width:0}
+  #ocm-mesh-bar .ocm-device-menu-button{display:flex;align-items:center;gap:6px;min-width:0;border:1px solid var(--v2-border-border-base);border-radius:6px;padding:2px 8px;background:var(--v2-background-bg-layer-02);color:var(--v2-text-text-base);font:inherit;line-height:20px;cursor:pointer}
+  #ocm-mesh-bar .ocm-device-menu-button[data-offline="true"]{color:var(--v2-text-text-faint)}
+  #ocm-mesh-bar .ocm-device-menu-button:focus-visible,#ocm-device-menu .ocm-device-menu-item:focus-visible{outline:2px solid var(--v2-border-border-base);outline-offset:2px}
+  #ocm-mesh-bar .ocm-device-menu-label{max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #ocm-device-menu{position:fixed;z-index:2147483646;min-width:0;max-width:calc(100vw - 16px);max-height:calc(100dvh - 16px);overflow:auto;padding:4px;background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-base);font-family:inherit;font-size:13px;font-weight:440;line-height:20px;border-radius:6px;box-shadow:var(--v2-elevation-floating,0 8px 16px rgba(0,0,0,.04),0 4px 8px rgba(0,0,0,.08),0 0 0 .5px rgba(0,0,0,.12))}
+  #ocm-device-menu .ocm-device-menu-item{display:flex;align-items:center;gap:8px;width:100%;min-width:0;border:0;border-radius:6px;padding:6px 8px;background:transparent;color:inherit;font-family:inherit;font-size:13px;font-weight:440;line-height:20px;text-align:left;cursor:pointer;transition:background 120ms}
+  #ocm-device-menu .ocm-device-menu-item:hover:not(:disabled),#ocm-device-menu .ocm-device-menu-item:focus-visible{background:var(--v2-overlay-simple-overlay-hover)}
+  #ocm-device-menu .ocm-device-menu-item[aria-current="true"]{background:var(--v2-background-bg-layer-03)}
+  #ocm-device-menu .ocm-device-menu-item:disabled{cursor:default;opacity:.65}
+  #ocm-device-menu .ocm-device-menu-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #ocm-device-menu .ocm-device-menu-status{margin-left:auto;color:var(--v2-text-text-faint);font-size:11px;white-space:nowrap}
+  #ocm-device-menu .ocm-device-menu-loading,#ocm-device-menu .ocm-device-menu-error{padding:6px 8px;color:var(--v2-text-text-faint);font-family:inherit;font-size:13px;font-weight:440;line-height:20px}
+  #ocm-device-menu .ocm-device-menu-dot{width:6px;height:6px;flex:0 0 6px;border-radius:9999px;background:var(--ocm-device-unknown,rgba(127,127,127,.65))}
+  #ocm-device-menu .ocm-device-menu-dot[data-state="online"]{background:var(--icon-success-base,var(--ocm-device-online,#12c905))}
+  #ocm-device-menu .ocm-device-menu-dot[data-state="offline"]{background:var(--icon-critical-base,var(--ocm-device-offline,#fc533a))}
+  @media (prefers-color-scheme:light){:root{--ocm-device-online:#7add71;--ocm-device-offline:#ed4831}}
+  :root[data-color-scheme="light"]{--ocm-device-online:#7add71;--ocm-device-offline:#ed4831}
+  :root[data-color-scheme="dark"]{--ocm-device-online:#12c905;--ocm-device-offline:#fc533a}
   #ocm-mesh-bar .ocm-transport{margin-left:auto;display:flex;align-items:center;gap:6px;color:var(--v2-text-text-base)}
-  #ocm-mesh-bar .ocm-dot{width:8px;height:8px;border-radius:9999px;background:#22c55e}
+  #ocm-mesh-bar .ocm-dot{width:6px;height:6px;border-radius:9999px;background:var(--icon-success-base,var(--ocm-device-online,#12c905))}
   #ocm-mesh-bar .ocm-dot[data-kind="relay"]{background:#3b82f6}
   #root{height:calc(100dvh - 36px)}
   `;
@@ -93,14 +114,204 @@ TRANSPORT_ADAPTER = r"""
     const version = document.createElement('span');
     version.className = 'ocm-version';
     version.textContent = 'v' + MESH_VERSION;
-    const device = document.createElement('span');
-    device.className = 'ocm-device';
+    const deviceWrap = document.createElement('span');
+    deviceWrap.className = 'ocm-device-menu-wrap';
+    const device = document.createElement('button');
+    device.type = 'button';
+    device.className = 'ocm-device-menu-button';
+    device.setAttribute('aria-haspopup', 'menu');
+    device.setAttribute('aria-expanded', 'false');
+    const deviceLabel = document.createElement('span');
+    deviceLabel.className = 'ocm-device-menu-label';
+    device.appendChild(deviceLabel);
+    deviceWrap.appendChild(device);
     const transport = document.createElement('span');
     transport.className = 'ocm-transport';
-    bar.append(title, version, device, transport);
+    bar.append(title, version, deviceWrap, transport);
     document.body.insertBefore(bar, document.body.firstChild);
+    device.addEventListener('click', toggleDeviceMenu);
     return bar;
   }
+
+  let deviceMenu = { open: false, generation: 0, controller: null, timer: null, devices: [] };
+
+  function deviceMenuButton() { return ensureBar()?.querySelector('.ocm-device-menu-button'); }
+
+  function closeDeviceMenu({ focus = false } = {}) {
+    if (!deviceMenu.open) return;
+    deviceMenu.open = false;
+    deviceMenu.generation += 1;
+    deviceMenu.controller?.abort();
+    deviceMenu.controller = null;
+    clearTimeout(deviceMenu.timer);
+    deviceMenu.timer = null;
+    document.getElementById('ocm-device-menu')?.remove();
+    const button = deviceMenuButton();
+    button?.setAttribute('aria-expanded', 'false');
+    if (focus) button?.focus();
+  }
+
+  function positionDeviceMenu(panel) {
+    const rect = deviceMenuButton()?.getBoundingClientRect();
+    if (!rect) return;
+    const width = Math.min(360, Math.max(0, window.innerWidth - 16));
+    panel.style.position = 'fixed';
+    panel.style.width = width + 'px';
+    panel.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8)) + 'px';
+    panel.style.top = Math.max(8, Math.min(rect.bottom + 6, window.innerHeight - 8)) + 'px';
+  }
+
+  function ensureDeviceMenuPanel() {
+    let panel = document.getElementById('ocm-device-menu');
+    if (panel) return panel;
+    const wrap = ensureBar()?.querySelector('.ocm-device-menu-wrap');
+    if (!wrap) return null;
+    panel = document.createElement('div');
+    panel.id = 'ocm-device-menu';
+    panel.tabIndex = -1;
+    panel.setAttribute('role', 'menu');
+    wrap.appendChild(panel);
+    return panel;
+  }
+
+  function deviceMenuItems() {
+    return [...(document.getElementById('ocm-device-menu')?.querySelectorAll('.ocm-device-menu-item') || [])].filter(item => !item.disabled);
+  }
+
+  function navigateDeviceMenu(event) {
+    const items = deviceMenuItems();
+    if (!items.length) return;
+    let index = items.indexOf(document.activeElement);
+    if (event.key === 'ArrowDown') index = (index + 1 + items.length) % items.length;
+    else if (event.key === 'ArrowUp') index = (index - 1 + items.length) % items.length;
+    else if (event.key === 'Home') index = 0;
+    else if (event.key === 'End') index = items.length - 1;
+    else return;
+    event.preventDefault();
+    items[index].focus();
+  }
+
+  function renderDeviceMenu(kind = 'devices') {
+    if (!deviceMenu.open) return;
+    const panel = ensureDeviceMenuPanel();
+    if (!panel) return;
+    const focusedDeviceId = document.activeElement === panel
+      ? panel.dataset.focusDeviceId : document.activeElement?.dataset?.ocmDeviceId;
+    delete panel.dataset.focusDeviceId;
+    const children = [];
+    if (kind !== 'devices') {
+      const message = document.createElement('div');
+      message.className = kind === 'loading' ? 'ocm-device-menu-loading' : 'ocm-device-menu-error';
+      message.textContent = kind === 'loading' ? 'Loading devices…' : 'Device status unavailable.';
+      children.push(message);
+    } else {
+      const current = activeDeviceId();
+      for (const item of deviceMenu.devices) {
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'ocm-device-menu-item';
+        row.setAttribute('role', 'menuitem');
+        row.dataset.ocmDeviceId = item.device_id;
+        const online = item.online === true;
+        row.disabled = !online;
+        if (item.device_id === current) row.setAttribute('aria-current', 'true');
+        const dot = document.createElement('span');
+        dot.className = 'ocm-device-menu-dot';
+        dot.dataset.state = online ? 'online' : item.online === false ? 'offline' : 'unknown';
+        const name = document.createElement('span');
+        name.className = 'ocm-device-menu-name';
+        name.textContent = item.name || item.device_id || 'Unnamed device';
+        const status = document.createElement('span');
+        status.className = 'ocm-device-menu-status';
+        status.textContent = online ? 'Online' : item.online === false ? 'Offline' : 'Unknown';
+        row.append(dot, name, status);
+        if (online) row.addEventListener('click', () => {
+          if (row.disabled) return;
+          closeDeviceMenu();
+          location.assign('/?mesh_device=' + encodeURIComponent(item.device_id));
+        });
+        children.push(row);
+      }
+    }
+    panel.replaceChildren(...children);
+    positionDeviceMenu(panel);
+    if (focusedDeviceId) {
+      const restored = deviceMenuItems().find(item => item.dataset.ocmDeviceId === focusedDeviceId);
+      (restored || panel).focus();
+    }
+  }
+
+  function markDeviceMenuRefreshing() {
+    const panel = document.getElementById('ocm-device-menu');
+    if (!panel) return;
+    // Disabling a focused button blurs it in real browsers. Park focus on the
+    // stable panel and restore the device only if the user has not moved away.
+    if (panel.contains(document.activeElement) && document.activeElement?.dataset?.ocmDeviceId) {
+      panel.dataset.focusDeviceId = document.activeElement.dataset.ocmDeviceId;
+      panel.focus();
+    }
+    for (const row of panel.querySelectorAll('.ocm-device-menu-item')) {
+      row.disabled = true;
+      row.querySelector('.ocm-device-menu-dot').dataset.state = 'unknown';
+      row.querySelector('.ocm-device-menu-status').textContent = 'Updating…';
+    }
+  }
+
+  function scheduleDeviceMenuRefresh(generation) {
+    clearTimeout(deviceMenu.timer);
+    deviceMenu.timer = setTimeout(() => {
+      if (deviceMenu.open && deviceMenu.generation === generation) refreshDeviceMenu(generation);
+    }, 3000);
+  }
+
+  async function refreshDeviceMenu(generation = deviceMenu.generation) {
+    if (!deviceMenu.open || generation !== deviceMenu.generation || deviceMenu.controller) return;
+    const controller = new AbortController();
+    deviceMenu.controller = controller;
+    let rejectDeadline;
+    const deadlineExpired = new Promise((_, reject) => { rejectDeadline = reject; });
+    const deadline = setTimeout(() => {
+      controller.abort();
+      rejectDeadline(new Error('Mesh device discovery timed out'));
+    }, 10000);
+    if (deviceMenu.devices.length) markDeviceMenuRefreshing();
+    else renderDeviceMenu('loading');
+    try {
+      const response = await Promise.race([nativeFetch('/_mesh/devices', { credentials: 'same-origin', cache: 'no-store', signal: controller.signal }), deadlineExpired]);
+      if (!response.ok) throw new Error('Mesh device discovery failed: ' + response.status);
+      const payload = await Promise.race([response.json(), deadlineExpired]);
+      if (!deviceMenu.open || generation !== deviceMenu.generation || deviceMenu.controller !== controller) return;
+      deviceMenu.devices = Array.isArray(payload.devices) ? payload.devices : [];
+      renderDeviceMenu();
+      scheduleDeviceMenuRefresh(generation);
+    } catch (_) {
+      if (!deviceMenu.open || generation !== deviceMenu.generation || deviceMenu.controller !== controller) return;
+      deviceMenu.devices = [];
+      renderDeviceMenu('error');
+      scheduleDeviceMenuRefresh(generation);
+    } finally {
+      clearTimeout(deadline);
+      if (deviceMenu.controller === controller) deviceMenu.controller = null;
+    }
+  }
+
+  function toggleDeviceMenu() {
+    if (deviceMenu.open) { closeDeviceMenu(); return; }
+    deviceMenu.open = true;
+    deviceMenu.generation += 1;
+    deviceMenu.devices = [];
+    deviceMenuButton()?.setAttribute('aria-expanded', 'true');
+    refreshDeviceMenu(deviceMenu.generation);
+  }
+
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && deviceMenu.open) { event.preventDefault(); closeDeviceMenu({ focus: true }); }
+    else if (deviceMenu.open) navigateDeviceMenu(event);
+  });
+  document.addEventListener('pointerdown', event => {
+    const wrap = ensureBar()?.querySelector('.ocm-device-menu-wrap');
+    if (deviceMenu.open && wrap && !wrap.contains(event.target)) closeDeviceMenu();
+  });
 
   function currentDeviceInfo() {
     const routeId = currentDeviceId();
@@ -122,6 +333,7 @@ TRANSPORT_ADAPTER = r"""
   }
 
   async function measureRelayRtt() {
+    if (state.handoffPending) return;
     if (state.channel && state.channel.readyState === 'open') return;
     if (document.hidden) return;
     const deviceId = activeDeviceId();
@@ -140,8 +352,8 @@ TRANSPORT_ADAPTER = r"""
     if (!bar) return;
     const info = currentDeviceInfo();
     const transport = transportInfo();
-    const device = bar.querySelector('.ocm-device');
-    device.textContent = info.name;
+    const device = bar.querySelector('.ocm-device-menu-button');
+    device.querySelector('.ocm-device-menu-label').textContent = info.name;
     device.dataset.offline = String(info.online === false);
     bar.querySelector('.ocm-transport').innerHTML =
       '<span class="ocm-dot" data-kind="' + transport.kind + '"></span><span>' + transport.label + '</span>';
@@ -229,6 +441,10 @@ TRANSPORT_ADAPTER = r"""
   };
 
   async function syncNativeServers() {
+      // Offline-page handoffs are accepted only at the V2 home route. A session
+      // deep link already identifies its Server and must never be retargeted by
+      // an incidental query parameter.
+      const handoffDevice = location.pathname === '/' ? new URLSearchParams(location.search).get('mesh_device') : null;
       const response = await nativeFetch('/_mesh/devices', { credentials: 'same-origin', signal: AbortSignal.timeout(10000) });
       if (!response.ok) throw new Error('Mesh device discovery failed: ' + response.status);
       const payload = await response.json();
@@ -248,7 +464,14 @@ TRANSPORT_ADAPTER = r"""
         } catch (_) { return null; }
       }))).filter(Boolean);
       const store = readJson('opencode.global.dat:server', { list: [], projects: {}, lastProject: {}, recentlyClosed: {} });
-      const primary = state.devices.find(device => device.device_id === payload.configured_default_device)
+      const requested = handoffDevice && state.devices.find(device => device.device_id === handoffDevice);
+      // An explicit click is not a preference: keeping the query and retrying is
+      // safer than silently opening another device when discovery, reachability,
+      // or the V2 probe has not confirmed the requested target.
+      if (handoffDevice && (!requested || !requested.online || !devices.some(device => device.device_id === handoffDevice))) {
+        throw new Error('Requested device handoff is unavailable or not an OpenCode V2 server');
+      }
+      const primary = requested || state.devices.find(device => device.device_id === payload.configured_default_device)
         || devices.find(device => device.device_id === payload.default_device) || devices[0];
       if (!primary) throw new Error('No OpenCode V2 device available');
       if (unsupported.has(primary.device_id)) {
@@ -272,8 +495,11 @@ TRANSPORT_ADAPTER = r"""
       const initial = primary.online ? primary : devices.find(device => device.device_id === payload.default_device) || devices[0] || primary;
       if (!previous || previous.replace(/\/+$/, '') === location.origin) localStorage.setItem(defaultKey, serverTabUrl(initial.device_id));
       const layout = readJson('opencode.global.dat:layout', {});
-      if (layout.home?.selection?.server?.replace(/\/+$/, '') === location.origin) {
+      if (handoffDevice || layout.home?.selection?.server?.replace(/\/+$/, '') === location.origin) {
+        layout.home = layout.home || {};
+        layout.home.selection = layout.home.selection || {};
         layout.home.selection.server = primaryUrl;
+        if (handoffDevice) delete layout.home.directory;
         localStorage.setItem('opencode.global.dat:layout', JSON.stringify(layout));
       }
       const pwaKey = 'opencode.pwa.last-route';
@@ -288,6 +514,16 @@ TRANSPORT_ADAPTER = r"""
       }
       // Point canonicalLocalServer at the explicit device too; existing local project/window state stays preserved by the native migration.
       window.__ocmBootstrap.serverUrl = primaryUrl;
+      // Bootstrap starts P2P before discovery completes. Switch generations only
+      // after all native selection state agrees so an old manifest cannot win a
+      // race or trigger a duplicate negotiation for the previous default.
+      if (handoffDevice && state.transportStarted && state.routeDeviceId !== primary.device_id) reconnectForDevice();
+      if (handoffDevice && !state.transportStarted) state.routeDeviceId = primary.device_id;
+      if (handoffDevice) {
+        const clean = new URL(location.href);
+        clean.searchParams.delete('mesh_device');
+        history.replaceState(history.state, '', clean.pathname + clean.search + clean.hash);
+      }
   }
 
   async function bootstrapServers() {
@@ -762,6 +998,7 @@ TRANSPORT_ADAPTER = r"""
   }
 
   async function reconnectForDevice() {
+    if (!state.transportStarted) return;
     const deviceId = activeDeviceId();
     if (deviceId === state.routeDeviceId) return;
     releaseCurrentAttempt(true);
@@ -1034,24 +1271,43 @@ TRANSPORT_ADAPTER = r"""
     }
   }
 
-  state.routeDeviceId = activeDeviceId();
-  state.isInitialAttempt = true;
-  const bootstrapGeneration = state.generation;
-  state.ready = connectP2P(state.routeDeviceId)
-    .then(() => { if (state.generation === bootstrapGeneration) state.reconnectDelay = 1000; })
-    .catch(() => { if (state.generation !== bootstrapGeneration) return null; scheduleReconnect(); return null; });
+  function startInitialTransport() {
+    if (state.transportStarted) return state.ready;
+    state.transportStarted = true;
+    state.routeDeviceId = activeDeviceId();
+    state.isInitialAttempt = true;
+    const bootstrapGeneration = state.generation;
+    state.ready = connectP2P(state.routeDeviceId)
+      .then(() => { if (state.generation === bootstrapGeneration) state.reconnectDelay = 1000; })
+      .catch(() => { if (state.generation !== bootstrapGeneration) return null; scheduleReconnect(); return null; });
+    return state.ready;
+  }
   window.__ocmTransport = state;
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', renderBar, { once: true });
   else renderBar();
   let relayTick = 0;
   setInterval(() => { reconnectForDevice(); renderBar(); if (++relayTick % 5 === 0) measureRelayRtt(); }, 2000);
   setTimeout(measureRelayRtt, 1500);
-  // The native entry module waits for discovery to finish before starting; the page is no longer refreshed once the user starts typing.
+  // The native entry module waits for discovery to finish before starting; a
+  // root handoff additionally holds the transport itself until its target is
+  // confirmed, so no old selected device can receive a manifest or bare API.
   window.__ocmBootstrap = { serverUrl: null, ready: null };
-  window.__ocmBootstrap.ready = bootstrapServers();
+  if (rootHandoffDevice) {
+    window.__ocmBootstrap.ready = bootstrapServers().then(() => {
+      state.handoffPending = false;
+      startInitialTransport();
+    });
+  } else {
+    startInitialTransport();
+    window.__ocmBootstrap.ready = bootstrapServers();
+  }
   window.__ocmBootstrap.ready.catch(error => { console.error('Mesh bootstrap:', error); });
 
   window.fetch = async (input, init) => {
+    if (state.handoffPending) {
+      await window.__ocmBootstrap.ready;
+      return window.fetch(input, init);
+    }
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);
     if (url.origin !== location.origin || (url.pathname.startsWith('/_mesh/') && !url.pathname.startsWith('/_mesh/device/')) || (virtualDeviceId(url.pathname) && virtualDeviceId(url.pathname) !== state.manifest?.device_id)) return nativeFetch(input, init);
     // While a foreground probe verifies the old open channel, new requests go

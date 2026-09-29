@@ -155,17 +155,24 @@ OFFLINE_PAGE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OpenCode Mesh</title>
+<script id="ocm-offline-theme">
+try {
+  var colorScheme = localStorage.getItem('opencode-color-scheme');
+  if (colorScheme === 'light' || colorScheme === 'dark') document.documentElement.dataset.colorScheme = colorScheme;
+} catch (_) {}
+</script>
 <style>
-:root{color-scheme:light dark}
-body{margin:0;font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#fafafa;color:#111;display:flex;min-height:100vh;align-items:center;justify-content:center}
-@media (prefers-color-scheme:dark){body{background:#080808;color:#fafafa}}
-.card{width:min(520px,calc(100vw - 48px));padding:24px 28px;border:1px solid rgba(127,127,127,.3);border-radius:12px}
+:root{color-scheme:light;--offline-background:#fafafa;--offline-text:#111;--offline-border:rgba(127,127,127,.3);--offline-divider:rgba(127,127,127,.2);--offline-success:#7add71;--offline-critical:#ed4831}
+@media (prefers-color-scheme:dark){:root:not([data-color-scheme="light"]){color-scheme:dark;--offline-background:#080808;--offline-text:#fafafa;--offline-success:#12c905;--offline-critical:#fc533a}}
+:root[data-color-scheme="dark"]{color-scheme:dark;--offline-background:#080808;--offline-text:#fafafa;--offline-success:#12c905;--offline-critical:#fc533a}
+body{margin:0;font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--offline-background);color:var(--offline-text);display:flex;min-height:100vh;align-items:center;justify-content:center}
+.card{width:min(520px,calc(100vw - 48px));padding:24px 28px;border:1px solid var(--offline-border);border-radius:12px}
 h1{font-size:15px;margin:0 0 6px}
 p{margin:0 0 14px;opacity:.7}
 ul{list-style:none;margin:0;padding:0}
-li{display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid rgba(127,127,127,.2)}
-.dot{width:8px;height:8px;border-radius:50%;background:#9ca3af}
-.dot.on{background:#22c55e}
+li{display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid var(--offline-divider)}
+.dot{width:6px;height:6px;border-radius:9999px;background:var(--offline-critical)}
+.dot.on{background:var(--offline-success)}
 .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 a.name{color:inherit;text-decoration:underline;cursor:pointer}
 .state{opacity:.6;font-size:12px}
@@ -182,7 +189,7 @@ a.name{color:inherit;text-decoration:underline;cursor:pointer}
 var target = __TARGET__;
 var msg = document.getElementById('msg');
 var list = document.getElementById('list');
-function deviceLink(id){ return '/_mesh/device/' + encodeURIComponent(id); }
+function deviceLink(id){ return '/?mesh_device=' + encodeURIComponent(id); }
 function render(devices){
   list.textContent = '';
   devices.forEach(function(d){
@@ -190,8 +197,8 @@ function render(devices){
     var dot = document.createElement('span'); dot.className = 'dot' + (d.online ? ' on' : '');
     var state = document.createElement('span'); state.className = 'state'; state.textContent = d.online ? 'online' : 'offline';
     if (d.online){
-      // Manual switch entry only: the path-type device entry the frontend
-      // adapter already uses for discovery and Server identity.
+      // A root-page handoff lets the adapter establish the native Server
+      // selection before the V2 entry module starts.
       var link = document.createElement('a');
       link.className = 'name';
       link.href = deviceLink(d.device_id);

@@ -32,6 +32,8 @@ Each test names the production change it protects:
 
 import subprocess
 
+import pytest
+
 from src.static_adapter import TRANSPORT_ADAPTER
 
 ADAPTER_JS = (
@@ -86,6 +88,9 @@ const manifestFetches = [];
 const hangFetches = [];
 global.fetchCalls = [];
 global.MANIFEST_BEHAVIOR = 'defer';
+global.MANIFEST_IGNORE_ABORT = false;
+global.DISCOVERY_RESPONSES = null;
+global.INFO_VERSIONS = null;
 // Stall flags park an attempt at a specific stage: ICE_HANG keeps the peer
 // gathering forever, OFFER_HANG makes createOffer never settle.
 global.ICE_HANG = false;
@@ -99,18 +104,28 @@ global.fetch = (input, init = {}) => {
   if (init.signal) init.signal.addEventListener('abort', () => { rec.aborted = true; });
   if (url.includes('/_mesh/transport-manifest')) {
     const p = new Promise((resolve, reject) => {
-      if (init.signal) init.signal.addEventListener('abort', () => { rec.aborted = true; reject(new DOMException('Aborted', 'AbortError')); });
+      if (init.signal) init.signal.addEventListener('abort', () => { rec.aborted = true; if (!global.MANIFEST_IGNORE_ABORT) reject(new DOMException('Aborted', 'AbortError')); });
       rec.resolve = resolve; rec.reject = reject;
     });
     manifestFetches.push(rec);
     const behavior = global.MANIFEST_BEHAVIOR;
     if (behavior === 'fail') rec.resolve({ ok: false, status: 503, json: async () => ({}) });
-    if (behavior === 'p2p-disabled') rec.resolve({ ok: true, json: async () => ({ device_id: 'device-a', p2p: { enabled: false }, stun_servers: [] }) });
-    if (behavior === 'ok') rec.resolve({ ok: true, json: async () => ({ device_id: 'device-a', p2p: { enabled: true, offer: '/_mesh/offers/' + manifestFetches.length }, stun_servers: [] }) });
-    if (behavior === 'ok-hang') rec.resolve({ ok: true, json: async () => ({ device_id: 'device-a', p2p: { enabled: true, offer: '/_mesh/offers-hang/' + manifestFetches.length }, stun_servers: [] }) });
+    const deviceId = (url.match(/[?&]device=([^&]+)/) || [, 'device-a'])[1];
+    if (behavior === 'p2p-disabled') rec.resolve({ ok: true, json: async () => ({ device_id: deviceId, p2p: { enabled: false }, stun_servers: [] }) });
+    if (behavior === 'ok') rec.resolve({ ok: true, json: async () => ({ device_id: deviceId, p2p: { enabled: true, offer: '/_mesh/offers/' + manifestFetches.length }, stun_servers: [] }) });
+    if (behavior === 'ok-hang') rec.resolve({ ok: true, json: async () => ({ device_id: deviceId, p2p: { enabled: true, offer: '/_mesh/offers-hang/' + manifestFetches.length }, stun_servers: [] }) });
     return p;
   }
-  if (url.includes('/_mesh/devices')) return new Promise(() => {}); // bootstrap discovery stays pending
+  if (url.includes('/_mesh/devices')) {
+    if (!global.DISCOVERY_RESPONSES) return new Promise(() => {}); // bootstrap discovery stays pending
+    const payload = global.DISCOVERY_RESPONSES.shift();
+    return Promise.resolve({ ok: true, json: async () => payload });
+  }
+  if (url.includes('/api/info')) {
+    const deviceId = (url.match(/\/_mesh\/device\/([^/]+)\/api\/info/) || [, ''])[1];
+    const version = global.INFO_VERSIONS?.[deviceId] || '2.0.18';
+    return Promise.resolve({ ok: true, status: 200, headers: new Headers({ 'content-type': 'application/json' }), json: async () => ({ version }) });
+  }
   if (url.includes('/_mesh/offers-hang/')) {
     hangFetches.push(rec);
     return new Promise((resolve, reject) => {
@@ -398,6 +413,119 @@ global.MANIFEST_BEHAVIOR = 'ok-hang';
   advance(40500); await tick();
   assert.equal(s.reconnectTimer, null, 'stale attempt never schedules a backoff after the switch');
   assert.equal(manifestFetches.length, countBefore, 'no late reconnect from the old device');
+})().then(() => { completed = true; }).catch(e => { completed = true; console.error(e); process.exitCode = 1; });
+"""
+    run_adapter(HARNESS_WITH_CONN_JS, preamble, body)
+
+
+def test_valid_handoff_starts_ui_before_stalled_p2p_and_uses_bounded_relay_wait():
+    """Validated selection must not make the entry await a 40-second negotiation."""
+    preamble = r"""
+storage.set('opencode.global.dat:layout', JSON.stringify({home:{selection:{server:'https://mesh.test/_mesh/device/device-a'}}}));
+global.location = {origin:'https://mesh.test',host:'mesh.test',pathname:'/',search:'?mesh_device=device-b',hash:'',href:'https://mesh.test/?mesh_device=device-b'};
+global.history = {state:null,pushState(){},replaceState(state,title,path){location.href=location.origin+path;location.search=new URL(location.href).search;}};
+global.DISCOVERY_RESPONSES = [{configured_default_device:'device-a',default_device:'device-a',devices:[{device_id:'device-a',online:true},{device_id:'device-b',online:true}]}];
+global.MANIFEST_BEHAVIOR = 'ok-hang';
+"""
+    body = FINISHER + r"""
+  let entryStarted = false;
+  window.__ocmBootstrap.ready.then(() => { entryStarted = true; });
+  for (let i = 0; i < 10; i++) await tick();
+  assert.equal(entryStarted, true, 'entry waits for selection, not P2P negotiation');
+  assert.equal(window.__ocmTransport.handoffPending, false);
+  assert.equal(manifestFetches.length, 1);
+  assert.ok(manifestFetches[0].url.includes('device=device-b'));
+  assert.equal(hangFetches.length, 1, 'P2P is still negotiating');
+  const operation = window.fetch('https://mesh.test/api/session/ses_b/message');
+  const business = () => fetchCalls.filter(call => call.url.includes('/api/session/ses_b/message'));
+  await tick(); advance(1199); await tick();
+  assert.equal(business().length, 0);
+  advance(1); await tick();
+  assert.equal(business().length, 1);
+  assert.equal(business()[0].url, 'https://mesh.test/_mesh/device/device-b/api/session/ses_b/message');
+  await operation;
+})().then(() => { completed = true; }).catch(e => { completed = true; console.error(e); process.exitCode = 1; });
+"""
+    run_adapter(HARNESS_WITH_CONN_JS, preamble, body)
+
+
+def test_root_handoff_starts_transport_only_after_v2_selection_and_scopes_business_fetch_to_selected_device():
+    """A valid root handoff does not negotiate the old selected device first."""
+    preamble = r"""
+storage.set('opencode.global.dat:server', JSON.stringify({ list: [
+  { type: 'http', displayName: 'A', http: { url: 'https://mesh.test/_mesh/device/device-a' } },
+] }));
+storage.set('opencode.global.dat:layout', JSON.stringify({ home: { selection: { server: 'https://mesh.test/_mesh/device/device-a' } } }));
+global.location = { origin: 'https://mesh.test', host: 'mesh.test', pathname: '/', search: '?mesh_device=device-b&keep=yes', hash: '#handoff', href: 'https://mesh.test/?mesh_device=device-b&keep=yes#handoff' };
+global.history = { state: null, pushState() {}, replaceState(state, title, path) { this.replaced = path; const next = new URL(path, location.origin); location.pathname = next.pathname; location.search = next.search; location.hash = next.hash; location.href = location.origin + path; } };
+global.DISCOVERY_RESPONSES = [{ configured_default_device: 'device-a', default_device: 'device-a', devices: [
+  { device_id: 'device-a', online: true }, { device_id: 'device-b', online: true },
+] }];
+global.MANIFEST_BEHAVIOR = 'p2p-disabled';
+"""
+    body = FINISHER + r"""
+  const s = window.__ocmTransport;
+  for (let i = 0; i < 10; i++) await tick();
+  assert.equal(manifestFetches.length, 1, 'handoff starts exactly one verified device-b negotiation');
+  assert.ok(manifestFetches[0].url.includes('device=device-b'));
+  assert.equal(location.search, '?keep=yes', 'successful handoff consumed only its parameter');
+  assert.equal(history.replaced, '/?keep=yes#handoff');
+  assert.equal(s.manifest.device_id, 'device-b');
+  await window.fetch('https://mesh.test/api/session/ses_b/prompt', { method: 'POST', body: new Uint8Array(0) });
+  const business = global.fetchCalls.filter(call => call.url.includes('/api/session/ses_b/prompt'));
+  assert.equal(business.length, 1, 'one business request reached native fetch');
+  assert.equal(business[0].url, 'https://mesh.test/_mesh/device/device-b/api/session/ses_b/prompt', 'business request is routed to the handoff device, not the old default');
+})().then(() => { completed = true; }).catch(e => { completed = true; console.error(e); process.exitCode = 1; });
+"""
+    run_adapter(HARNESS_WITH_CONN_JS, preamble, body)
+
+
+@pytest.mark.parametrize('first_devices, versions', [
+    ("[{ device_id: 'device-a', online: true }]", '{}'),
+    ("[{ device_id: 'device-a', online: true }, { device_id: 'device-b', online: false }]", '{}'),
+    ("[{ device_id: 'device-a', online: true }, { device_id: 'device-b', online: true }]", "{ 'device-b': '1.9.0' }"),
+])
+def test_root_handoff_retry_keeps_unverified_target_isolated_until_it_becomes_online_v2(first_devices, versions):
+    """Absent, offline, or incompatible handoffs never start the old default transport."""
+    preamble = r"""
+storage.set('opencode.global.dat:server', JSON.stringify({ list: [
+  { type: 'http', displayName: 'A', http: { url: 'https://mesh.test/_mesh/device/device-a' } },
+] }));
+storage.set('opencode.global.dat:layout', JSON.stringify({ home: { selection: { server: 'https://mesh.test/_mesh/device/device-a' } } }));
+global.location = { origin: 'https://mesh.test', host: 'mesh.test', pathname: '/', search: '?mesh_device=device-b&keep=yes', hash: '#retry', href: 'https://mesh.test/?mesh_device=device-b&keep=yes#retry' };
+global.history = { state: null, pushState() {}, replaceState(state, title, path) { this.replaced = path; const next = new URL(path, location.origin); location.pathname = next.pathname; location.search = next.search; location.hash = next.hash; location.href = location.origin + path; } };
+global.DISCOVERY_RESPONSES = [
+  { configured_default_device: 'device-a', default_device: 'device-a', devices: __FIRST_DEVICES__ },
+  { configured_default_device: 'device-a', default_device: 'device-a', devices: [{ device_id: 'device-a', online: true }, { device_id: 'device-b', online: true }] },
+];
+global.INFO_VERSIONS = __VERSIONS__;
+global.MANIFEST_BEHAVIOR = 'p2p-disabled';
+""".replace('__FIRST_DEVICES__', first_devices).replace('__VERSIONS__', versions)
+    body = FINISHER + r"""
+  const ready = window.__ocmBootstrap.ready;
+  for (let i = 0; i < 10; i++) await tick();
+  let settled = false; ready.then(() => { settled = true; });
+  await tick();
+  assert.equal(settled, false, 'offline explicit target keeps bootstrap pending for retry');
+  assert.equal(location.search, '?mesh_device=device-b&keep=yes', 'failed handoff remains retryable');
+  assert.equal(history.replaced, undefined, 'failed handoff did not consume its query');
+  assert.equal(JSON.parse(storage.get('opencode.global.dat:layout')).home.selection.server, 'https://mesh.test/_mesh/device/device-a', 'no fallback selection was persisted');
+  assert.equal(manifestFetches.length, 0, 'unverified target did not negotiate the old default');
+  assert.equal(global.fetchCalls.filter(call => call.url.includes('/api/session/')).length, 0, 'unverified target sent no business request');
+  global.INFO_VERSIONS = null;
+  advance(3000); for (let i = 0; i < 10; i++) await tick();
+  await ready;
+  const s = window.__ocmTransport;
+  assert.equal(window.__ocmBootstrap.serverUrl, 'https://mesh.test/_mesh/device/device-b');
+  assert.equal(s.defaultDevice, 'device-b');
+  assert.equal(location.search, '?keep=yes');
+  assert.equal(history.replaced, '/?keep=yes#retry');
+  assert.equal(manifestFetches.length, 1, 'recovery starts only the verified target transport');
+  assert.ok(manifestFetches[0].url.includes('device=device-b'));
+  await window.fetch('https://mesh.test/api/session/ses_b/retry', { method: 'POST', body: new Uint8Array(0) });
+  const business = global.fetchCalls.filter(call => call.url.includes('/api/session/ses_b/retry'));
+  assert.equal(business.length, 1);
+  assert.equal(business[0].url, 'https://mesh.test/_mesh/device/device-b/api/session/ses_b/retry', 'recovery request uses the explicitly selected device');
 })().then(() => { completed = true; }).catch(e => { completed = true; console.error(e); process.exitCode = 1; });
 """
     run_adapter(HARNESS_WITH_CONN_JS, preamble, body)
