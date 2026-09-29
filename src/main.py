@@ -168,17 +168,18 @@ try {
 } catch (_) {}
 </script>
 <style>
-:root{color-scheme:light;--offline-background:#fafafa;--offline-text:#111;--offline-border:rgba(127,127,127,.3);--offline-divider:rgba(127,127,127,.2);--offline-success:#7add71;--offline-critical:#ed4831}
-@media (prefers-color-scheme:dark){:root:not([data-color-scheme="light"]){color-scheme:dark;--offline-background:#080808;--offline-text:#fafafa;--offline-success:#12c905;--offline-critical:#fc533a}}
-:root[data-color-scheme="dark"]{color-scheme:dark;--offline-background:#080808;--offline-text:#fafafa;--offline-success:#12c905;--offline-critical:#fc533a}
+:root{color-scheme:light;--offline-background:#fafafa;--offline-text:#111;--offline-border:rgba(127,127,127,.3);--offline-divider:rgba(127,127,127,.2);--offline-success:#7add71;--offline-critical:#ed4831;--offline-unknown:#8a8a8a}
+@media (prefers-color-scheme:dark){:root:not([data-color-scheme="light"]){color-scheme:dark;--offline-background:#080808;--offline-text:#fafafa;--offline-success:#12c905;--offline-critical:#fc533a;--offline-unknown:#999}}
+:root[data-color-scheme="dark"]{color-scheme:dark;--offline-background:#080808;--offline-text:#fafafa;--offline-success:#12c905;--offline-critical:#fc533a;--offline-unknown:#999}
 body{margin:0;font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--offline-background);color:var(--offline-text);display:flex;min-height:100vh;align-items:center;justify-content:center}
 .card{width:min(520px,calc(100vw - 48px));padding:24px 28px;border:1px solid var(--offline-border);border-radius:12px}
 h1{font-size:15px;margin:0 0 6px}
 p{margin:0 0 14px;opacity:.7}
 ul{list-style:none;margin:0;padding:0}
 li{display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid var(--offline-divider)}
-.dot{width:6px;height:6px;border-radius:9999px;background:var(--offline-critical)}
-.dot.on{background:var(--offline-success)}
+.dot{width:6px;height:6px;border-radius:9999px;background:var(--offline-unknown)}
+.dot.healthy{background:var(--offline-success)}
+.dot.failed{background:var(--offline-critical)}
 .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 a.name{color:inherit;text-decoration:underline;cursor:pointer}
 .state{opacity:.6;font-size:12px}
@@ -196,13 +197,22 @@ var target = __TARGET__;
 var msg = document.getElementById('msg');
 var list = document.getElementById('list');
 function deviceLink(id){ return '/?mesh_device=' + encodeURIComponent(id); }
+function deviceState(d){
+  if (d.online !== true) return d.online === false ? {dot:'failed', text:'Agent offline'} : {dot:'unknown', text:'Unknown'};
+  if (d.upstream_health === 'healthy' && d.available === true) return {dot:'healthy', text:'Healthy'};
+  if (d.upstream_health === 'auth_failed') return {dot:'failed', text:'OpenCode authentication failed'};
+  if (d.upstream_health === 'unreachable') return {dot:'failed', text:'OpenCode unavailable'};
+  if (d.upstream_health === 'unhealthy') return {dot:'failed', text:'OpenCode unhealthy'};
+  return {dot:'unknown', text:'OpenCode status unknown'};
+}
 function render(devices){
   list.textContent = '';
   devices.forEach(function(d){
     var li = document.createElement('li');
-    var dot = document.createElement('span'); dot.className = 'dot' + (d.online ? ' on' : '');
-    var state = document.createElement('span'); state.className = 'state'; state.textContent = d.online ? 'online' : 'offline';
-    if (d.online){
+    var view = deviceState(d);
+    var dot = document.createElement('span'); dot.className = 'dot ' + view.dot;
+    var state = document.createElement('span'); state.className = 'state'; state.textContent = view.text;
+    if (d.available === true){
       // A root-page handoff lets the adapter establish the native Server
       // selection before the V2 entry module starts.
       var link = document.createElement('a');
@@ -230,24 +240,25 @@ function setUnknown(){
 }
 function update(devices){
   render(devices);
-  var anyOnline = devices.some(function(d){ return d.online; });
+  var anyAvailable = devices.some(function(d){ return d.available === true; });
   if (target){
     var targetDevice = null;
     devices.forEach(function(d){ if (d.device_id === target) targetDevice = d; });
     // Reload only when the original target recovers; never auto-switch the page
     // to another device nor replay any operation.
-    if (targetDevice && targetDevice.online){ location.reload(); return; }
+    if (targetDevice && targetDevice.available === true){ location.reload(); return; }
     var name = targetDevice ? (targetDevice.name || target) : target;
-    msg.textContent = anyOnline
-      ? 'Device "' + name + '" is offline; another device is online. Choose it below or wait for this device — the page refreshes automatically.'
-      : 'Device "' + name + '" is offline. This page refreshes automatically.';
+    var targetState = targetDevice ? deviceState(targetDevice).text : 'Unknown';
+    msg.textContent = anyAvailable
+      ? 'Device "' + name + '" is ' + targetState + '; another device is available. Choose it below or wait for this device — the page refreshes automatically.'
+      : 'Device "' + name + '" is ' + targetState + '. This page refreshes automatically.';
     return;
   }
   // No original target: list the realtime state and let the user pick; never
   // claim no device is online while the list shows one.
-  msg.textContent = anyOnline
-    ? 'Choose an online device below to continue.'
-    : 'No device is online. This page refreshes automatically.';
+  msg.textContent = anyAvailable
+    ? 'Choose an available device below to continue.'
+    : 'No device is available. This page refreshes automatically.';
 }
 var fetching = false;
 function tick(){
@@ -313,18 +324,27 @@ class Registry:
             harden_permissions(self.path)
             try:
                 self.devices = json.loads(self.path.read_text()).get("devices", {})
+                for device in self.devices.values():
+                    device.pop("upstream_health", None)
+                    device.pop("upstream_checked", None)
             except Exception:
                 self.devices = {}
 
     def save(self):
-        devices = {key: {k: v for k, v in value.items() if k != "ws"}
+        devices = {key: {k: v for k, v in value.items() if k not in {"ws", "upstream_health", "upstream_checked"}}
                    for key, value in self.devices.items()}
         private_json(self.path, {"devices": devices})
 
     def public(self):
         result = []
         for d in self.devices.values():
-            result.append({k: v for k, v in d.items() if k not in {"auth_token", "ws"}} | {"online": device_online(d)})
+            public = {k: v for k, v in d.items() if k not in {"auth_token", "ws", "upstream_checked"}}
+            online = device_online(d)
+            checked = d.get("upstream_checked")
+            fresh = type(checked) in (int, float) and 0 <= time.monotonic() - checked <= 30
+            health = d.get("upstream_health", "unknown") if fresh else "unknown"
+            result.append(public | {"online": online, "upstream_health": health,
+                                    "available": online and health == "healthy"})
         return result
 
 
@@ -457,6 +477,8 @@ class Gateway:
             await self.cleanup_device(old)
         device["ws"] = ws
         device["last_seen"] = int(time.time())
+        device["upstream_health"] = "unknown"
+        device.pop("upstream_checked", None)
 
     async def cleanup_device(self, ws: WebSocket) -> None:
         """Idempotently clean up requests, streams, P2P answers, and browser bridges held by a control connection."""
@@ -464,6 +486,8 @@ class Gateway:
         for device in self.registry.devices.values():
             if device.get("ws") is ws:
                 device.pop("ws", None)
+                device["upstream_health"] = "unknown"
+                device.pop("upstream_checked", None)
         for request_id, owner in list(self.owners.items()):
             if owner is not ws:
                 continue
@@ -864,10 +888,16 @@ class Gateway:
                     if "text" not in msg:
                         continue
                     item = json.loads(msg["text"])
-                    if item.get("type") == "pong":
+                    if item.get("type") in {"pong", "agent_hello"}:
                         d["last_seen"] = int(time.time())
-                    elif item.get("type") == "agent_hello":
-                        d["last_seen"] = int(time.time())
+                        health = item.get("upstream_health")
+                        age = item.get("upstream_health_age")
+                        if isinstance(health, str) and health in {"unknown", "healthy", "unreachable", "auth_failed", "unhealthy"} and type(age) in (int, float) and 0 <= age <= 30:
+                            d["upstream_health"] = health
+                            d["upstream_checked"] = time.monotonic() - age
+                        else:
+                            d["upstream_health"] = "unknown"
+                            d.pop("upstream_checked", None)
                     elif item.get("type") in {"ws_data", "ws_opened", "ws_closed", "ws_error"}:
                         bridge_id = item.get("id")
                         bridge = self.browser_ws.get(bridge_id)
@@ -933,6 +963,12 @@ class Gateway:
             if not explicit_device and (path == 'api' or path.startswith('api/')):
                 return JSONResponse({"error": "Explicit device required", "reason": "device_required"}, status_code=400)
 
+            if not path and req.method == "GET" and self.wants_html(req) and "mesh_device" in req.query_params:
+                requested = req.query_params["mesh_device"]
+                if not re.fullmatch(r"[A-Za-z0-9_-]+", requested):
+                    return JSONResponse({"error": "Invalid device selection"}, status_code=400)
+                explicit_device = requested
+
             if explicit_device:
                 # An explicitly routed device must never be substituted by another one.
                 d = self.registry.devices.get(explicit_device)
@@ -950,6 +986,16 @@ class Gateway:
                     return self.offline_response(req, None)
                 device_id, d = selected
                 ws = d["ws"]
+            # Only page navigation uses the recovery UI; business requests keep
+            # their original device and transport even if a probe failed.
+            page_navigation = (req.method == "GET" and self.wants_html(req)
+                               and not frontend_asset
+                               and (not path or path == "settings" or path == "new-session"
+                                    or path.startswith(("server/", "session/", "settings/"))))
+            checked = d.get("upstream_checked")
+            if (page_navigation and d.get("upstream_health") in ("unreachable", "auth_failed", "unhealthy")
+                    and type(checked) in (int, float) and 0 <= time.monotonic() - checked <= 30):
+                return self.offline_response(req, device_id, known=True)
             request_id = secrets.token_urlsafe(12)
             body = await req.body()
             if len(body) > request_limit(self.cfg):
@@ -1143,6 +1189,8 @@ class Agent:
         self.ws_queue_overflowed: set[str] = set()
         self.ws_queue_closing: set[str] = set()
         self.control_send_lock = asyncio.Lock()
+        self.upstream_health = "unknown"
+        self.upstream_health_completed = None
         self.routes()
 
     def routes(self):
@@ -1710,12 +1758,49 @@ class Agent:
         while True:
             await asyncio.sleep(interval)
             try:
-                await self.send_control(ws, {"type": "pong"})
+                await self.send_control(ws, self.health_pong())
             except Exception:
                 # Heartbeat timeout/failure: close the connection so run() rebuilds instead of blocking forever.
                 with contextlib.suppress(Exception):
                     await ws.close(code=1011)
                 return
+
+    def health_pong(self) -> dict[str, Any]:
+        age = None if self.upstream_health_completed is None else max(0.0, time.monotonic() - self.upstream_health_completed)
+        return {"type": "pong", "upstream_health": self.upstream_health,
+                "upstream_health_age": age}
+
+    async def upstream_health_worker(self, ws) -> None:
+        """Probe only the local V2 info endpoint; failures never tear down control."""
+        failures = 0
+        basic = self.cfg.get("opencode_basic_auth")
+        auth = httpx.BasicAuth(str(basic["username"]), str(basic.get("password", ""))) if isinstance(basic, dict) and basic.get("username") else None
+        async with httpx.AsyncClient(auth=auth, follow_redirects=False) as client:
+            while True:
+                status = "unhealthy"
+                try:
+                    async with asyncio.timeout(2):
+                        response = await client.get(self.target + "/api/info", timeout=httpx.Timeout(2.0))
+                    if response.status_code in {401, 403}:
+                        status = "auth_failed"
+                    elif 200 <= response.status_code < 300:
+                        payload = response.json()
+                        status = "healthy" if isinstance(payload, dict) and str(payload.get("version", "")).startswith("2.") else "unhealthy"
+                    else:
+                        status = "unhealthy"
+                except (httpx.ConnectError, httpx.TimeoutException, TimeoutError):
+                    status = "unreachable"
+                except Exception:
+                    status = "unhealthy"
+                self.upstream_health_completed = time.monotonic()
+                failures = 0 if status == "healthy" else failures + 1
+                next_status = status if status == "healthy" or failures >= 2 else self.upstream_health
+                changed = next_status != self.upstream_health
+                self.upstream_health = next_status
+                if changed:
+                    with contextlib.suppress(Exception):
+                        await self.send_control(ws, self.health_pong())
+                await asyncio.sleep(5)
 
     async def send_control(self, ws, message: dict[str, Any],
                            timeout: float = CONTROL_SEND_TIMEOUT) -> None:
@@ -1778,9 +1863,12 @@ class Agent:
                     tasks = {}
                     task_kinds = {}
                     await self.reset_p2p_state()
+                    self.upstream_health = "unknown"
+                    self.upstream_health_completed = None
                     heartbeat = asyncio.create_task(self.control_heartbeat(ws))
-                    await self.send_control(ws, {"type": "agent_hello"})
+                    health_worker = asyncio.create_task(self.upstream_health_worker(ws))
                     try:
+                        await self.send_control(ws, self.health_pong() | {"type": "agent_hello"})
                         async for raw in ws:
                             item = json.loads(raw)
                             handler = {"request": self.handle_request, "stream_request": self.local_stream,
@@ -1843,7 +1931,7 @@ class Agent:
                                         completed.exception()
                                 task.add_done_callback(finish_p2p)
                             elif item.get("type") == "ping":
-                                await self.send_control(ws, {"type": "pong"})
+                                await self.send_control(ws, self.health_pong())
                             elif item.get("type") in {"ws_data", "ws_close"}:
                                 bridge_id = item.get("id", "")
                                 if bridge_id in self.ws_queues and not self.enqueue_ws_message(bridge_id, item):
@@ -1856,13 +1944,14 @@ class Agent:
                                                  "error": "WebSocket bridge buffer overflow"}))
                     finally:
                         heartbeat.cancel()
+                        health_worker.cancel()
                         remaining = list(tasks.values())
                         for task in remaining: task.cancel()
-                        await asyncio.gather(*remaining, return_exceptions=True)
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await heartbeat
-                        # Connection dropped/rebuild: close old P2P peers and clear all associated state.
-                        await self.reset_p2p_state()
+                        try:
+                            await asyncio.gather(heartbeat, health_worker, *remaining, return_exceptions=True)
+                        finally:
+                            # Preserve cancellation of run() while cleaning up child tasks.
+                            await self.reset_p2p_state()
             except Exception as exc:
                 attempt += 1
                 delay = backoff_delay(attempt)

@@ -130,9 +130,9 @@ def test_discovery_preserves_native_server_names_and_skips_v1():
     const state={}; const window={__ocmBootstrap:{}}; const renderBar=()=>{};
     const nativeFetch=async url=>{
       if(url==='/_mesh/devices') return Response.json({devices:[
-        {device_id:'device-a',name:'Renamed host',online:true},
-        {device_id:'device-b',name:'Device B',online:true},
-        {device_id:'legacy',name:'legacy',online:true}],default_device:'device-a'});
+        {device_id:'device-a',name:'Renamed host',online:true,upstream_health:'healthy',available:true},
+        {device_id:'device-b',name:'Device B',online:true,upstream_health:'healthy',available:true},
+        {device_id:'legacy',name:'legacy',online:true,upstream_health:'healthy',available:true}],default_device:'device-a'});
       if(url.includes('legacy')) return new Response('<html>V1</html>',{headers:{'content-type':'text/html'}});
       return Response.json({version:'2.0.6'});
     };

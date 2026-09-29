@@ -90,12 +90,15 @@ TRANSPORT_ADAPTER = r"""
   #ocm-device-menu .ocm-device-menu-dot{width:6px;height:6px;flex:0 0 6px;border-radius:9999px;background:var(--ocm-device-unknown,rgba(127,127,127,.65))}
   #ocm-device-menu .ocm-device-menu-dot[data-state="online"]{background:var(--icon-success-base,var(--ocm-device-online,#12c905))}
   #ocm-device-menu .ocm-device-menu-dot[data-state="offline"]{background:var(--icon-critical-base,var(--ocm-device-offline,#fc533a))}
+  #ocm-device-menu .ocm-device-menu-dot[data-state="unavailable"]{background:var(--icon-critical-base,var(--ocm-device-offline,#fc533a))}
   @media (prefers-color-scheme:light){:root{--ocm-device-online:#7add71;--ocm-device-offline:#ed4831}}
   :root[data-color-scheme="light"]{--ocm-device-online:#7add71;--ocm-device-offline:#ed4831}
   :root[data-color-scheme="dark"]{--ocm-device-online:#12c905;--ocm-device-offline:#fc533a}
   #ocm-mesh-bar .ocm-transport{margin-left:auto;display:flex;align-items:center;gap:6px;color:var(--v2-text-text-base)}
   #ocm-mesh-bar .ocm-dot{width:6px;height:6px;border-radius:9999px;background:var(--icon-success-base,var(--ocm-device-online,#12c905))}
   #ocm-mesh-bar .ocm-dot[data-kind="relay"]{background:#3b82f6}
+  #ocm-mesh-bar .ocm-dot[data-health="unknown"]{background:var(--ocm-device-unknown,rgba(127,127,127,.65))}
+  #ocm-mesh-bar .ocm-dot[data-health="unavailable"],#ocm-mesh-bar .ocm-dot[data-health="offline"]{background:var(--icon-critical-base,var(--ocm-device-offline,#fc533a))}
   #root{height:calc(100dvh - 36px)}
   `;
 
@@ -138,7 +141,8 @@ TRANSPORT_ADAPTER = r"""
     return bar;
   }
 
-  let deviceMenu = { open: false, generation: 0, controller: null, timer: null, devices: [], hasRenderedDevices: false, renderedCurrentDeviceId: undefined };
+  let deviceMenu = { open: false, generation: 0, timer: null, devices: [], hasRenderedDevices: false, renderedCurrentDeviceId: undefined };
+  let deviceStatus = { request: null, timer: null };
 
   function deviceMenuButton() { return ensureBar()?.querySelector('.ocm-device-menu-button'); }
 
@@ -146,8 +150,6 @@ TRANSPORT_ADAPTER = r"""
     if (!deviceMenu.open) return;
     deviceMenu.open = false;
     deviceMenu.generation += 1;
-    deviceMenu.controller?.abort();
-    deviceMenu.controller = null;
     clearTimeout(deviceMenu.timer);
     deviceMenu.timer = null;
     document.getElementById('ocm-device-menu')?.remove();
@@ -220,19 +222,25 @@ TRANSPORT_ADAPTER = r"""
         row.setAttribute('role', 'menuitem');
         row.dataset.ocmDeviceId = item.device_id;
         const online = item.online === true;
-        row.disabled = !online;
+        const health = item.upstream_health || 'unknown';
+        const available = item.available === true;
+        row.disabled = !available;
         if (item.device_id === current) row.setAttribute('aria-current', 'true');
         const dot = document.createElement('span');
         dot.className = 'ocm-device-menu-dot';
-        dot.dataset.state = online ? 'online' : item.online === false ? 'offline' : 'unknown';
+        dot.dataset.state = available ? 'online' : online ? (health === 'unknown' ? 'unknown' : 'unavailable') : item.online === false ? 'offline' : 'unknown';
         const name = document.createElement('span');
         name.className = 'ocm-device-menu-name';
         name.textContent = item.name || item.device_id || 'Unnamed device';
         const status = document.createElement('span');
         status.className = 'ocm-device-menu-status';
-        status.textContent = online ? 'Online' : item.online === false ? 'Offline' : 'Unknown';
+        status.textContent = !online ? (item.online === false ? 'Agent offline' : 'Unknown')
+          : health === 'healthy' ? 'Healthy'
+            : health === 'auth_failed' ? 'OpenCode authentication failed'
+              : health === 'unreachable' ? 'OpenCode unavailable'
+                : health === 'unhealthy' ? 'OpenCode unhealthy' : 'OpenCode status unknown';
         row.append(dot, name, status);
-        if (online) row.addEventListener('click', () => {
+        if (available) row.addEventListener('click', () => {
           if (row.disabled) return;
           closeDeviceMenu();
           location.assign('/?mesh_device=' + encodeURIComponent(item.device_id));
@@ -259,43 +267,83 @@ TRANSPORT_ADAPTER = r"""
     }, 5000);
   }
 
+  function scheduleDeviceStatusRefresh() {
+    if (deviceStatus.timer) return;
+    deviceStatus.timer = setTimeout(() => {
+      deviceStatus.timer = null;
+      if (deviceMenu.open) { scheduleDeviceStatusRefresh(); return; }
+      refreshDeviceStatus().catch(() => {}).finally(scheduleDeviceStatusRefresh);
+    }, 5000);
+  }
+
   function sameDeviceMenuDevices(previous, next) {
     return previous.length === next.length && previous.every((device, index) => {
       const updated = next[index];
-      return updated && device.device_id === updated.device_id && device.name === updated.name && device.online === updated.online;
+      return updated && device.device_id === updated.device_id && device.name === updated.name && device.online === updated.online
+        && device.upstream_health === updated.upstream_health && device.available === updated.available;
     });
   }
 
-  async function refreshDeviceMenu(generation = deviceMenu.generation) {
-    if (!deviceMenu.open || generation !== deviceMenu.generation || deviceMenu.controller) return;
+  function setDeviceStatusUnknown() {
+    state.devices = state.devices.map(device => ({ ...device, upstream_health: 'unknown', available: false }));
+    renderBar();
+  }
+
+  async function refreshDeviceStatus(menuGeneration) {
+    if (deviceStatus.request) {
+      // A menu reopened after its own request was cancelled must not render that
+      // stale response. Background and current-menu callers share the request.
+      if (menuGeneration !== undefined && deviceStatus.request.menuGeneration !== undefined
+          && deviceStatus.request.menuGeneration !== menuGeneration) {
+        deviceStatus.request.controller.abort();
+        deviceStatus.request = null;
+      } else return deviceStatus.request.promise;
+    }
     const controller = new AbortController();
-    deviceMenu.controller = controller;
+    const request = { controller, menuGeneration, promise: null };
+    deviceStatus.request = request;
     let rejectDeadline;
     const deadlineExpired = new Promise((_, reject) => { rejectDeadline = reject; });
     const deadline = setTimeout(() => {
       controller.abort();
       rejectDeadline(new Error('Mesh device discovery timed out'));
     }, 10000);
+    request.promise = (async () => {
+      try {
+        const response = await Promise.race([nativeFetch('/_mesh/devices', { credentials: 'same-origin', cache: 'no-store', signal: controller.signal }), deadlineExpired]);
+        if (!response.ok) throw new Error('Mesh device discovery failed: ' + response.status);
+        const payload = await Promise.race([response.json(), deadlineExpired]);
+        if (deviceStatus.request !== request) return;
+        state.devices = Array.isArray(payload.devices) ? payload.devices : [];
+        renderBar();
+      } catch (error) {
+        if (deviceStatus.request === request) setDeviceStatusUnknown();
+        throw error;
+      } finally {
+        clearTimeout(deadline);
+        if (deviceStatus.request === request) deviceStatus.request = null;
+      }
+    })();
+    return request.promise;
+  }
+
+  async function refreshDeviceMenu(generation = deviceMenu.generation) {
+    if (!deviceMenu.open || generation !== deviceMenu.generation) return;
     if (!deviceMenu.hasRenderedDevices) renderDeviceMenu('loading');
     try {
-      const response = await Promise.race([nativeFetch('/_mesh/devices', { credentials: 'same-origin', cache: 'no-store', signal: controller.signal }), deadlineExpired]);
-      if (!response.ok) throw new Error('Mesh device discovery failed: ' + response.status);
-      const payload = await Promise.race([response.json(), deadlineExpired]);
-      if (!deviceMenu.open || generation !== deviceMenu.generation || deviceMenu.controller !== controller) return;
-      const devices = Array.isArray(payload.devices) ? payload.devices : [];
+      await refreshDeviceStatus(generation);
+      if (!deviceMenu.open || generation !== deviceMenu.generation) return;
+      const devices = state.devices;
       if (!deviceMenu.hasRenderedDevices || deviceMenu.renderedCurrentDeviceId !== activeDeviceId() || !sameDeviceMenuDevices(deviceMenu.devices, devices)) {
         deviceMenu.devices = devices;
         renderDeviceMenu();
       }
       scheduleDeviceMenuRefresh(generation);
     } catch (_) {
-      if (!deviceMenu.open || generation !== deviceMenu.generation || deviceMenu.controller !== controller) return;
+      if (!deviceMenu.open || generation !== deviceMenu.generation) return;
       deviceMenu.devices = [];
       renderDeviceMenu('error');
       scheduleDeviceMenuRefresh(generation);
-    } finally {
-      clearTimeout(deadline);
-      if (deviceMenu.controller === controller) deviceMenu.controller = null;
     }
   }
 
@@ -323,7 +371,17 @@ TRANSPORT_ADAPTER = r"""
     const routeId = currentDeviceId();
     const id = routeId || (state.manifest && state.manifest.device_id) || state.defaultDevice;
     const device = state.devices.find(item => item.device_id === id);
-    return { name: (device && device.name) || id || 'no device', online: device ? !!device.online : undefined };
+    return { name: (device && device.name) || id || 'no device', online: device ? !!device.online : undefined,
+      health: device?.upstream_health || 'unknown', available: device?.available === true };
+  }
+
+  function deviceHealthInfo(info) {
+    if (info.online === false) return { state: 'offline', label: 'Agent offline' };
+    if (info.available && info.health === 'healthy') return { state: 'healthy', label: 'OpenCode healthy' };
+    if (info.health === 'auth_failed') return { state: 'unavailable', label: 'OpenCode authentication failed' };
+    if (info.health === 'unreachable') return { state: 'unavailable', label: 'OpenCode unavailable' };
+    if (info.health === 'unhealthy') return { state: 'unavailable', label: 'OpenCode unhealthy' };
+    return { state: 'unknown', label: 'OpenCode status unknown' };
   }
 
   function transportInfo() {
@@ -357,12 +415,17 @@ TRANSPORT_ADAPTER = r"""
     const bar = ensureBar();
     if (!bar) return;
     const info = currentDeviceInfo();
+    const health = deviceHealthInfo(info);
     const transport = transportInfo();
     const device = bar.querySelector('.ocm-device-menu-button');
     device.querySelector('.ocm-device-menu-label').textContent = info.name;
     device.dataset.offline = String(info.online === false);
+    device.dataset.health = health.state;
+    device.setAttribute('title', health.label);
+    device.setAttribute('aria-label', info.name + ': ' + health.label);
+    const transportLabel = health.state === 'healthy' ? transport.label : health.label + ' · ' + transport.label;
     bar.querySelector('.ocm-transport').innerHTML =
-      '<span class="ocm-dot" data-kind="' + transport.kind + '"></span><span>' + transport.label + '</span>';
+      '<span class="ocm-dot" data-kind="' + transport.kind + '" data-health="' + health.state + '"></span><span title="' + health.label + '">' + transportLabel + '</span>';
   }
 
   const requestPath = input => {
@@ -454,11 +517,11 @@ TRANSPORT_ADAPTER = r"""
       const response = await nativeFetch('/_mesh/devices', { credentials: 'same-origin', signal: AbortSignal.timeout(10000) });
       if (!response.ok) throw new Error('Mesh device discovery failed: ' + response.status);
       const payload = await response.json();
-      state.devices = Array.isArray(payload.devices) ? payload.devices : [];
-      state.defaultDevice = payload.default_device || null;
-      renderBar();
+       state.devices = Array.isArray(payload.devices) ? payload.devices : [];
+       state.defaultDevice = payload.default_device || null;
+       renderBar();
       const unsupported = new Set();
-      const devices = (await Promise.all(state.devices.filter(device => device.online).map(async device => {
+       const devices = (await Promise.all(state.devices.filter(device => device.available === true).map(async device => {
         try {
           const info = await nativeFetch(serverTabUrl(device.device_id) + '/api/info', {
             credentials: 'same-origin', signal: AbortSignal.timeout(5000)
@@ -474,10 +537,10 @@ TRANSPORT_ADAPTER = r"""
       // An explicit click is not a preference: keeping the query and retrying is
       // safer than silently opening another device when discovery, reachability,
       // or the V2 probe has not confirmed the requested target.
-      if (handoffDevice && (!requested || !requested.online || !devices.some(device => device.device_id === handoffDevice))) {
+       if (handoffDevice && (!requested || requested.available !== true || !devices.some(device => device.device_id === handoffDevice))) {
         throw new Error('Requested device handoff is unavailable or not an OpenCode V2 server');
       }
-      const primary = requested || state.devices.find(device => device.device_id === payload.configured_default_device)
+       const primary = requested || state.devices.find(device => device.available === true && device.device_id === payload.configured_default_device)
         || devices.find(device => device.device_id === payload.default_device) || devices[0];
       if (!primary) throw new Error('No OpenCode V2 device available');
       if (unsupported.has(primary.device_id)) {
@@ -498,7 +561,7 @@ TRANSPORT_ADAPTER = r"""
       localStorage.setItem('opencode.global.dat:server', JSON.stringify(store));
       const defaultKey = 'opencode.settings.dat:defaultServerUrl';
       const previous = localStorage.getItem(defaultKey);
-      const initial = primary.online ? primary : devices.find(device => device.device_id === payload.default_device) || devices[0] || primary;
+       const initial = primary;
       if (!previous || previous.replace(/\/+$/, '') === location.origin) localStorage.setItem(defaultKey, serverTabUrl(initial.device_id));
       const layout = readJson('opencode.global.dat:layout', {});
       if (handoffDevice || layout.home?.selection?.server?.replace(/\/+$/, '') === location.origin) {
@@ -1401,6 +1464,7 @@ TRANSPORT_ADAPTER = r"""
   window.__ocmTransport = state;
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', renderBar, { once: true });
   else renderBar();
+  scheduleDeviceStatusRefresh();
   let relayTick = 0;
   setInterval(() => { reconnectForDevice(); renderBar(); if (++relayTick % 5 === 0) measureRelayRtt(); }, 2000);
   setTimeout(measureRelayRtt, 1500);

@@ -9,6 +9,14 @@ Gateway 与 Agent 使用一条长期 WebSocket 控制连接。浏览器请求可
 - Agent 控制连接使用 `X-Mesh-Agent-Token`，不把 token 放进 URL query。
 - Agent 断线后按有界指数退避重新注册和连接；Gateway 不把失效控制连接显示为在线。
 
+## 上游健康报告
+
+Agent 在独立循环中探测本机 OpenCode 的 `/api/info`，完成后间隔 5 秒进行下一次，单次总期限 2 秒，不跟随重定向；连续两次失败才转为失败状态，一次成功恢复 healthy。如本机配置了 Basic Auth，探测使用该认证，但认证信息不进入控制消息或设备公开状态。结果通过 `agent_hello` 和 `pong` 的 `upstream_health`、`upstream_health_age` 上报；状态变化立即上报，15 秒心跳携带最近结果的实际年龄，不会把旧结果重新算作刚探测成功。
+
+`upstream_health` 为运行时状态：`unknown` 表示没有可接受的近期报告，`healthy` 表示探测到兼容的 OpenCode V2，`unreachable` 表示连接或超时失败，`auth_failed` 表示本机上游认证被拒绝，`unhealthy` 表示其余非健康响应。Gateway 只接受 0～30 秒的数值年龄（不含布尔值），以自己的单调时钟换算检查时间；检查时间超过 30 秒或报告格式无效时降为 `unknown`。该状态不持久化，Agent 重连后从 `unknown` 重新开始。
+
+设备控制连接的 `online` 与上游健康分离：`available` 仅在 `online` 且 `upstream_health=healthy` 时为真。健康探测失败不会关闭 Agent 控制连接，不对 HTTP、SSE、WebSocket 或 P2P 路由进行 fail-fast，也不会触发请求重放。
+
 ## 控制消息
 
 控制消息是 JSON 对象，常见类型如下：

@@ -4,6 +4,15 @@
 
 ## 1. 先确认事实来源
 
+### 上游 OpenCode 健康探测（2026-09-29，已验证，待部署）
+
+- 目标：区分 Mesh Agent 控制在线与本机 OpenCode 可用；保留原设备、身份及业务传输，不因探测失败重放请求或关闭控制连接。
+- Agent 独立探测 `/api/info`，完成后等待 5 秒，单次总期限 2 秒；连续两次失败后标记不可用，一次成功恢复。结果变化与心跳均携带健康状态及单调时钟年龄，Gateway 以 30 秒新鲜度计算 `upstream_health`、`available`；`online` 仍指控制连接。健康数据不持久化。
+- 菜单和顶部状态定期刷新；离线页区分 Agent offline、OpenCode unavailable/authentication failed、unknown。页面入口遇到新鲜明确失败时返回原目标恢复页；首页手动 handoff 选择页面来源，API/POST 转发保持原语义。
+- 回归覆盖探测认证、错误分类、两失败一恢复、总超时、健康字段类型、age、持久化隔离、控制 ping/hello 清理、HTML 入口与跨设备 handoff。修正了旧测试把第一次超时当成最终不可用的错误预期，以及测试协程尚未启动便取消时误要求执行 finally 的问题。
+- 浏览器人工验收待用户操作：先停止/恢复 OpenCode（Agent 保持运行），再停止/恢复对应 Agent，分开观察状态与恢复。本轮尚未主动停服进行故障复现；Android APK 不重打包。
+- 验证：全套 pytest **352 passed, 1 skipped**；跳过项为 Android API-35 `android.jar` 缺失。JavaScript 语法与 `git diff --check` 通过；部署后再记录服务和健康 API 证据，单元测试不等于浏览器停服验收。
+
 | 问题 | 权威来源 |
 |---|---|
 | 当前工作区、改动和提交 | `git status`、`git log`、实际 diff |

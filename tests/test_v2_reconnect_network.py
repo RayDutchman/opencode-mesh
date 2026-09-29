@@ -424,7 +424,7 @@ def test_valid_handoff_starts_ui_before_stalled_p2p_and_uses_bounded_relay_wait(
 storage.set('opencode.global.dat:layout', JSON.stringify({home:{selection:{server:'https://mesh.test/_mesh/device/device-a'}}}));
 global.location = {origin:'https://mesh.test',host:'mesh.test',pathname:'/',search:'?mesh_device=device-b',hash:'',href:'https://mesh.test/?mesh_device=device-b'};
 global.history = {state:null,pushState(){},replaceState(state,title,path){location.href=location.origin+path;location.search=new URL(location.href).search;}};
-global.DISCOVERY_RESPONSES = [{configured_default_device:'device-a',default_device:'device-a',devices:[{device_id:'device-a',online:true},{device_id:'device-b',online:true}]}];
+global.DISCOVERY_RESPONSES = [{configured_default_device:'device-a',default_device:'device-a',devices:[{device_id:'device-a',online:true,upstream_health:'healthy',available:true},{device_id:'device-b',online:true,upstream_health:'healthy',available:true}]}];
 global.MANIFEST_BEHAVIOR = 'ok-hang';
 """
     body = FINISHER + r"""
@@ -459,7 +459,7 @@ storage.set('opencode.global.dat:layout', JSON.stringify({ home: { selection: { 
 global.location = { origin: 'https://mesh.test', host: 'mesh.test', pathname: '/', search: '?mesh_device=device-b&keep=yes', hash: '#handoff', href: 'https://mesh.test/?mesh_device=device-b&keep=yes#handoff' };
 global.history = { state: null, pushState() {}, replaceState(state, title, path) { this.replaced = path; const next = new URL(path, location.origin); location.pathname = next.pathname; location.search = next.search; location.hash = next.hash; location.href = location.origin + path; } };
 global.DISCOVERY_RESPONSES = [{ configured_default_device: 'device-a', default_device: 'device-a', devices: [
-  { device_id: 'device-a', online: true }, { device_id: 'device-b', online: true },
+  { device_id: 'device-a', online: true, upstream_health: 'healthy', available: true }, { device_id: 'device-b', online: true, upstream_health: 'healthy', available: true },
 ] }];
 global.MANIFEST_BEHAVIOR = 'p2p-disabled';
 """
@@ -481,9 +481,9 @@ global.MANIFEST_BEHAVIOR = 'p2p-disabled';
 
 
 @pytest.mark.parametrize('first_devices, versions', [
-    ("[{ device_id: 'device-a', online: true }]", '{}'),
-    ("[{ device_id: 'device-a', online: true }, { device_id: 'device-b', online: false }]", '{}'),
-    ("[{ device_id: 'device-a', online: true }, { device_id: 'device-b', online: true }]", "{ 'device-b': '1.9.0' }"),
+    ("[{ device_id: 'device-a', online: true, upstream_health: 'healthy', available: true }]", '{}'),
+    ("[{ device_id: 'device-a', online: true, upstream_health: 'healthy', available: true }, { device_id: 'device-b', online: false, upstream_health: 'unknown', available: false }]", '{}'),
+    ("[{ device_id: 'device-a', online: true, upstream_health: 'healthy', available: true }, { device_id: 'device-b', online: true, upstream_health: 'healthy', available: true }]", "{ 'device-b': '1.9.0' }"),
 ])
 def test_root_handoff_retry_keeps_unverified_target_isolated_until_it_becomes_online_v2(first_devices, versions):
     """Absent, offline, or incompatible handoffs never start the old default transport."""
@@ -496,7 +496,7 @@ global.location = { origin: 'https://mesh.test', host: 'mesh.test', pathname: '/
 global.history = { state: null, pushState() {}, replaceState(state, title, path) { this.replaced = path; const next = new URL(path, location.origin); location.pathname = next.pathname; location.search = next.search; location.hash = next.hash; location.href = location.origin + path; } };
 global.DISCOVERY_RESPONSES = [
   { configured_default_device: 'device-a', default_device: 'device-a', devices: __FIRST_DEVICES__ },
-  { configured_default_device: 'device-a', default_device: 'device-a', devices: [{ device_id: 'device-a', online: true }, { device_id: 'device-b', online: true }] },
+  { configured_default_device: 'device-a', default_device: 'device-a', devices: [{ device_id: 'device-a', online: true, upstream_health: 'healthy', available: true }, { device_id: 'device-b', online: true, upstream_health: 'healthy', available: true }] },
 ];
 global.INFO_VERSIONS = __VERSIONS__;
 global.MANIFEST_BEHAVIOR = 'p2p-disabled';

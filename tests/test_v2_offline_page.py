@@ -279,6 +279,11 @@ global.document = {
 const reloads = [];
 global.location = { origin: 'https://mesh.test', host: 'mesh.test', reload: () => reloads.push(__now) };
 const fetchCalls = [];
+const devicePayload = data => data && Array.isArray(data.devices) ? ({...data, devices:data.devices.map(device => ({
+  ...device,
+  upstream_health:device.upstream_health || (device.online ? 'healthy' : 'unknown'),
+  available:device.available ?? device.online,
+}))}) : data;
 global.fetch = (url, init) => {
   fetchCalls.push({ url: String(url), cache: init && init.cache, signal: init && init.signal });
   const next = scripted.shift();
@@ -288,9 +293,9 @@ global.fetch = (url, init) => {
   if (next && typeof next.delay === 'number') {
     // A poll that settles after the 10s deadline: the response arrives late and
     // must be discarded instead of overwriting the unknown state.
-    return new Promise(resolve => setTimeout(() => resolve({ ok: true, json: () => Promise.resolve(next.body) }), next.delay));
+    return new Promise(resolve => setTimeout(() => resolve({ ok: true, json: () => Promise.resolve(devicePayload(next.body)) }), next.delay));
   }
-  return Promise.resolve({ ok: true, json: () => Promise.resolve(next) });
+  return Promise.resolve({ ok: true, json: () => Promise.resolve(devicePayload(next)) });
 };
 const getMsg = () => nodes.msg.textContent;
 const getRows = () => nodes.list.children;
@@ -343,7 +348,7 @@ def test_offline_page_storage_error_keeps_polling_with_system_theme_fallback():
   await flush();
   assert.equal(document.documentElement.dataset.colorScheme || null, null);
   assert.equal(fetchCalls.length, 1, 'storage errors do not block polling');
-  assert.equal(getMsg(), 'No device is online. This page refreshes automatically.');
+  assert.equal(getMsg(), 'No device is available. This page refreshes automatically.');
   completed = true;
 })().catch(e => { console.error(e); process.exitCode = 1; });
 """
@@ -351,8 +356,8 @@ def test_offline_page_storage_error_keeps_polling_with_system_theme_fallback():
 
 
 def test_offline_page_status_dot_tokens_match_opencode_v2018():
-    assert '.dot{width:6px;height:6px;border-radius:9999px;background:var(--offline-critical)}' in OFFLINE_PAGE
-    assert '.dot.on{background:var(--offline-success)}' in OFFLINE_PAGE
+    assert '.dot{width:6px;height:6px;border-radius:9999px;background:var(--offline-unknown)}' in OFFLINE_PAGE
+    assert '.dot.healthy{background:var(--offline-success)}' in OFFLINE_PAGE
     assert '--offline-success:#7add71' in OFFLINE_PAGE
     assert '--offline-critical:#ed4831' in OFFLINE_PAGE
     assert '--offline-success:#12c905' in OFFLINE_PAGE
@@ -377,16 +382,16 @@ def test_offline_page_names_target_and_lists_online_switch_without_reload():
     body = FINISHER + r"""
   await flush();
   assert.equal(reloads.length, 0, 'target offline: no reload');
-  assert.ok(getMsg().startsWith('Device "Alpha" is offline'), 'target name shown verbatim');
-  assert.ok(getMsg().includes('another device is online'), 'no misleading no-device claim');
+  assert.ok(getMsg().startsWith('Device "Alpha" is Agent offline'), 'target name shown verbatim');
+  assert.ok(getMsg().includes('another device is available'), 'no misleading no-device claim');
   assert.ok(!getMsg().includes('No device is online'), 'online device exists');
   assert.equal(fetchCalls[0].cache, 'no-store', 'device list polling stays no-store');
   assert.equal(getLinks().length, 1, 'only the online device is a switch entry');
   assert.equal(getLinks()[0].href, '/?mesh_device=device-b');
   assert.equal(getLinks()[0].textContent, 'Beta');
   const rowsText = getRows().map(li => li.children.map(c => c.textContent).join('|')).join('\n');
-  assert.ok(rowsText.includes('Alpha') && rowsText.includes('offline'), 'offline target listed');
-  assert.ok(rowsText.includes('Beta') && rowsText.includes('online'), 'online device listed');
+  assert.ok(rowsText.includes('Alpha') && rowsText.includes('Agent offline'), 'offline target listed');
+  assert.ok(rowsText.includes('Beta') && rowsText.includes('Healthy'), 'online device listed');
   completed = true;
 })().then(() => { completed = true; }).catch(e => { completed = true; console.error(e); process.exitCode = 1; });
 """
@@ -399,16 +404,16 @@ def test_offline_page_names_target_and_lists_online_switch_without_reload():
 def test_offline_page_reloads_only_when_target_recovers():
     body = FINISHER + r"""
   await flush();
-  assert.equal(reloads.length, 0, 'no reload while the target is offline');
+  assert.equal(reloads.length, 0, 'no reload while the target upstream is unavailable');
   advance(3000); await flush(); await flush();
   assert.equal(reloads.length, 1, 'target recovery reloads exactly once');
   completed = true;
 })().then(() => { completed = true; }).catch(e => { completed = true; console.error(e); process.exitCode = 1; });
 """
     run_offline('device-a', [
-        {'devices': [{'device_id': 'device-a', 'name': 'Alpha', 'online': False},
+        {'devices': [{'device_id': 'device-a', 'name': 'Alpha', 'online': True, 'upstream_health': 'unreachable', 'available': False},
                      {'device_id': 'device-b', 'name': 'Beta', 'online': True}]},
-        {'devices': [{'device_id': 'device-a', 'name': 'Alpha', 'online': True},
+        {'devices': [{'device_id': 'device-a', 'name': 'Alpha', 'online': True, 'upstream_health': 'healthy', 'available': True},
                      {'device_id': 'device-b', 'name': 'Beta', 'online': True}]},
     ], body)
 
@@ -416,10 +421,10 @@ def test_offline_page_reloads_only_when_target_recovers():
 def test_offline_page_without_target_lists_online_device_but_never_reloads():
     body = FINISHER + r"""
   await flush();
-  assert.equal(getMsg(), 'No device is online. This page refreshes automatically.');
+  assert.equal(getMsg(), 'No device is available. This page refreshes automatically.');
   assert.equal(reloads.length, 0);
   advance(3000); await flush(); await flush();
-  assert.equal(getMsg(), 'Choose an online device below to continue.', 'online device must not be hidden');
+  assert.equal(getMsg(), 'Choose an available device below to continue.', 'online device must not be hidden');
   assert.ok(!getMsg().includes('No device is online'), 'no misleading claim while one device is online');
   assert.equal(reloads.length, 0, 'no target: never auto-reload/auto-switch');
   assert.equal(getLinks().length, 1);
@@ -453,7 +458,7 @@ def test_offline_page_names_are_safe_text_for_known_and_unknown_devices():
     # An unknown target id is shown verbatim and safely.
     body = FINISHER + r"""
   await flush();
-  assert.ok(getMsg().startsWith('Device "unknown-dev" is offline'));
+  assert.ok(getMsg().startsWith('Device "unknown-dev" is Unknown'));
   assert.equal(globalThis.__xss, undefined);
   assert.equal(getLinks().length, 1, 'unknown target does not hide the online entry point');
   completed = true;
@@ -470,15 +475,15 @@ def test_offline_page_poll_failure_expresses_unknown_and_recovers():
   assert.equal(getLinks().length, 1, 'fresh poll shows the online green entry');
   advance(3000); await flush(); await flush();
   assert.equal(getMsg(), 'Cannot reach the device list; status is unknown. This page keeps retrying automatically.');
-  assert.ok(!getCells().some(el => String(el.className).includes(' on')), 'stale green dot must not persist');
+  assert.ok(!getCells().some(el => String(el.className).includes(' healthy')), 'stale green dot must not persist');
   assert.equal(getRows()[0].children[0].textContent, 'Status unknown — retrying');
   assert.equal(reloads.length, 0, 'unknown state must not fake a target recovery');
   advance(3000); await flush(); await flush();
   assert.equal(getMsg(), 'Cannot reach the device list; status is unknown. This page keeps retrying automatically.');
   advance(3000); await flush(); await flush();
-  assert.ok(getMsg().startsWith('Device "Alpha" is offline'), 'a successful poll recovers the live state');
+  assert.ok(getMsg().startsWith('Device "Alpha" is Agent offline'), 'a successful poll recovers the live state');
   assert.equal(getLinks().length, 1, 'recovered online entry point is back');
-  assert.ok(getCells().some(el => String(el.className).includes(' on')), 'green dot restored on recovery');
+  assert.ok(getCells().some(el => String(el.className).includes(' healthy')), 'green dot restored on recovery');
   completed = true;
 })().then(() => { completed = true; }).catch(e => { completed = true; console.error(e); process.exitCode = 1; });
 """
@@ -500,14 +505,14 @@ def test_offline_page_aborts_a_hung_poll_and_recovers_on_the_next_round():
   assert.equal(fetchCalls[0].signal.aborted, true, 'the 10s deadline aborts the hung request');
   assert.equal(getMsg(), 'Cannot reach the device list; status is unknown. This page keeps retrying automatically.');
   assert.equal(getRows()[0].children[0].textContent, 'Status unknown — retrying');
-  assert.ok(!getCells().some(el => String(el.className).includes(' on')), 'no dots kept from a hung poll');
+  assert.ok(!getCells().some(el => String(el.className).includes(' healthy')), 'no dots kept from a hung poll');
   assert.equal(reloads.length, 0, 'unknown state is not a fake recovery');
   assert.equal(fetchCalls.length, 1, 'the guard blocked retries while the poll hung');
   advance(2000); await flush(); await flush(); await flush();
   assert.equal(fetchCalls.length, 2, 'after the abort the next round retries');
-  assert.ok(getMsg().startsWith('Device "Alpha" is offline'), 'the next round after the abort recovers');
+  assert.ok(getMsg().startsWith('Device "Alpha" is Agent offline'), 'the next round after the abort recovers');
   assert.equal(getLinks().length, 1);
-  assert.ok(getCells().some(el => String(el.className).includes(' on')), 'fresh data restores the green dot');
+  assert.ok(getCells().some(el => String(el.className).includes(' healthy')), 'fresh data restores the green dot');
   assert.equal(reloads.length, 0);
   completed = true;
 })().then(() => { completed = true; }).catch(e => { completed = true; console.error(e); process.exitCode = 1; });
@@ -530,14 +535,14 @@ def test_offline_page_discards_a_stale_late_response_after_the_deadline():
   assert.equal(getMsg(), 'Cannot reach the device list; status is unknown. This page keeps retrying automatically.');
   assert.ok(!getMsg().includes('BETA-STALE'), 'the late response must not overwrite the unknown state');
   assert.ok(!getCells().some(el => el.textContent === 'BETA-STALE'), 'the stale row must not render');
-  assert.ok(!getCells().some(el => String(el.className).includes(' on')), 'no stale green dot');
+  assert.ok(!getCells().some(el => String(el.className).includes(' healthy')), 'no stale green dot');
   assert.equal(reloads.length, 0);
   // The second poll expires at 22s; the next scheduled poll starts at 24s.
   advance(12000); await flush(); await flush(); await flush();
-  assert.ok(getMsg().startsWith('Device "Alpha" is offline'), 'a fresh poll recovers after the discard');
+  assert.ok(getMsg().startsWith('Device "Alpha" is Agent offline'), 'a fresh poll recovers after the discard');
   assert.ok(getCells().some(el => el.textContent === 'BETA-FRESH'), 'the fresh data rendered');
   assert.ok(!getCells().some(el => el.textContent === 'BETA-STALE'), 'the stale body never rendered');
-  assert.ok(getCells().some(el => String(el.className).includes(' on')), 'only fresh data carries the green dot');
+  assert.ok(getCells().some(el => String(el.className).includes(' healthy')), 'only fresh data carries the green dot');
   assert.equal(reloads.length, 0);
   completed = true;
 })().then(() => { completed = true; }).catch(e => { completed = true; console.error(e); process.exitCode = 1; });
