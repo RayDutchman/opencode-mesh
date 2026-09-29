@@ -31,7 +31,7 @@ Gateway 提供页面、设备发现和 WebRTC 信令。直连建立后，消息�
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | \
-  MESH_VERSION=v0.3.1 bash -s -- agent
+  MESH_VERSION=v0.3.2 bash -s -- agent
 ```
 
 安装完成后会打印实际运行版本。升级时修改 `MESH_VERSION` 后重新执行安装；需要回滚时指定较早的 tag。版本号的唯一来源是 `src/__init__.py`，发布前需同步创建对应的 Git tag。
@@ -104,8 +104,8 @@ bash -c 'curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/
 统一使用 Git tag 或 commit 部署，无需逐个同步 Python 文件：
 
 ```bash
-bash scripts/upgrade.sh root@your-vps /root/opencode-mesh gateway system v0.3.1
-bash scripts/upgrade.sh user@device /home/user/.local/share/opencode-mesh agent user v0.3.1
+bash scripts/upgrade.sh root@your-vps /root/opencode-mesh gateway system v0.3.2
+bash scripts/upgrade.sh user@device /home/user/.local/share/opencode-mesh agent user v0.3.2
 # 本机以 Git 工作区运行的 Agent：工作区须干净，且 HEAD 与部署 ref 一致
 bash scripts/upgrade.sh local "$PWD" agent user HEAD
 ```

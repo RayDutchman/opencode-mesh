@@ -133,7 +133,7 @@ TRANSPORT_ADAPTER = r"""
     return bar;
   }
 
-  let deviceMenu = { open: false, generation: 0, controller: null, timer: null, devices: [] };
+  let deviceMenu = { open: false, generation: 0, controller: null, timer: null, devices: [], hasRenderedDevices: false, renderedCurrentDeviceId: undefined };
 
   function deviceMenuButton() { return ensureBar()?.querySelector('.ocm-device-menu-button'); }
 
@@ -206,6 +206,8 @@ TRANSPORT_ADAPTER = r"""
       children.push(message);
     } else {
       const current = activeDeviceId();
+      deviceMenu.hasRenderedDevices = true;
+      deviceMenu.renderedCurrentDeviceId = current;
       for (const item of deviceMenu.devices) {
         const row = document.createElement('button');
         row.type = 'button';
@@ -233,6 +235,10 @@ TRANSPORT_ADAPTER = r"""
         children.push(row);
       }
     }
+    if (kind !== 'devices') {
+      deviceMenu.hasRenderedDevices = false;
+      deviceMenu.renderedCurrentDeviceId = undefined;
+    }
     panel.replaceChildren(...children);
     positionDeviceMenu(panel);
     if (focusedDeviceId) {
@@ -241,27 +247,18 @@ TRANSPORT_ADAPTER = r"""
     }
   }
 
-  function markDeviceMenuRefreshing() {
-    const panel = document.getElementById('ocm-device-menu');
-    if (!panel) return;
-    // Disabling a focused button blurs it in real browsers. Park focus on the
-    // stable panel and restore the device only if the user has not moved away.
-    if (panel.contains(document.activeElement) && document.activeElement?.dataset?.ocmDeviceId) {
-      panel.dataset.focusDeviceId = document.activeElement.dataset.ocmDeviceId;
-      panel.focus();
-    }
-    for (const row of panel.querySelectorAll('.ocm-device-menu-item')) {
-      row.disabled = true;
-      row.querySelector('.ocm-device-menu-dot').dataset.state = 'unknown';
-      row.querySelector('.ocm-device-menu-status').textContent = 'Updating…';
-    }
-  }
-
   function scheduleDeviceMenuRefresh(generation) {
     clearTimeout(deviceMenu.timer);
     deviceMenu.timer = setTimeout(() => {
       if (deviceMenu.open && deviceMenu.generation === generation) refreshDeviceMenu(generation);
-    }, 3000);
+    }, 5000);
+  }
+
+  function sameDeviceMenuDevices(previous, next) {
+    return previous.length === next.length && previous.every((device, index) => {
+      const updated = next[index];
+      return updated && device.device_id === updated.device_id && device.name === updated.name && device.online === updated.online;
+    });
   }
 
   async function refreshDeviceMenu(generation = deviceMenu.generation) {
@@ -274,15 +271,17 @@ TRANSPORT_ADAPTER = r"""
       controller.abort();
       rejectDeadline(new Error('Mesh device discovery timed out'));
     }, 10000);
-    if (deviceMenu.devices.length) markDeviceMenuRefreshing();
-    else renderDeviceMenu('loading');
+    if (!deviceMenu.hasRenderedDevices) renderDeviceMenu('loading');
     try {
       const response = await Promise.race([nativeFetch('/_mesh/devices', { credentials: 'same-origin', cache: 'no-store', signal: controller.signal }), deadlineExpired]);
       if (!response.ok) throw new Error('Mesh device discovery failed: ' + response.status);
       const payload = await Promise.race([response.json(), deadlineExpired]);
       if (!deviceMenu.open || generation !== deviceMenu.generation || deviceMenu.controller !== controller) return;
-      deviceMenu.devices = Array.isArray(payload.devices) ? payload.devices : [];
-      renderDeviceMenu();
+      const devices = Array.isArray(payload.devices) ? payload.devices : [];
+      if (!deviceMenu.hasRenderedDevices || deviceMenu.renderedCurrentDeviceId !== activeDeviceId() || !sameDeviceMenuDevices(deviceMenu.devices, devices)) {
+        deviceMenu.devices = devices;
+        renderDeviceMenu();
+      }
       scheduleDeviceMenuRefresh(generation);
     } catch (_) {
       if (!deviceMenu.open || generation !== deviceMenu.generation || deviceMenu.controller !== controller) return;
@@ -300,6 +299,8 @@ TRANSPORT_ADAPTER = r"""
     deviceMenu.open = true;
     deviceMenu.generation += 1;
     deviceMenu.devices = [];
+    deviceMenu.hasRenderedDevices = false;
+    deviceMenu.renderedCurrentDeviceId = undefined;
     deviceMenuButton()?.setAttribute('aria-expanded', 'true');
     refreshDeviceMenu(deviceMenu.generation);
   }

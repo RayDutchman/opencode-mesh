@@ -131,6 +131,12 @@ UI 或传输行为变更应按受影响范围检查：
 - 另补完整适配器红测修复首页 handoff 等待边界：设备验证成功即允许原生 UI 启动，P2P 后台协商不再阻塞入口至 40 秒；首个业务 fetch 仍最多等 1.2 秒后向明确所选设备走 Relay，未验证目标仍保持隔离。
 - 最终独立验证：完整 pytest 291 passed、1 skipped（Android UI 编译测试缺 API-35 `android.jar`），`git diff --check` 通过。隔离 Chromium 在 390px 视口验证菜单真实点击、当前项、离线禁用、安全名称、6px 状态点、浅深主题背景与字号/圆角/阴影、离线页保存偏好优先系统、轮询刷新焦点保持，结果 PASS、无 page error。使用当前真实 2.0.18 前端资源配合本地适配器替换与模拟发现列表，未验证 Android 原生运行，也不代表已部署。
 
+### 设备菜单静默刷新收尾（2026-09-29，未部署）
+
+- 菜单轮询改为 5 秒；首次查询立即显示 Loading，已有有效展示时后台查询不再禁用条目、改写状态或显示 Updating。成功结果的设备状态、名称、列表和当前项均未变化时保留真实 DOM 条目，避免焦点及圆点闪烁；首次空列表、错误后的空列表成功恢复仍会替换 Loading/错误状态为正常空列表。
+- `tests/test_v2_device_menu.py` 先以首次空列表停留 Loading、空列表静默轮询以及当前项变化未更新 `aria-current` 复现，再修正展示有效性与已展示当前设备的守卫。回归同时覆盖 pending 保留可点击状态、失败/超时未知状态和恢复、关闭/重开迟到响应隔离、10 秒正文 deadline、键盘冒泡与焦点保持。
+- 本轮完整 `.venv/bin/python -m pytest -q -p no:cacheprovider -W error::DeprecationWarning -rs`：291 passed、1 skipped（Android UI 编译测试缺 API-35 `android.jar`）；提取适配器 `node --check` 与 `git diff --check` 均通过。未提交、推送或部署；现有 Android 未提交源码和产物均保留。
+
 ### 本轮发布状态（2026-09-29）
 
 - 用户授权提交、推送和部署，明确不重打包 APK。上述两节“尚未提交/部署”是开发验证时点；网页代码已提交 `02187e0961f4cd3b9e0f243dc957de042121520f` 并推送远端 `main`，产品版本仍为 0.3.1，未移动已有版本标签。
