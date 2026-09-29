@@ -34,7 +34,7 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
   MESH_VERSION=v0.3.2 bash -s -- agent
 ```
 
-安装完成后会打印实际运行版本。升级时修改 `MESH_VERSION` 后重新执行安装；需要回滚时指定较早的 tag。版本号的唯一来源是 `src/__init__.py`，发布前需同步创建对应的 Git tag。
+安装完成后会打印实际运行版本。已有安装请使用下文的 `upgrade.sh` 指定目标 tag 或 commit 升级；需要回滚时指定较早的 tag。版本号的唯一来源是 `src/__init__.py`，发布前需同步创建对应的 Git tag。
 
 ### 第 1 步：部署 Gateway（公网服务器）
 
@@ -131,7 +131,7 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/uninstall.sh | bash -s -- all
 ```
 
-卸载必须显式指定 `agent`、`gateway` 或 `all`。卸载会停止并删除对应 systemd 服务与安装文件；Agent 卸载时还会通知 Gateway 注销设备。若想保留设备身份（`data/` 目录），可在提示时选择 `y`，或用 `MESH_KEEP_DATA=y` 跳过交互。
+卸载必须显式指定 `agent`、`gateway` 或 `all`。单独卸载 Agent 或 Gateway 只停止并删除对应 systemd 服务，保留共享安装目录；单独卸载 Gateway 也会保留其配置和凭据，避免影响同目录的其他实例。`all` 才进入整目录卸载流程。Agent 卸载时还会通知 Gateway 注销设备。若想在 `all` 时保留设备身份（`data/` 目录），可在提示时选择 `y`，或用 `MESH_KEEP_DATA=y` 跳过交互。
 
 ## 安装位置与平台支持
 

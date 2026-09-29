@@ -218,7 +218,9 @@ Agent 不理解 OpenCode 的业务语义，只负责传输和边界保护：
 
 ### 5.3 P2P 应答和资源清理
 
-Agent 接收 Gateway 转发的 P2P offer，使用 aiortc 创建 answer，并为每个 P2P peer 保存有限的装配器、序列号和任务状态。
+Agent 接收 Gateway 转发的 P2P offer，使用 aiortc 创建 answer，并为每个 P2P peer 保存有限的装配器、序列号和任务状态。每条 DataChannel 的装配器最多保留 64 条活动/错误状态；完成 ID 的无 payload 墓碑最多 256 条、最长 300 秒，达到数量上限时淘汰最旧项。该窗口只防止近期重放，不保存完成结果，也不承诺窗口外的永久去重或 exactly-once。
+
+同一 DataChannel 的活动 P2P 请求按请求 ID single-flight；已完成分片在解析、校验并取得逻辑消息后，先释放 fragment 字节预算，再派发可能缓慢的上游操作。完成墓碑不持有 payload。所有并行 fragment 共享 `max_p2p_total_bytes` 预算，缺省等于单消息 P2P 限额；300 秒 TTL 在下一 frame 到达时检查，取消、断线和错误路径也释放状态。
 
 控制连接重建、DataChannel 关闭、请求取消和超时都会清理：
 
@@ -314,7 +316,7 @@ P2P DataChannel 和 Agent 控制 WebSocket 都需要面对单帧大小、缓冲�
 - `final` 只表示当前逻辑消息完成。
 - `data` 使用严格 base64 编码。
 - 请求、响应、流和 WebSocket 数据均受统一大小上限约束。
-- 未完成装配、完成墓碑和错误墓碑都受数量和 TTL 限制。
+- Agent 侧每条 DataChannel 的活动/错误装配状态最多 64 条；完成墓碑最多 256 条、最长 300 秒且不持有 payload。达到数量上限时淘汰最旧项，因此仅在有限窗口内拒绝完成后的重放；不承诺永久去重或 exactly-once。浏览器接收端独立地最多保留 128 条入站装配，单条和全部尚未交付 payload 均各受 64 MiB 限制，未完成装配在 120 秒后失败；已完成 SSE chunk 和 WebSocket 帧不继续占用 payload 预算或 deadline。持续流保留的零 payload 状态仍计入 128 条并发条目，但不以整个流累计字节预算或未完成 deadline。
 - DataChannel 背压等待超过超时后关闭当前 P2P 通道，使在途操作失败、后续请求可走 Relay，不重放结果未知的请求。
 
 浏览器 P2P 请求体上限为 32 MiB，为 base64 和 JSON 信封开销留出空间。已知超限的请求零读取转 Relay；未知大小的流由唯一 reader 读取至超过上限（最多保留上限加一个源块），然后将已读块和剩余 reader 按序交给受消费者背压控制的 Relay 流。读取期间取消会立即释放源流，不使用 clone/tee 全量缓冲。这不是已发送请求的重试，Relay 自身的大小限制仍然有效。
@@ -358,7 +360,7 @@ Agent  --agent_token--> Gateway 控制 WebSocket
 | 设备切换 | 重建当前 P2P 连接；每个请求仍按自身明确 Server 路由，其他 Server 可走 Relay |
 | 后台冻结后遗留旧 open P2P 通道 | 前台恢复时探针 ping，3s 无匹配 pong 则淘汰旧通道并后台重建；验证期新 HTTP/WS 请求走 Relay，mutation 不重放 |
 
-可靠性回归测试位于 `tests/test_mesh_reliability.py`，覆盖分片顺序、大小限制、重复结束、P2P 状态清理和真实 Agent 消息处理路径。`tests/test_v2_transport.py` 使用实际 Node URL/Request/Abort 行为和 Agent HTTP 请求捕获，覆盖设备作用域、上传体、取消、逐跳头及原生 Server 名称保留。
+`tests/test_review_protocol_limits.py` 覆盖 Agent 分片状态的 64 条活动容量、256 条完成墓碑、300 秒窗口、预算释放时机及有限重放语义。`tests/test_v2_incoming_limits.py` 在真实浏览器适配器中覆盖浏览器接收端的 128 条入站装配、单条/总计 64 MiB、120 秒未完成 deadline，以及完成 SSE/WebSocket 帧不累计限制整个流。`tests/test_mesh_reliability.py` 保留分片顺序、大小限制、重复结束、P2P 状态清理和真实 Agent 消息处理路径；`tests/test_v2_transport.py` 使用实际 Node URL/Request/Abort 行为和 Agent HTTP 请求捕获，覆盖设备作用域、上传体、取消、逐跳头及原生 Server 名称保留。
 
 ## 10. 文件架构
 
@@ -392,7 +394,9 @@ opencode-mesh/
     ├── test_v2_bootstrap.py
     ├── test_v2_errors.py
     ├── test_v2_offline_page.py
+    ├── test_review_protocol_limits.py
     ├── test_v2_reconnect_network.py
+    ├── test_v2_incoming_limits.py
     ├── test_v2_upload_backpressure.py
     └── test_v2_websocket.py
 ```
@@ -468,6 +472,8 @@ P2P 和分片基础设施：
 - `docs/opencode-web-route-catalog.json`：历史机器可读路由目录。
 - `tests/test_mesh_reliability.py`：可靠性回归测试。
 - `tests/test_v2_transport.py`：V2 请求透明性和浏览器适配行为测试。
+- `tests/test_review_protocol_limits.py`：Agent 分片装配的活动容量、有限完成墓碑、TTL、预算释放和近期重放拒绝回归。
+- `tests/test_v2_incoming_limits.py`：真实浏览器适配器的入站装配数量、单条/总计字节预算、未完成 deadline，以及 SSE/WebSocket 完成帧释放回归。
 - `tests/test_v2_reconnect_network.py`：在 Node 中运行真实适配器、用可控假时钟模拟网络事件，覆盖重连提示、防抖冷却、任意未打开阶段的取消重建（初始 ICE、重试 ICE、等待打开）、旧协商链的污染防护、hint 启动的重试不继承首轮 fetch 等待、kick 失效静默死亡通道的 pending、40s 总时限（含停滞的 createOffer）和前后台/bfcache 恢复行为。
 - `tests/test_v2_offline_page.py`：在 Node 中运行真实离线页脚本（脚本化 fetch + DOM shim + 假时钟），并直接驱动 ASGI websocket 通道验证浏览器切入点，覆盖统一在线判据（列表/路由/P2P/ws gate，隔离 `state_file`）、目标设备名称安全显示、在线设备切换入口、仅目标恢复时 reload、无目标不自动改投、轮询失败的状态未知与恢复、永不返回轮询的 10 秒 abort 与迟到响应丢弃。
 - `tests/test_v2_foreground_health.py`：在 Node 中运行真实适配器、用可控假时钟驱动 visibilitychange/pageshow 恢复，覆盖旧 open P2P 通道 3s 探针验活、探针/周期 pong 匹配顺序、迟到 pong 与迟到探针超时不影响新连接、验证期 fetch/WS 走 Relay、周期 ping 不覆盖探针槽位、重复恢复不延长时限、探针期间再次隐藏不误淘汰、初始可见不触发探针与 mutation 不重放。

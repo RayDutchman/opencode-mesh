@@ -49,6 +49,10 @@ if [[ "${1:-}" == "-c" ]]; then
   printf 'Deploying Mesh 0.0.0-mock\\n'
   exit 0
 fi
+if [[ -n "${MOCK_PIP_BLOCK_MARKER:-}" && ! -e "$MOCK_PIP_BLOCK_MARKER" ]]; then
+  touch "$MOCK_PIP_BLOCK_MARKER"
+  while :; do :; done
+fi
 if [[ "${MOCK_PIP_FAIL:-0}" == "1" ]]; then
   printf 'mock: pip install failed\\n' >&2
   exit 1
@@ -232,6 +236,21 @@ def run_apply(script: Path, root: Path, archive: Path, digest: str, role: str, s
         ["bash", str(script), "--apply", str(archive), digest, str(root), role, scope, REVISION],
         env=env, capture_output=True, text=True, timeout=120,
     )
+
+
+def write_tmp_stat_stub(bin_dir: Path, mode: str) -> None:
+    """Report a synthetic /tmp mode while leaving every other stat query real."""
+    stat = bin_dir / "stat"
+    stat.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"${1:-}\" == -c && \"${2:-}\" == %a && \"${3:-}\" == /tmp ]]; then\n"
+        f"  printf '%s\\n' {mode!r}\n"
+        "  exit 0\n"
+        "fi\n"
+        "exec /usr/bin/stat \"$@\"\n",
+        encoding="utf-8",
+    )
+    stat.chmod(0o755)
 
 
 def read_ops(log_path: Path) -> list[tuple[str, str]]:
@@ -430,6 +449,27 @@ def test_same_revision_does_not_restart(tmp_path, mock_env, deploy_script):
     assert (root / 'src/MARKER').read_text() == 'OLD'
 
 
+@pytest.mark.parametrize(("tmp_mode", "accepted"), [("777", False), ("1777", True)])
+def test_apply_requires_a_sticky_tmp_without_changing_host_tmp(
+    tmp_path, mock_env, deploy_script, tmp_mode, accepted,
+):
+    """The real --apply path rejects non-sticky /tmp from a controlled stat stub."""
+    bin_dir, state_path, log_path = mock_env
+    write_tmp_stat_stub(bin_dir, tmp_mode)
+    root = make_install_root(tmp_path)
+    write_state(state_path, "system", {
+        "opencode-mesh-agent.service": {"active": "active", "wd": str(root)},
+    })
+    archive, digest = make_release_archive(tmp_path)
+
+    proc = run_apply(deploy_script, root, archive, digest, "agent", "system", bin_dir, state_path, log_path)
+
+    assert (proc.returncode == 0) is accepted, proc.stderr
+    if not accepted:
+        assert "Unsafe /tmp permissions" in proc.stderr
+        assert (root / "src" / "MARKER").read_text() == "OLD"
+
+
 @pytest.mark.parametrize("role,units", [
     # target role=gateway but the dir only has Agent services: refuse to avoid silent success
     ("gateway", {"opencode-mesh-agent.service": {"state_file": "enabled", "active": "active", "wd": None}}),
@@ -455,3 +495,41 @@ def test_apply_refuses_when_target_role_has_no_installed_service(
     assert (root / "src" / "MARKER").read_text(encoding="utf-8") == "OLD"
     assert (root / ".mesh-revision").read_text(encoding="utf-8") == "rev-old\n"
     assert not (root / ".mesh-backups").exists()
+
+
+def test_apply_sigterm_restores_source_and_running_services(tmp_path, mock_env, deploy_script):
+    """A catchable termination after replacement restores the old source and active set."""
+    import signal
+    import time
+
+    bin_dir, state_path, log_path = mock_env
+    root = make_install_root(tmp_path)
+    write_state(state_path, "system", {
+        "opencode-mesh-agent.service": {"state_file": "enabled", "active": "active", "wd": str(root)},
+    })
+    archive, digest = make_release_archive(tmp_path)
+    marker = tmp_path / "pip-entered"
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "MOCK_SYSTEMCTL_STATE": str(state_path),
+        "MOCK_SYSTEMCTL_LOG": str(log_path),
+        "MOCK_PYTHON_LOG": str(log_path.parent / "mock-python.log"),
+        "MOCK_PIP_BLOCK_MARKER": str(marker),
+        "MESH_DEPLOY_HEALTH_SLEEP": "0",
+    }
+    proc = subprocess.Popen(
+        ["bash", str(deploy_script), "--apply", str(archive), digest, str(root), "agent", "system", REVISION],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    for _ in range(100):
+        if marker.exists():
+            break
+        time.sleep(.02)
+    assert marker.exists(), proc.communicate(timeout=2)
+    proc.send_signal(signal.SIGTERM)
+    _, stderr = proc.communicate(timeout=10)
+    assert proc.returncode == 1, stderr
+    assert (root / "src" / "MARKER").read_text(encoding="utf-8") == "OLD"
+    assert (root / ".mesh-revision").read_text(encoding="utf-8") == "rev-old\n"
+    assert read_state(state_path, "system")["opencode-mesh-agent.service"]["active"] == "active"

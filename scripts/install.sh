@@ -76,7 +76,41 @@ else
   UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 fi
 
-command -v python3 >/dev/null 2>&1 || { err "python3 is required"; exit 1; }
+# Serialize all lifecycle operations for this canonical installation directory.
+command -v flock >/dev/null 2>&1 || { err "flock is required for Mesh lifecycle locking"; exit 1; }
+command -v python3 >/dev/null 2>&1 || { err "python3 is required for Mesh lifecycle locking"; exit 1; }
+INSTALL_KEY="$(printf '%s' "$(realpath -m "$INSTALL_DIR")" | sha256sum | awk '{print $1}')"
+TMP_MODE="$(stat -c '%a' /tmp)"
+[[ ! -L /tmp && $(stat -c '%u' /tmp) == 0 && "$TMP_MODE" =~ ^[0-7]+$ ]] && (( (8#$TMP_MODE & 8#1000) != 0 )) || { err "unsafe /tmp permissions for Mesh lifecycle locking"; exit 1; }
+LOCK_DIR="/tmp/opencode-mesh-$INSTALL_KEY.lock"
+LOCK_OWNER="$(id -u)"
+if [[ -d "$INSTALL_DIR" ]]; then LOCK_OWNER="$(stat -Lc '%u' "$INSTALL_DIR")"; fi
+if mkdir -m 700 "$LOCK_DIR" 2>/dev/null; then chown "$LOCK_OWNER" "$LOCK_DIR"; elif [[ ! -d "$LOCK_DIR" || -L "$LOCK_DIR" ]]; then err "unsafe Mesh lifecycle lock path: ${LOCK_DIR}"; exit 1; fi
+[[ $(stat -c '%u:%a' "$LOCK_DIR") == "$LOCK_OWNER:700" ]] || { err "Mesh lifecycle lock is not owned by the installation owner: ${LOCK_DIR}"; exit 1; }
+HOLDER="$LOCK_DIR/holder"
+[[ ! -L "$HOLDER" && ( ! -e "$HOLDER" || ( -f "$HOLDER" && $(stat -c '%u:%a' "$HOLDER") == "$LOCK_OWNER:600" ) ) ]] || { err "unsafe Mesh lifecycle lock holder: ${HOLDER}"; exit 1; }
+if [[ ! -e "$HOLDER" ]]; then
+  (umask 077; set -C; : > "$HOLDER")
+  chown "$LOCK_OWNER" "$HOLDER"
+fi
+LOCK_READY="$LOCK_DIR/.ready.$$.${RANDOM}"
+PARENT_START="$(awk '{print $22}' "/proc/$$/stat")"
+flock -n "$HOLDER" python3 - "$$" "$PARENT_START" "$LOCK_READY" <<'PY' >/dev/null 2>&1 &
+import os, sys, time
+from pathlib import Path
+pid, start, ready = sys.argv[1:]
+Path(ready).touch()
+while True:
+    try:
+        if Path(f"/proc/{pid}/stat").read_text().split()[21] != start: break
+    except FileNotFoundError: break
+    time.sleep(.001)
+PY
+LOCK_GUARDIAN=$!
+for _ in $(seq 1 100); do [[ -e "$LOCK_READY" ]] && break; kill -0 "$LOCK_GUARDIAN" 2>/dev/null || break; sleep .01; done
+[[ -e "$LOCK_READY" ]] || { wait "$LOCK_GUARDIAN" 2>/dev/null || true; err "another Mesh lifecycle operation is using ${INSTALL_DIR}"; exit 1; }
+rm -f "$LOCK_READY"
+
 if [ -z "${MESH_SOURCE_DIR:-}" ]; then
   command -v curl >/dev/null 2>&1 || { err "curl is required"; exit 1; }
   command -v tar  >/dev/null 2>&1 || { err "tar is required"; exit 1; }

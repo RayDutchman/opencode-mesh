@@ -14,6 +14,8 @@ Run: .venv/bin/python -m pytest tests/test_instance_install.py -q
 
 import json
 import os
+import fcntl
+import hashlib
 import subprocess
 import sys
 import textwrap
@@ -44,6 +46,27 @@ exit 0
 FAKE_CURL = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "${FAKE_CURL_LOG:?}"
 exit 0
+"""
+
+# The lifecycle scripts inspect /tmp before creating their fixed hash lock.
+# Keep that check deterministic without changing the host /tmp permissions.
+FAKE_STAT = """#!/usr/bin/env bash
+if [[ "${1:-}" == -c ]]; then
+  format=${2:-}
+  path=${3:-}
+  if [[ "$format" == %u && "${FAKE_REAL_INSTALL_OWNER:-}" == 1 && "$path" != /tmp ]]; then
+    exec /usr/bin/stat "$@"
+  fi
+  case "$format:$path" in
+    %a:/tmp) printf '%s\\n' "${FAKE_TMP_MODE:-1777}"; exit 0 ;;
+    %u:/tmp) printf '0\\n'; exit 0 ;;
+    %u:%a:/tmp) printf '0:%s\\n' "${FAKE_TMP_MODE:-1777}"; exit 0 ;;
+    %u:%a:*holder) printf '%s\\n' "${FAKE_HOLDER_STAT:-1000:600}"; exit 0 ;;
+    %u:%a:*) printf '%s\\n' "${FAKE_LOCK_STAT:-1000:700}"; exit 0 ;;
+    %u:*) printf '1000\\n'; exit 0 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
 """
 
 # Temp files hold the remote script/data, executed in place by the mock ssh (simulating the remote filesystem).
@@ -119,6 +142,7 @@ def make_fakebin(tmp_path):
         "systemctl": FAKE_SYSTEMCTL,
         "loginctl": FAKE_LOGINCTL,
         "curl": FAKE_CURL,
+        "stat": FAKE_STAT,
         "ssh": FAKE_SSH,
         "python3": FAKE_PYTHON,
     }
@@ -207,6 +231,11 @@ def agent_env(**extra):
         "OPENCODE_URL": "http://127.0.0.1:4096",
         **extra,
     }
+
+
+def lifecycle_lock_dir(install_dir):
+    key = hashlib.sha256(str(install_dir.resolve()).encode()).hexdigest()
+    return Path(f"/tmp/opencode-mesh-{key}.lock")
 
 
 # ---------------------------------------------------------------- install.sh
@@ -334,6 +363,122 @@ def test_install_gateway_rejects_instance(tmp_path):
     ))
     result = run_script("install.sh", ["gateway", "win"], env)
     assert result.returncode != 0
+
+
+@pytest.mark.parametrize(
+    ("tmp_mode", "accepted"),
+    [("777", False), ("1777", True)],
+)
+def test_install_requires_a_sticky_tmp_without_changing_host_tmp(tmp_path, tmp_mode, accepted):
+    """The real installer must reject a non-sticky /tmp reported by the stat stub."""
+    fakebin, logs = make_fakebin(tmp_path)
+    source = make_source(tmp_path)
+    inst = tmp_path / f"tmp-mode-{tmp_mode}"
+    env = base_env(tmp_path, fakebin, logs, **agent_env(
+        MESH_SOURCE_DIR=str(source),
+        MESH_INSTALL_DIR=str(inst),
+        MESH_INSTALL_ONLY="1",
+        FAKE_TMP_MODE=tmp_mode,
+    ))
+
+    result = run_script("install.sh", ["agent"], env)
+
+    assert (result.returncode == 0) is accepted, result.stderr
+    if not accepted:
+        assert "unsafe /tmp permissions" in result.stderr
+
+
+@pytest.mark.parametrize("holder_target", ["regular", "dangling"])
+def test_install_rejects_untrusted_lock_entries_then_allows_a_normal_lock(tmp_path, holder_target):
+    """Pre-existing foreign lock metadata or any holder symlink must not be followed."""
+    fakebin, logs = make_fakebin(tmp_path)
+    source = make_source(tmp_path)
+    inst = tmp_path / f"untrusted-{holder_target}"
+    lock_dir = lifecycle_lock_dir(inst)
+    if lock_dir.exists() or lock_dir.is_symlink():
+        pytest.skip(f"test lock path already exists: {lock_dir}")
+    lock_dir.mkdir(mode=0o700)
+    holder = lock_dir / "holder"
+    target = tmp_path / "holder-target"
+    if holder_target == "regular":
+        target.write_text("not a lock")
+    holder.symlink_to(target)
+
+    env = base_env(tmp_path, fakebin, logs, **agent_env(
+        MESH_SOURCE_DIR=str(source),
+        MESH_INSTALL_DIR=str(inst),
+        MESH_INSTALL_ONLY="1",
+    ))
+    try:
+        rejected = run_script("install.sh", ["agent"], env)
+        assert rejected.returncode != 0
+        assert "unsafe Mesh lifecycle lock holder" in rejected.stderr
+        if holder_target == "dangling":
+            assert not target.exists(), "a dangling holder symlink must never be followed"
+        else:
+            assert target.read_text() == "not a lock"
+
+        # This directory was created by this test.  Removing it proves a fresh,
+        # well-formed lock can still be acquired after a malicious one is refused.
+        holder.unlink()
+        lock_dir.rmdir()
+        accepted = run_script("install.sh", ["agent"], env)
+        assert accepted.returncode == 0, accepted.stderr
+    finally:
+        if lock_dir.exists() and not lock_dir.is_symlink():
+            for child in lock_dir.iterdir():
+                child.unlink()
+            lock_dir.rmdir()
+
+
+def test_install_creates_a_missing_nested_install_root(tmp_path):
+    """Ownership discovery must not stat a parent that does not exist yet."""
+    fakebin, logs = make_fakebin(tmp_path)
+    source = make_source(tmp_path)
+    inst = tmp_path / "missing" / "nested" / "install"
+    env = base_env(tmp_path, fakebin, logs, **agent_env(
+        MESH_SOURCE_DIR=str(source),
+        MESH_INSTALL_DIR=str(inst),
+        MESH_INSTALL_ONLY="1",
+        FAKE_REAL_INSTALL_OWNER="1",
+    ))
+
+    result = run_script("install.sh", ["agent"], env)
+
+    assert result.returncode == 0, result.stderr
+    assert (inst / "config" / "agents.json").exists()
+
+
+def test_install_serializes_only_the_same_canonical_directory(tmp_path):
+    """A held lifecycle lock rejects its directory but does not block another install."""
+    fakebin, logs = make_fakebin(tmp_path)
+    source = make_source(tmp_path)
+    locked = tmp_path / "locked"
+    other = tmp_path / "other"
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    key = hashlib.sha256(str(locked.resolve()).encode()).hexdigest()
+    lock_dir = Path(f"/tmp/opencode-mesh-{key}.lock")
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_dir.chmod(0o700)
+    lock_path = lock_dir / "holder"
+    lock_path.touch()
+    lock_path.chmod(0o600)
+    with lock_path.open("w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        locked_env = base_env(tmp_path, fakebin, logs, **agent_env(
+            MESH_SOURCE_DIR=str(source), MESH_INSTALL_DIR=str(locked),
+            MESH_INSTALL_ONLY="1", XDG_RUNTIME_DIR=str(runtime),
+        ))
+        blocked = run_script("install.sh", ["agent"], locked_env)
+        assert blocked.returncode != 0
+        assert "another Mesh lifecycle operation" in blocked.stderr
+        other_env = base_env(tmp_path, fakebin, logs, **agent_env(
+            MESH_SOURCE_DIR=str(source), MESH_INSTALL_DIR=str(other),
+            MESH_INSTALL_ONLY="1", XDG_RUNTIME_DIR=str(runtime),
+        ))
+        allowed = run_script("install.sh", ["agent"], other_env)
+        assert allowed.returncode == 0, allowed.stderr
 
 
 # --------------------------------------------------------------- uninstall.sh

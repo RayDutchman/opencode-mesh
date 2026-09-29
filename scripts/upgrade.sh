@@ -13,6 +13,38 @@ if [[ "${1:-}" == --apply ]]; then
   [[ "$role" == agent || "$role" == gateway ]] || exit 2
   [[ "$scope" == user || "$scope" == system ]] || exit 2
   root=$(realpath "$root")
+  command -v flock >/dev/null 2>&1 || { printf 'flock is required for Mesh lifecycle locking.\n' >&2; exit 1; }
+  command -v python3 >/dev/null 2>&1 || { printf 'python3 is required for Mesh lifecycle locking.\n' >&2; exit 1; }
+  lock_key="$(printf '%s' "$root" | sha256sum | awk '{print $1}')"
+  tmp_mode="$(stat -c '%a' /tmp)"
+  [[ ! -L /tmp && $(stat -c '%u' /tmp) == 0 && "$tmp_mode" =~ ^[0-7]+$ ]] && (( (8#$tmp_mode & 8#1000) != 0 )) || { printf 'Unsafe /tmp permissions for Mesh lifecycle locking.\n' >&2; exit 1; }
+  lock_owner="$(stat -c '%u' "$root")"
+  lock_dir="/tmp/opencode-mesh-$lock_key.lock"
+  if mkdir -m 700 "$lock_dir" 2>/dev/null; then chown "$lock_owner" "$lock_dir"; elif [[ ! -d "$lock_dir" || -L "$lock_dir" ]]; then printf 'Unsafe Mesh lifecycle lock path: %s\n' "$lock_dir" >&2; exit 1; fi
+  [[ $(stat -c '%u:%a' "$lock_dir") == "$lock_owner:700" ]] || { printf 'Mesh lifecycle lock is not owned by the installation owner: %s\n' "$lock_dir" >&2; exit 1; }
+  holder="$lock_dir/holder"
+  [[ ! -L "$holder" && ( ! -e "$holder" || ( -f "$holder" && $(stat -c '%u:%a' "$holder") == "$lock_owner:600" ) ) ]] || { printf 'Unsafe Mesh lifecycle lock holder: %s\n' "$holder" >&2; exit 1; }
+  if [[ ! -e "$holder" ]]; then
+    (umask 077; set -C; : > "$holder")
+    chown "$lock_owner" "$holder"
+  fi
+  lock_ready="$lock_dir/.ready.$$.${RANDOM}"
+  parent_start="$(awk '{print $22}' "/proc/$$/stat")"
+  flock -n "$holder" python3 - "$$" "$parent_start" "$lock_ready" <<'PY' >/dev/null 2>&1 &
+import os, sys, time
+from pathlib import Path
+pid, start, ready = sys.argv[1:]
+Path(ready).touch()
+while True:
+    try:
+        if Path(f"/proc/{pid}/stat").read_text().split()[21] != start: break
+    except FileNotFoundError: break
+    time.sleep(.001)
+PY
+  lock_guardian=$!
+  for _ in $(seq 1 100); do [[ -e "$lock_ready" ]] && break; kill -0 "$lock_guardian" 2>/dev/null || break; sleep .01; done
+  [[ -e "$lock_ready" ]] || { wait "$lock_guardian" 2>/dev/null || true; printf 'Another Mesh lifecycle operation is using %s\n' "$root" >&2; exit 1; }
+  rm -f "$lock_ready"
   python="$root/.venv/bin/python"
   [[ -x "$python" && -d "$root/src" && -d "$root/scripts" && -f "$root/pyproject.toml" ]] || {
     printf 'Existing installation required: %s\n' "$root" >&2; exit 1;
@@ -99,9 +131,9 @@ if [[ "${1:-}" == --apply ]]; then
   tar -czf "$backup" -C "$root" "${files[@]}"
 
   source_changed=0
+  command_pid=""
   rollback() {
-    trap - ERR
-    trap - EXIT
+    trap - ERR INT TERM HUP EXIT
     recovery_failed=0
     printf 'Deployment failed; restoring source from %s\n' "$backup" >&2
     if [[ "$source_changed" == 1 ]]; then
@@ -132,7 +164,21 @@ if [[ "${1:-}" == --apply ]]; then
     printf 'Restored the original version and running services.\n' >&2
     exit 1
   }
+  interrupted() {
+    local signal="$1"
+    trap - ERR INT TERM HUP
+    if [[ -n "$command_pid" ]]; then
+      kill -TERM -- "-$command_pid" 2>/dev/null || true
+      wait "$command_pid" 2>/dev/null || true
+      command_pid=""
+    fi
+    printf 'Deployment interrupted by %s; attempting recovery.\n' "$signal" >&2
+    rollback
+  }
   trap rollback ERR
+  trap 'interrupted INT' INT
+  trap 'interrupted TERM' TERM
+  trap 'interrupted HUP' HUP
 
   stop_targets=()
   for name in "${managed[@]}"; do
@@ -150,7 +196,15 @@ if [[ "${1:-}" == --apply ]]; then
   source_changed=1
   rm -rf -- "$root/src" "$root/scripts"
   cp -a "$stage/src" "$stage/scripts" "$stage/pyproject.toml" "$root/"
-  "$python" -m pip install -e "$root" --quiet
+  python3 -c 'import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
+    "$python" -m pip install -e "$root" --quiet &
+  command_pid=$!
+  set +e
+  wait "$command_pid"
+  pip_status=$?
+  set -e
+  command_pid=""
+  (( pip_status == 0 )) || exit "$pip_status"
   printf '%s\n' "$revision" > "$root/.mesh-revision"
   if [[ ${#stop_targets[@]} -gt 0 ]]; then
     "${manager[@]}" restart "${stop_targets[@]}"
@@ -161,7 +215,7 @@ if [[ "${1:-}" == --apply ]]; then
   for name in "${stop_targets[@]}"; do
     "${manager[@]}" is-active --quiet "$name"
   done
-  trap - ERR
+  trap - ERR INT TERM HUP
   printf 'Upgrade succeeded (%.12s); running services restored: %s\n' "$revision" "${stop_targets[*]:-none (no services were running)}"
   exit 0
 fi

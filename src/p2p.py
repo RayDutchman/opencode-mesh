@@ -182,7 +182,7 @@ class ChunkAssembler:
     def __init__(self, limit: int = MAX_RESPONSE_BYTES, trace: bool = False,
                  max_assemblies: int = 64, ttl: float | None = 300.0,
                  clock: Callable[[], float] | None = None,
-                 budget: int | None = None):
+                 budget: int | None = None, completed_max: int = 256):
         self.limit = int(limit)
         self.trace_enabled = bool(trace)
         self.max_assemblies = max(1, int(max_assemblies))
@@ -190,8 +190,12 @@ class ChunkAssembler:
         self.clock = clock or time.monotonic
         # Global byte budget: cap on the sum of buffered bytes across parallel assemblies (genuinely low and globally bounded).
         self.budget = int(budget) if budget is not None else int(limit)
+        self.completed_max = max(1, int(completed_max))
         self._used_bytes = 0
         self._assemblies: dict[str, dict[str, Any]] = {}
+        # Completed IDs retain no payload. This is a deliberately finite replay
+        # window independent from the active reassembly capacity.
+        self._completed: dict[str, float] = {}
         # Arrival frame trace: (message_id, sequence), recorded only while trace_enabled.
         self.trace: list[tuple[str | None, int | None]] = []
 
@@ -201,6 +205,9 @@ class ChunkAssembler:
                        if now - asm["updated"] > self.ttl]
             for key in expired:
                 self._used_bytes -= self._assemblies.pop(key, {})["total"]
+            for key, completed_at in list(self._completed.items()):
+                if now - completed_at > self.ttl:
+                    self._completed.pop(key, None)
         if incoming is not None and incoming not in self._assemblies:
             while len(self._assemblies) >= self.max_assemblies:
                 oldest = min(self._assemblies, key=lambda key: self._assemblies[key]["updated"])
@@ -219,6 +226,9 @@ class ChunkAssembler:
         if self.trace_enabled:
             self.trace.append((message_id, sequence))
         now = self.clock()
+        self._purge(now)
+        if message_id in self._completed:
+            return "error"
         self._purge(now, incoming=message_id)
         asm = self._assemblies.setdefault(
             message_id, {"parts": [], "total": 0, "accepted": False, "error": None,
@@ -274,7 +284,11 @@ class ChunkAssembler:
         if asm is None:
             return
         self._free(asm)
-        asm["accepted"] = True
+        self._assemblies.pop(message_id, None)
+        self._completed[message_id] = self.clock()
+        while len(self._completed) > self.completed_max:
+            oldest = min(self._completed, key=self._completed.get)
+            self._completed.pop(oldest, None)
 
     def discard(self, message_id: str) -> None:
         asm = self._assemblies.pop(message_id, None)
@@ -295,13 +309,17 @@ class ChunkAssembler:
         return self._assemblies.get(message_id, {}).get("total", 0)
 
     def is_accepted(self, message_id: str) -> bool:
-        return bool(self._assemblies.get(message_id, {}).get("accepted"))
+        return message_id in self._completed or bool(self._assemblies.get(message_id, {}).get("accepted"))
 
     def error_of(self, message_id: str):
+        if message_id in self._completed:
+            return "frame after completion"
         return self._assemblies.get(message_id, {}).get("error")
 
     def reason_of(self, message_id: str):
         """Return the stable error kind for this message_id (so callers can distinguish 400/413)."""
+        if message_id in self._completed:
+            return INVALID_SEQUENCE_REASON
         return self._assemblies.get(message_id, {}).get("reason")
 
 

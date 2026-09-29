@@ -129,7 +129,11 @@ def filter_response_headers(headers) -> dict[str, str]:
     and Relay paths so upstream cookies never cross the trust boundary.
     """
     blocked = {'content-encoding', 'content-length', 'transfer-encoding', 'connection',
+               'keep-alive', 'proxy-connection', 'te', 'trailer', 'upgrade',
                'set-cookie', 'set-cookie2'}
+    for key, value in headers.items():
+        if key.lower() == 'connection':
+            blocked.update(token.strip().lower() for token in value.split(','))
     return {k: v for k, v in headers.items() if k.lower() not in blocked}
 
 
@@ -372,6 +376,11 @@ class Gateway:
         self.p2p_owners: dict[str, WebSocket] = {}
         self.device_send_locks: dict[int, asyncio.Lock] = {}
         self.browser_send_locks: dict[str, asyncio.Lock] = {}
+        self.browser_queues: dict[str, asyncio.Queue] = {}
+        self.browser_queue_bytes: dict[str, int] = {}
+        self.browser_sender_tasks: dict[str, asyncio.Task] = {}
+        self.browser_queue_overflowed: set[str] = set()
+        self.browser_closing: set[str] = set()
         self.auth_failures: dict[str, list[float]] = {}
         self.register_attempts: dict[str, list[float]] = {}
         self.app = FastAPI(title="OpenCode Mesh Gateway", lifespan=self.lifespan)
@@ -486,10 +495,10 @@ class Gateway:
         bucket[key] = recent
         return True
 
-    async def send_browser(self, bridge_id: str, payload: Any, binary: bool) -> None:
+    async def send_browser(self, bridge_id: str, payload: Any, binary: bool) -> bool:
         bridge = self.browser_ws.get(bridge_id)
         if not bridge:
-            return
+            return False
         lock = self.browser_send_locks.setdefault(bridge_id, asyncio.Lock())
         try:
             async with lock:
@@ -497,8 +506,78 @@ class Gateway:
                     await bridge.send_bytes(payload)
                 else:
                     await bridge.send_text(payload)
+            return True
         except Exception:
-            self.browser_ws.pop(bridge_id, None)
+            return False
+
+    def browser_queue_limits(self) -> tuple[int, int]:
+        return (max(1, int(self.cfg.get("ws_bridge_queue_frames", 128))),
+                max(1, int(self.cfg.get("ws_bridge_queue_bytes", 4 * 1024 * 1024))))
+
+    @staticmethod
+    def ws_payload_size(payload: Any, binary: bool) -> int:
+        if binary:
+            return len(payload)
+        return len(str(payload).encode("utf-8"))
+
+    def enqueue_browser_message(self, bridge_id: str, payload: Any, binary: bool) -> bool:
+        """Queue one browser-bound frame without stalling the Agent receive loop."""
+        frames, byte_limit = self.browser_queue_limits()
+        queue = self.browser_queues.setdefault(bridge_id, asyncio.Queue(maxsize=frames))
+        size = self.ws_payload_size(payload, binary)
+        if (bridge_id in self.browser_queue_overflowed or queue.full() or
+                self.browser_queue_bytes.get(bridge_id, 0) + size > byte_limit):
+            self.browser_queue_overflowed.add(bridge_id)
+            return False
+        queue.put_nowait((payload, binary, size))
+        self.browser_queue_bytes[bridge_id] = self.browser_queue_bytes.get(bridge_id, 0) + size
+        task = self.browser_sender_tasks.get(bridge_id)
+        if bridge_id in self.browser_ws and (task is None or task.done()):
+            self.browser_sender_tasks[bridge_id] = asyncio.create_task(self.browser_sender(bridge_id, queue))
+        return True
+
+    def schedule_browser_overflow_close(self, bridge_id: str) -> None:
+        """Schedule exactly one close after a bridge has exceeded its local budget."""
+        if bridge_id in self.browser_closing:
+            return
+        self.browser_closing.add(bridge_id)
+        asyncio.create_task(self.close_browser(bridge_id, 1011))
+
+    async def fail_browser_bridge(self, bridge_id: str, code: int = 1011) -> None:
+        """Release one failed browser bridge and notify only its owning Agent."""
+        bridge = self.browser_ws.pop(bridge_id, None)
+        owner = self.owners.pop(bridge_id, None)
+        self.browser_send_locks.pop(bridge_id, None)
+        self.browser_queues.pop(bridge_id, None)
+        self.browser_queue_bytes.pop(bridge_id, None)
+        self.browser_queue_overflowed.discard(bridge_id)
+        self.browser_closing.discard(bridge_id)
+        if owner is not None:
+            with contextlib.suppress(Exception):
+                await self.send_control(owner, {"type": "ws_close", "id": bridge_id}, timeout=2)
+        if bridge is not None:
+            with contextlib.suppress(Exception):
+                await bridge.close(code=code)
+
+    async def browser_sender(self, bridge_id: str, queue: asyncio.Queue) -> None:
+        """Deliver one bridge queue serially; its bounded producer owns backpressure."""
+        try:
+            while True:
+                payload, binary, size = await queue.get()
+                if bridge_id not in self.browser_ws:
+                    return
+                try:
+                    delivered = await self.send_browser(bridge_id, payload, binary)
+                    if not delivered:
+                        await self.fail_browser_bridge(bridge_id)
+                        return
+                finally:
+                    if bridge_id in self.browser_queue_bytes:
+                        self.browser_queue_bytes[bridge_id] = max(
+                            0, self.browser_queue_bytes[bridge_id] - size)
+        finally:
+            if self.browser_sender_tasks.get(bridge_id) is asyncio.current_task():
+                self.browser_sender_tasks.pop(bridge_id, None)
 
     async def close_browser(self, bridge_id: str, code: int) -> None:
         bridge = self.browser_ws.get(bridge_id)
@@ -686,6 +765,13 @@ class Gateway:
                 self.browser_ws.pop(bridge_id, None)
                 self.owners.pop(bridge_id, None)
                 self.browser_send_locks.pop(bridge_id, None)
+                sender = self.browser_sender_tasks.pop(bridge_id, None)
+                if sender is not None:
+                    sender.cancel()
+                self.browser_queues.pop(bridge_id, None)
+                self.browser_queue_bytes.pop(bridge_id, None)
+                self.browser_queue_overflowed.discard(bridge_id)
+                self.browser_closing.discard(bridge_id)
                 try:
                     await client.close()
                 except Exception:
@@ -762,7 +848,8 @@ class Gateway:
                                 except Exception:
                                     asyncio.create_task(self.close_browser(bridge_id, 1011))
                                     continue
-                                asyncio.create_task(self.send_browser(bridge_id, payload, binary))
+                                if not self.enqueue_browser_message(bridge_id, payload, binary):
+                                    self.schedule_browser_overflow_close(bridge_id)
                             elif item.get("type") == "ws_closed":
                                 asyncio.create_task(self.close_browser(bridge_id, item.get("code", 1000)))
                             elif item.get("type") == "ws_error":
@@ -862,8 +949,9 @@ class Gateway:
                 if not completed:
                     with contextlib.suppress(Exception):
                         await self.send_control(ws, {"type": "cancel", "id": request_id}, timeout=2)
-            headers = {k: v for k, v in result.get("headers", {}).items()
-                       if k.lower() not in {"content-length", "transfer-encoding", "connection", "content-security-policy", "x-frame-options"}}
+            headers = filter_response_headers(result.get("headers", {}))
+            headers = {k: v for k, v in headers.items()
+                       if k.lower() not in {"content-security-policy", "x-frame-options"}}
             encoded_body = result.get("body", "")
             guard = ResponseSizeGuard(response_limit(self.cfg))
             try:
@@ -1014,6 +1102,11 @@ class Agent:
         self.p2p_tasks: dict[tuple[int, str], asyncio.Task] = {}
         self.p2p_assemblers: dict[int, ChunkAssembler] = {}
         self.p2p_sequence: dict[tuple[int, str], int] = {}
+        self.p2p_reservations = 0
+        self.p2p_reservation_lock = asyncio.Lock()
+        self.ws_queue_bytes: dict[str, int] = {}
+        self.ws_queue_overflowed: set[str] = set()
+        self.ws_queue_closing: set[str] = set()
         self.control_send_lock = asyncio.Lock()
         self.routes()
 
@@ -1024,7 +1117,7 @@ class Agent:
 
     async def local_ws(self, item: dict[str, Any], control):
         bridge_id = item["id"]
-        queue = asyncio.Queue()
+        queue = asyncio.Queue(maxsize=self.ws_queue_limits()[0])
         self.ws_queues[bridge_id] = queue
         url = self.target.replace("http://", "ws://", 1).replace("https://", "wss://", 1) + item["path"]
         if item.get("query"):
@@ -1045,16 +1138,19 @@ class Agent:
                                                      "protocol": target.subprotocol or ""})
                 async def to_target():
                     while True:
-                        msg = await queue.get()
-                        if msg.get("type") == "ws_close":
-                            # websockets requires a string when serializing close frames;
-                            # missing or null reasons mean an empty wire reason.
-                            await target.close(code=int(msg.get("code", 1000)),
-                                               reason=str(msg.get("reason") or ""))
-                            return
-                        if msg.get("type") == "ws_data":
-                            data = decode_strict(msg["data"]) if msg.get("kind") == "bytes" else msg.get("data", "")
-                            await target.send(data)
+                        msg, size = await self.take_ws_message(bridge_id, queue)
+                        try:
+                            if msg.get("type") == "ws_close":
+                                # websockets requires a string when serializing close frames;
+                                # missing or null reasons mean an empty wire reason.
+                                await target.close(code=int(msg.get("code", 1000)),
+                                                   reason=str(msg.get("reason") or ""))
+                                return
+                            if msg.get("type") == "ws_data":
+                                data = decode_strict(msg["data"]) if msg.get("kind") == "bytes" else msg.get("data", "")
+                                await target.send(data)
+                        finally:
+                            self.release_ws_message(bridge_id, size)
                 async def from_target():
                     async for raw in target:
                         if isinstance(raw, bytes):
@@ -1078,6 +1174,50 @@ class Agent:
                 pass
         finally:
             self.ws_queues.pop(bridge_id, None)
+            self.ws_queue_bytes.pop(bridge_id, None)
+            self.ws_queue_overflowed.discard(bridge_id)
+            self.ws_queue_closing.discard(bridge_id)
+
+    def ws_queue_limits(self) -> tuple[int, int]:
+        return (max(1, int(self.cfg.get("ws_bridge_queue_frames", 128))),
+                max(1, int(self.cfg.get("ws_bridge_queue_bytes", 4 * 1024 * 1024))))
+
+    @staticmethod
+    def ws_message_size(item: dict[str, Any]) -> int:
+        data = item.get("data", "")
+        if item.get("kind") == "bytes" and isinstance(data, str) and is_valid_base64(data):
+            return decoded_size(data)
+        return len(str(data).encode("utf-8"))
+
+    def enqueue_ws_message(self, bridge_id: str, item: dict[str, Any]) -> bool:
+        """Enqueue a browser frame without blocking a shared control receive loop."""
+        queue = self.ws_queues.get(bridge_id)
+        if queue is None:
+            return False
+        _, byte_limit = self.ws_queue_limits()
+        size = self.ws_message_size(item)
+        if (bridge_id in self.ws_queue_overflowed or queue.full() or
+                self.ws_queue_bytes.get(bridge_id, 0) + size > byte_limit):
+            self.ws_queue_overflowed.add(bridge_id)
+            return False
+        queue.put_nowait(item)
+        self.ws_queue_bytes[bridge_id] = self.ws_queue_bytes.get(bridge_id, 0) + size
+        return True
+
+    def claim_ws_overflow(self, bridge_id: str) -> bool:
+        """Return true once so an overflowing bridge emits one terminal notification."""
+        if bridge_id in self.ws_queue_closing:
+            return False
+        self.ws_queue_closing.add(bridge_id)
+        return True
+
+    async def take_ws_message(self, bridge_id: str, queue: asyncio.Queue) -> tuple[dict[str, Any], int]:
+        item = await queue.get()
+        size = self.ws_message_size(item)
+        return item, size
+
+    def release_ws_message(self, bridge_id: str, size: int) -> None:
+        self.ws_queue_bytes[bridge_id] = max(0, self.ws_queue_bytes.get(bridge_id, 0) - size)
 
     async def local_stream(self, item: dict[str, Any], ws):
         if not is_valid_base64(item.get("body") or ""):
@@ -1162,6 +1302,9 @@ class Agent:
                     if restored.get("type") not in {"ws_data", "ws_close"} and str(restored.get("id", "")) != message_id:
                         await self._p2p_error(channel, message_id, 400, "message_id mismatch")
                         return
+                    # The complete payload is now owned by the dispatched request. Release
+                    # fragment storage before a slow upstream response consumes its timeout.
+                    assembler.complete(message_id)
                     await self.p2p_message(channel, restored)
                 finally:
                     # Keep a tombstone until TTL after completion to block replays of the same message_id.
@@ -1175,9 +1318,14 @@ class Agent:
             return
         key = (id(channel), str(item.get("id", "")))
         if item.get("type") in {"ws_data", "ws_close"}:
-            queue = self.ws_queues.get(item.get("id", ""))
-            if queue:
-                await queue.put(item)
+            bridge_id = item.get("id", "")
+            if bridge_id in self.ws_queues and not self.enqueue_ws_message(bridge_id, item):
+                if self.claim_ws_overflow(bridge_id):
+                    task = self.p2p_tasks.get(key)
+                    if task is not None:
+                        task.cancel()
+                    await self.p2p_send(channel, {"type": "ws_error", "id": bridge_id,
+                                                  "error": "WebSocket bridge buffer overflow"})
             return
         if item.get("type") == "cancel":
             task = self.p2p_tasks.get(key)
@@ -1192,6 +1340,11 @@ class Agent:
             await self.p2p_send(channel, {"type": "pong", "t": item.get("t")})
             return
         if item.get("type") not in {"request", "stream_request", "ws_open"}:
+            return
+
+        if key in self.p2p_tasks:
+            # A reliable ordered channel does not normally duplicate application messages,
+            # but a repeated ID must not execute a mutation twice.
             return
 
         encoded_body = item.get("body")
@@ -1239,7 +1392,8 @@ class Agent:
                                           "body": base64.b64encode(json.dumps({"error": str(exc),
                                                                                "reason": reason}).encode()).decode()})
         finally:
-            self.p2p_tasks.pop(key, None)
+            if self.p2p_tasks.get(key) is task:
+                self.p2p_tasks.pop(key, None)
 
     def _p2p_next_sequence(self, channel: Any, message_id: str) -> int:
         key = (id(channel), message_id)
@@ -1343,6 +1497,7 @@ class Agent:
         self.p2p_tasks.clear()
         self.p2p_assemblers.clear()
         self.p2p_sequence.clear()
+        self.p2p_reservations = 0
         self.ws_queues.clear()
         peers = list(self.p2p_peers)
         self.p2p_peers.clear()
@@ -1354,7 +1509,13 @@ class Agent:
 
     async def handle_p2p_offer(self, item: dict[str, Any], control) -> None:
         limit = int(self.cfg.get("max_p2p_peers", 4))
-        if len(self.p2p_peers) >= limit:
+        async with self.p2p_reservation_lock:
+            if len(self.p2p_peers) + self.p2p_reservations >= limit:
+                reserved = False
+            else:
+                self.p2p_reservations += 1
+                reserved = True
+        if not reserved:
             with contextlib.suppress(Exception):
                 await self.send_control(control, {"type": "p2p_answer", "id": item["id"],
                                                   "answer": {"error": "too many P2P sessions"}})
@@ -1388,6 +1549,9 @@ class Agent:
             with contextlib.suppress(Exception):
                 await self.send_control(control, {"type": "p2p_answer", "id": item["id"],
                                                   "answer": {"error": "P2P negotiation failed"}})
+        finally:
+            async with self.p2p_reservation_lock:
+                self.p2p_reservations = max(0, self.p2p_reservations - 1)
 
     async def handle_request(self, item: dict[str, Any], ws):
         try:
@@ -1554,9 +1718,15 @@ class Agent:
                             elif item.get("type") == "ping":
                                 await self.send_control(ws, {"type": "pong"})
                             elif item.get("type") in {"ws_data", "ws_close"}:
-                                q = self.ws_queues.get(item.get("id", ""))
-                                if q:
-                                    await q.put(item)
+                                bridge_id = item.get("id", "")
+                                if bridge_id in self.ws_queues and not self.enqueue_ws_message(bridge_id, item):
+                                    if self.claim_ws_overflow(bridge_id):
+                                        task = tasks.get(bridge_id)
+                                        if task:
+                                            task.cancel()
+                                        asyncio.create_task(self.send_control(
+                                            ws, {"type": "ws_error", "id": bridge_id,
+                                                 "error": "WebSocket bridge buffer overflow"}))
                     finally:
                         heartbeat.cancel()
                         remaining = list(tasks.values())

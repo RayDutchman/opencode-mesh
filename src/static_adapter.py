@@ -41,6 +41,11 @@ TRANSPORT_ADAPTER = r"""
   };
   const CHUNK_SIZE = 32768;
   const MAX_P2P_BYTES = 64 * 1024 * 1024;
+  // Keep decoded assembly payloads within the P2P per-message budget. This does
+  // not account for the DataChannel JSON/base64 string or the final contiguous copy.
+  // The entry cap also bounds unknown IDs before an Agent response is associated with work.
+  const MAX_INCOMING_MESSAGES = 128;
+  const INCOMING_ASSEMBLY_TTL_MS = 120000;
   // P2P request bodies expand through base64 and JSON; larger bodies use Relay.
   const MAX_P2P_BODY = 32 * 1024 * 1024;
   // Bound backpressure waits to match the Agent's default send timeout.
@@ -63,7 +68,7 @@ TRANSPORT_ADAPTER = r"""
   // and the V2 probe have accepted that requested device.
   const rootHandoffDevice = location.pathname === '/' ? new URLSearchParams(location.search).get('mesh_device') : null;
 
-  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), incoming: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, networkTimer: null, lastNetworkAttempt: null, lastAttemptTime: null, activeController: null, isInitialAttempt: false, devices: [], defaultDevice: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null, p2pSendTail: Promise.resolve(), probing: false, probe: null, transportStarted: false, handoffPending: !!rootHandoffDevice };
+  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), incoming: new Map(), incomingBytes: 0, incomingTombstones: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, networkTimer: null, lastNetworkAttempt: null, lastAttemptTime: null, activeController: null, isInitialAttempt: false, devices: [], defaultDevice: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null, p2pSendTail: Promise.resolve(), probing: false, probe: null, transportStarted: false, handoffPending: !!rootHandoffDevice };
 
   const BAR_CSS = `
   #ocm-mesh-bar{display:flex;align-items:center;gap:8px;height:36px;padding:0 10px;font-size:13px;line-height:20px;flex:0 0 auto;border-bottom:1px solid var(--v2-border-border-base);background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-muted);-webkit-user-select:none;user-select:none}
@@ -550,9 +555,93 @@ TRANSPORT_ADAPTER = r"""
     }
   }
 
+  function releaseIncoming(messageId) {
+    const entry = state.incoming.get(messageId);
+    if (!entry) return null;
+    state.incoming.delete(messageId);
+    clearTimeout(entry.timer);
+    state.incomingBytes = Math.max(0, state.incomingBytes - entry.bytes);
+    return entry;
+  }
+
+  function releaseIncomingForBusinessId(id) {
+    for (const [messageId, entry] of state.incoming) {
+      // HTTP/SSE normally use the request ID as message_id, while a WebSocket
+      // logical message has its own envelope ID and carries the socket ID here.
+      if (messageId === id || entry.businessId === id) releaseIncoming(messageId);
+    }
+  }
+
+  function releaseAllIncoming() {
+    for (const messageId of state.incoming.keys()) releaseIncoming(messageId);
+  }
+
+  function rememberIncomingTombstone(id) {
+    if (!id) return;
+    const previous = state.incomingTombstones.get(id);
+    if (previous) clearTimeout(previous);
+    while (state.incomingTombstones.size >= MAX_INCOMING_MESSAGES) {
+      const oldest = state.incomingTombstones.entries().next().value;
+      if (!oldest) break;
+      clearTimeout(oldest[1]);
+      state.incomingTombstones.delete(oldest[0]);
+    }
+    const timer = setTimeout(() => {
+      if (state.incomingTombstones.get(id) === timer) state.incomingTombstones.delete(id);
+    }, INCOMING_ASSEMBLY_TTL_MS);
+    state.incomingTombstones.set(id, timer);
+  }
+
+  function releaseIncomingTombstones() {
+    for (const timer of state.incomingTombstones.values()) clearTimeout(timer);
+    state.incomingTombstones.clear();
+  }
+
+  function armIncomingDeadline(messageId, entry) {
+    clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => {
+      if (state.incoming.get(messageId) !== entry) return;
+      failIncoming(messageId, new Error('P2P message assembly timeout'));
+    }, INCOMING_ASSEMBLY_TTL_MS);
+  }
+
+  function failIncoming(messageId, error) {
+    const entry = releaseIncoming(messageId);
+    const businessId = entry?.businessId;
+    if (!businessId) return;
+    const socket = state.sockets.get(businessId);
+    if (socket) socket.fail(error);
+    else rejectEntry(businessId, error);
+  }
+
+  function incomingEntry(messageId, message) {
+    let entry = state.incoming.get(messageId);
+    if (entry) return entry;
+    if (state.incoming.size >= MAX_INCOMING_MESSAGES) throw new Error('P2P incoming message limit exceeded');
+    entry = { next: 0, chunks: [], bytes: 0, kind: null, meta: null, businessId: null, timer: null };
+    state.incoming.set(messageId, entry);
+    armIncomingDeadline(messageId, entry);
+    return entry;
+  }
+
+  function decodeIncomingChunk(data, limit) {
+    if (typeof data !== 'string' || limit < 0 || data.length > Math.ceil(limit / 3) * 4) {
+      throw new Error('P2P incoming message too large');
+    }
+    try {
+      const bytes = unb64(data);
+      if (bytes.length > limit) throw new Error('P2P incoming message too large');
+      return bytes;
+    } catch (error) {
+      if (error.message === 'P2P incoming message too large') throw error;
+      throw new Error('invalid base64 encoding');
+    }
+  }
+
   function rejectEntry(id, error) {
     // Finish an in-flight request or stream and notify the Agent to cancel it.
     const err = error instanceof Error ? error : new Error(String(error));
+    releaseIncomingForBusinessId(id);
     const entry = state.pending.get(id);
     if (entry) {
       state.pending.delete(id);
@@ -564,6 +653,7 @@ TRANSPORT_ADAPTER = r"""
       state.streams.delete(id);
       stream.controller.error(err);
     }
+    if (entry || stream) rememberIncomingTombstone(id);
     if (entry) send({ type: 'cancel', id }, entry.channel).catch(() => {});
   }
 
@@ -580,7 +670,8 @@ TRANSPORT_ADAPTER = r"""
     }
     for (const stream of state.streams.values()) stream.controller.error(error);
     state.streams.clear();
-    state.incoming.clear();
+    releaseAllIncoming();
+    releaseIncomingTombstones();
     for (const socket of state.sockets.values()) {
       // Mark as terminated so queued send tasks cannot later fail() and emit error/close again.
       socket._done = true;
@@ -720,6 +811,7 @@ TRANSPORT_ADAPTER = r"""
       state.pending.delete(message.id);
       if (entry.timer) clearTimeout(entry.timer);
       if (!entry.response) return entry.reject(new Error('incomplete response'));
+      rememberIncomingTombstone(message.id);
       entry.resolve({ type: 'response', id: message.id, status: entry.response.status, headers: entry.response.headers, body: entry.response.chunks.join('') });
       return;
     }
@@ -731,10 +823,12 @@ TRANSPORT_ADAPTER = r"""
         const abortError = new DOMException('Request cancelled', 'AbortError');
         const stream = state.streams.get(message.id);
         state.streams.delete(message.id);
+        rememberIncomingTombstone(message.id);
         stream.controller.error(abortError);
         entry.reject(abortError);
         return;
       }
+      rememberIncomingTombstone(message.id);
       entry.resolve(message);
       return;
     }
@@ -747,11 +841,19 @@ TRANSPORT_ADAPTER = r"""
           entry.resolve(message);
         }
       }
-      if (message.type === 'stream_chunk' && message.body !== undefined) stream.controller.enqueue(unb64(message.body));
+      if (message.type === 'stream_chunk' && message.body !== undefined) {
+        try {
+          stream.controller.enqueue(unb64(message.body));
+        } catch (_) {
+          rejectEntry(message.id, new Error('invalid base64 encoding'));
+          return;
+        }
+      }
       if (message.type === 'stream_end' || message.type === 'stream_error') {
         state.streams.delete(message.id);
         state.pending.delete(message.id);
         if (entry.timer) clearTimeout(entry.timer);
+        rememberIncomingTombstone(message.id);
         // Pre-first-frame proxy errors keep the same HTTP/JSON semantics as Relay; an already-started stream can only be aborted.
         if (message.type === 'stream_error' && !entry.resolved) {
           // Mirror INVALID_ENCODING_REASON from src/p2p.py, mapped to 400; other proxy errors map to 502.
@@ -776,59 +878,70 @@ TRANSPORT_ADAPTER = r"""
       return;
     }
     const id = String(message.message_id || '');
-    let entry = state.incoming.get(id);
-    if (!entry) {
-      entry = { next: 0, chunks: [], kind: null, meta: null };
-      state.incoming.set(id, entry);
-    }
-    if (message.sequence !== entry.next) {
-      state.incoming.delete(id);
-      const pending = state.pending.get(id);
-      if (pending) rejectEntry(id, new Error('invalid frame sequence'));
-      return;
-    }
-    entry.next += 1;
-    if (message.type) {
-      entry.kind = message.type;
-      entry.meta = { ...message };
-      delete entry.meta.message_id;
-      delete entry.meta.sequence;
-      delete entry.meta.data;
-      delete entry.meta.final;
-    }
-    entry.chunks.push(unb64(message.data || ''));
-    if (!message.final) return;
-    const bytes = new Uint8Array(entry.chunks.reduce((size, chunk) => size + chunk.length, 0));
-    let offset = 0;
-    for (const chunk of entry.chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-    const meta = entry.meta ? { ...entry.meta } : null;
-    if (meta) {
-      meta.id = meta.id || id;
-      meta.body = b64(bytes);
-      settleMessage(meta);
-      if (entry.kind === 'stream_chunk') {
-        entry.chunks = [];
-        entry.meta = null;
+    if (state.incomingTombstones.has(id)) return;
+    try {
+      const entry = incomingEntry(id, message);
+      if (message.sequence !== entry.next) throw new Error('invalid frame sequence');
+      entry.next += 1;
+      if (message.type) {
+        // Response, stream, and terminal metadata must use the request's
+        // canonical envelope ID. Control/WS payloads are decoded before they
+        // are associated with a socket, so an invalid unknown frame cannot
+        // cancel an unrelated request merely by claiming its id.
+        if (message.id == null || String(message.id) !== id) throw new Error('invalid P2P message');
+        entry.kind = message.type;
+        entry.meta = { ...message };
+        entry.businessId = id;
+        delete entry.meta.message_id;
+        delete entry.meta.sequence;
+        delete entry.meta.data;
+        delete entry.meta.final;
+      }
+      const bytes = decodeIncomingChunk(message.data || '', Math.min(MAX_P2P_BYTES - entry.bytes, MAX_P2P_BYTES - state.incomingBytes));
+      entry.chunks.push(bytes);
+      entry.bytes += bytes.length;
+      state.incomingBytes += bytes.length;
+      if (!message.final) {
+        if (!entry.timer) armIncomingDeadline(id, entry);
         return;
       }
-      state.incoming.delete(id);
-      return;
-    }
-    if (entry.kind === 'stream_chunk') {
-      settleMessage({ type: 'stream_chunk', id, body: b64(bytes) });
-      entry.chunks = [];
-      return;
-    }
-    try {
-      const decoded = JSON.parse(dec.decode(bytes));
+      const body = new Uint8Array(entry.bytes);
+      let offset = 0;
+      for (const chunk of entry.chunks) { body.set(chunk, offset); offset += chunk.length; }
+      const meta = entry.meta ? { ...entry.meta } : null;
+      if (entry.kind === 'stream_chunk') {
+        state.incomingBytes = Math.max(0, state.incomingBytes - entry.bytes);
+        entry.bytes = 0;
+        entry.chunks = [];
+        entry.meta = null;
+        clearTimeout(entry.timer);
+        entry.timer = null;
+        if (meta) {
+          meta.id = meta.id || id;
+          meta.body = b64(body);
+          settleMessage(meta);
+        } else {
+          settleMessage({ type: 'stream_chunk', id: entry.businessId || id, body: b64(body) });
+        }
+        return;
+      }
+      if (meta) {
+        releaseIncoming(id);
+        meta.id = meta.id || id;
+        meta.body = b64(body);
+        settleMessage(meta);
+        return;
+      }
+      const decoded = JSON.parse(dec.decode(body));
+      releaseIncoming(id);
       settleMessage(decoded);
-    } catch (_) {
-      state.incoming.delete(id);
-      const pending = state.pending.get(id);
-      if (pending) rejectEntry(id, new Error('invalid P2P message'));
-      return;
+    } catch (error) {
+      const normalized = error instanceof Error && error.message === 'invalid frame sequence'
+        ? error : new Error(error instanceof Error && error.message === 'P2P incoming message too large'
+          ? error.message : error instanceof Error && error.message === 'invalid base64 encoding'
+            ? error.message : 'invalid P2P message');
+      failIncoming(id, normalized);
     }
-    state.incoming.delete(id);
   }
 
   // The retry chain guards every mutation with its captured generation: an
@@ -1226,6 +1339,8 @@ TRANSPORT_ADAPTER = r"""
     terminate(code, reason, error) {
       if (this._done) return;
       this._done = true;
+      releaseIncomingForBusinessId(this.id);
+      rememberIncomingTombstone(this.id);
       state.sockets.delete(this.id);
       this.readyState = MeshWebSocket.CLOSED;
       if (error) this.dispatch('error', error);
