@@ -140,6 +140,34 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 
 已实测：Linux（含 WSL、ARM64 / RK3588）。Windows 原生（非 WSL）与 iOS 暂不支持。
 
+## 常用运维命令
+
+普通配置文件修改后，只需重启对应实例；不需要 `daemon-reload`。例如，用户级默认 Agent：
+
+```bash
+systemctl --user restart opencode-mesh-agent.service
+systemctl --user status opencode-mesh-agent.service
+journalctl --user -u opencode-mesh-agent.service -f
+```
+
+具名用户级 Agent（示例实例名 `workstation`）使用模板单元：
+
+```bash
+systemctl --user restart opencode-mesh-agent@workstation.service
+systemctl --user status opencode-mesh-agent@workstation.service
+journalctl --user -u opencode-mesh-agent@workstation.service -f
+```
+
+系统级 Gateway：
+
+```bash
+sudo systemctl restart opencode-mesh-gateway.service
+sudo systemctl status opencode-mesh-gateway.service
+sudo journalctl -u opencode-mesh-gateway.service -f
+```
+
+`config/agents.json` 是共享配置：若只修改一个实例（例如 `agents.default.device_name`），只重启该实例，不必重启同机其他 Agent。`device_name` 仅是注册显示名；重启会重新注册其显示信息，但不会改写程序管理的 `data/agent-state*.json` 身份、`device_id` 或 `agent_token`。只有修改 systemd unit 文件时才先执行对应 scope 的 `daemon-reload`，再重启服务：用户级用 `systemctl --user daemon-reload`，系统级用 `sudo systemctl daemon-reload`。
+
 ## 配置参考
 
 - `agents.json`：同机所有 Agent 的统一人工配置，参见 [`config/agents.example.json`](config/agents.example.json)。顶层配置 Gateway 与加入密钥，`agents` 中按实例名填写各自上游、显示名和可选认证；实例字段覆盖同名公共字段。
