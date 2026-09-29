@@ -181,7 +181,7 @@ li{display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid va
 .dot.healthy{background:var(--offline-success)}
 .dot.failed{background:var(--offline-critical)}
 .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-a.name{color:inherit;text-decoration:underline;cursor:pointer}
+a.name{color:inherit;text-decoration:none;cursor:pointer}
 .state{opacity:.6;font-size:12px}
 .state.unknown{opacity:.8;color:#f59e0b}
 </style>
