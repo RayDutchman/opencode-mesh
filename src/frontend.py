@@ -17,6 +17,9 @@ ASSET_ROOT = '/_mesh/ui/2/'
 PWA_ROOT = '/_mesh/pwa/'
 PWA_SW_PATH = '/sw.js'
 PWA_MANIFEST_PATH = PWA_ROOT + 'manifest.webmanifest'
+# Keep Mesh distinct from the upstream manifest's id '/' on the same origin.
+# This identity need not be navigable; start_url and scope remain at the root.
+PWA_APP_ID = PWA_ROOT.rstrip('/')
 PWA_ICON_SIZES = (192, 512)
 PWA_ICON_DIR = Path(__file__).resolve().parent / 'assets' / 'pwa'
 PWA_MANIFEST_LINK = '<link rel="manifest" crossorigin="use-credentials" href="' + PWA_MANIFEST_PATH + '" />'
@@ -71,9 +74,10 @@ def pwa_manifest_document() -> dict:
     return {
         'name': 'OpenCode Mesh',
         'short_name': 'Mesh',
-        # A per-launch handoff parameter would break last-route restore and turn
-        # the same installation into several identities.
-        'id': '/',
+        # Distinct from the native app's id '/' on this origin, and fixed so a
+        # reinstall keeps the same identity. A per-launch handoff parameter
+        # would break last-route restore and turn one installation into many.
+        'id': PWA_APP_ID,
         'start_url': '/',
         # Keep the root scope explicit even if start_url changes in the future.
         'scope': '/',

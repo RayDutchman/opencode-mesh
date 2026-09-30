@@ -10,9 +10,9 @@
 
 已批准的默认（不再逐项请示）：
 
-- Gateway 级单一 PWA：`id`/`start_url`/`scope` 均为 `/`，冷启动回落到网关根，由既有首页选择与恢复页决定设备。
+- Gateway 级单一 PWA：`id` 为固定 `/_mesh/pwa`，`start_url`/`scope` 为 `/`，冷启动回落到网关根，由既有首页选择与恢复页决定设备。**（2026-09-30 用户批准的边界调整：原定 `id` 为 `/`，因同源旧原生应用已占用该身份导致启动器名称在 Mesh/OpenCode 间切换。）**
 - manifest 与图标由 Gateway 提供，字节入库，不依赖任何在线 Agent。
-- manifest 与图标保持 Basic Auth 保护；manifest 链接注入 `crossorigin="use-credentials"`。
+- manifest 与 `/sw.js` 保持 Basic Auth 保护；manifest 链接注入 `crossorigin="use-credentials"`。**（2026-09-30 用户批准的边界调整：两个图标的精确路径 GET/HEAD 匿名可读，其余仍需凭据。）**
 - `/sw.js` 由 Gateway 提供，接管原生注册的同 URL、同 scope `/`。
 - Service Worker **不注册 `fetch` 处理，不读写 CacheStorage**。旧缓存留在浏览器磁盘上；新 worker 无 `fetch` 处理即不会使用它们，不需要任何清理动作。
 - HTML 规范化注入 manifest 链接（替换既有链接、缺失时在 `<head>` 插入、去重），不为 PWA 让整页失败。
@@ -128,11 +128,13 @@ PWA_ICON_512 = '/_mesh/pwa/icon-512.png'
 
 路由在 `src/main.py` 的 `routes()` 内注册，**早于 catch-all**，仅 `GET`/`HEAD`：
 
-| 路径 | 响应 | 关键头 |
-|---|---|---|
-| `/sw.js` | §4.1 脚本，版本行注入 `src.__version__` | `text/javascript; charset=utf-8`、`Cache-Control: no-cache`、`Service-Worker-Allowed: /` |
-| `/_mesh/pwa/manifest.webmanifest` | 代码生成的 JSON | `application/manifest+json`、`Cache-Control: no-cache` |
-| `/_mesh/pwa/icon-192.png`、`icon-512.png` | `src/assets/pwa/` 字节 | `image/png`、`Cache-Control: no-cache` |
+| 路径 | 响应 | 关键头 | 无凭据 |
+|---|---|---|---|
+| `/sw.js` | §4.1 脚本，版本行注入 `src.__version__` | `text/javascript; charset=utf-8`、`Cache-Control: no-cache`、`Service-Worker-Allowed: /` | 401 |
+| `/_mesh/pwa/manifest.webmanifest` | 代码生成的 JSON | `application/manifest+json`、`Cache-Control: no-cache` | 401 |
+| `/_mesh/pwa/icon-192.png`、`icon-512.png` | `src/assets/pwa/` 字节 | `image/png`、`Cache-Control: no-cache` | 200（GET/HEAD，唯一匿名例外） |
+
+**图标匿名例外（2026-09-30 用户批准的边界调整）**：Chrome 在生成 WebAPK 时以 `CredentialsMode::kOmit` 取 manifest 图标，带 Basic Auth 挑战会丢掉启动器图标。因此认证中间件放行**精确匹配**这两个图标路径的 `GET`/`HEAD`。约束：manifest、`/sw.js`、页面、API 与其他方法仍需凭据（未认证写图标 401、认证写图标 405）；白名单按精确路径集合匹配，变体路径（尾斜杠、大小写、未提供尺寸、子目录、后缀、编码斜杠）仍 401，不得扩成前缀。研究同时确认存在 bitmap fallback，因此这是兼容风险处置，不等于已证实的手机根因。
 
 图标字节放包内 `src/assets/pwa/`，以 `Path(__file__).resolve().parent / "assets" / "pwa"` 解析；缺失时启动即显式报错。`scripts/install.sh` 用 `pip install -e` 且 `WorkingDirectory` 为安装目录，包内数据随检出可用；若将来改 wheel 分发需补 `package-data`（记录为约束）。
 
@@ -144,7 +146,7 @@ manifest 文档：
 {
   "name": "OpenCode Mesh",
   "short_name": "Mesh",
-  "id": "/",
+  "id": "/_mesh/pwa",
   "start_url": "/",
   "scope": "/",
   "icons": [
@@ -159,6 +161,7 @@ manifest 文档：
 
 - `scope` 显式声明：缺省时规范取 `start_url` 的父路径（此处恰为 `/`），显式声明可避免依赖缺省行为。
 - `start_url` 不带 `?mesh_device=`：该参数是一次性 handoff，设备选择由既有首页选择与恢复页负责。
+- **`id` 为 `/_mesh/pwa`（2026-09-30 用户批准的边界调整）**：浏览器按「源 + id」识别已安装应用，同源旧原生应用已占用 `id` `/`，两者会合并为一个启动器条目，名称与图标随最后一次写入而变。`id` 按规范以 `start_url` 为基准解析，是身份标识而非入口，因此不要求可导航；`start_url` 与 `scope` 保持 `/`，冷启动行为不变。旧已安装应用不卸载、不清缓存。
 - `theme_color`/`background_color` 与原生页面 `background-color: var(--v2-background-bg-deep, #fafafa)` 及 `OFFLINE_PAGE` 浅色底一致（上游用 `#080808`）。纯外观。
 
 ### 4.3 HTML 规范化
@@ -218,7 +221,7 @@ manifest 文档：
 4. manifest 字段断言：`id`/`start_url`/`scope` 为 `/`、`display: standalone`、含 192/512 图标、`purpose` 合法、`start_url` 无 query。
 5. 图标字节存在、`Content-Type: image/png`、尺寸与 SHA-256 与记录一致。
 6. HTML 规范化：既有 manifest 链接被替换为 credentialed 网关链接；缺失时插入；重复时去重；`/_mesh/` 路径不被二次改写；`rel="icon"`/`apple-touch-icon` 指向网关图标；**manifest 链接缺失不得抛错**。**2026-09-30 评审补充**：还须覆盖 `data-rel`/`x-rel`/`aria-rel` 不被误判、属性值内引号 `>` 时整标签删除无残渣、`<script>`/`<style>`/HTML 注释内的同文本不被改写、`rel` token 列表与大小写、截断文档不抛错，以及整条 `rewrite_device_html` 管线的字节级幂等。
-7. 恢复页含 manifest 链接与 `/sw.js` 注册，仍为 `no-store`；四条 PWA 路径无凭据访问均 401。
+7. 恢复页含 manifest 链接与 `/sw.js` 注册，仍为 `no-store`；manifest 与 `/sw.js` 无凭据访问为 401。**（2026-09-30 用户批准的边界调整后：两个图标路径的匿名 GET/HEAD 为 200，未认证写为 401、认证写为 405，六个变体路径仍 401，页面与 API 仍 401；`id` 固定为 `/_mesh/pwa` 且跨请求稳定、不随 manifest 路径或设备变化。）**
 8. standalone 冷启动：预置指向 Device A 的 `opencode.pwa.last-route`、默认设备为 Device B，断言**最终路由与在途请求归属为 A**，切换前已发出的请求不被改投或重放。不要求"只协商一次"。**2026-09-30 评审补充**："在途"必须是切换时**尚未 settle** 的真实请求（先前版本先 await 完成再切换，不构成在途证据），并显式断言最终目标为 A。该用例只固定**适配器在 native app 恢复路由之后**的契约：路由移动通过 `history.replaceState` 模拟，未执行上游 `restorePwaRoute` 与 display-mode standalone 冷启动本身（需手机，见 V-6）。
 9. 全量 `.venv/bin/python -m pytest -q -p no:cacheprovider -W error::DeprecationWarning -rs`、`git diff --check`。
 
@@ -249,6 +252,7 @@ manifest 文档：
 | V-4 | 旧 worker 是否被及时替换、旧 precache 是否确实不再被使用 | 验证缺陷 3 处置有效 | 本地 fixture worker 已被同 URL 接管、旧缓存保留且无新增；线上未验 |
 | V-5 | standalone 冷启动恢复 last-route 后的最终目标与在途归属 | 影响 PWA 冷启动体验 | **未验**：本轮浏览器无真实 2.0.18 页面与手机冷启动，仅有自动化回归 |
 | V-6 | 真实安装、启动器图标、冷启动、网关不可达时的离线表现 | 决定是否可替代 Android 客户端 | 未验（用户手机验收；启动器图标未验证） |
+| V-7 | 新 `id` `/_mesh/pwa` 与匿名图标在真实手机 Chrome 上是否让 WebAPK 拿到图标与稳定名称 | 决定这次边界调整是否真的解决启动器问题 | 仅有单元/ASGI 证据，未部署未复验；旧应用保留，重装后为两个独立条目 |
 
 ## 8. 风险与回滚
 

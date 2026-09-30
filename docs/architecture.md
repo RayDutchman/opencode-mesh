@@ -302,13 +302,15 @@ WebSocket 在 `ws_open` 发出前被关闭时，本地确定终止并清理；�
 
 ### 6.5 网关级 PWA
 
-PWA 由 Gateway 单独提供，不随所服务的设备变化，也不依赖任何在线 Agent。四条 GET/HEAD 路径在设备 catch-all 之前注册，认证中间件覆盖它们（无凭据仍为 401），非 GET/HEAD 方法返回 405，不落到设备转发：
+PWA 由 Gateway 单独提供，不随所服务的设备变化，也不依赖任何在线 Agent。四条 GET/HEAD 路径在设备 catch-all 之前注册，非 GET/HEAD 方法返回 405，不落到设备转发。认证中间件覆盖 manifest、`/sw.js`、页面与 API（无凭据为 401）；**唯一的匿名例外是两个图标路径的 GET/HEAD**，因为 Chrome 生成 WebAPK 时用 `CredentialsMode::kOmit` 取图标，带挑战会丢掉启动器图标。该例外按精确路径匹配且只限读，变体路径与其他方法仍走认证（未认证写为 401，认证写为 405）：
 
-| 路径 | 内容 | 关键响应头 |
-|---|---|---|
-| `/sw.js` | 根 scope Service Worker | `Cache-Control: no-cache`、`Service-Worker-Allowed: /` |
-| `/_mesh/pwa/manifest.webmanifest` | `id`/`start_url`/`scope` 均为 `/`，`display: standalone` | `Cache-Control: no-cache` |
-| `/_mesh/pwa/icon-192.png`、`icon-512.png` | 打包在本仓库的本地图标 | `Cache-Control: no-cache` |
+| 路径 | 内容 | 关键响应头 | 无凭据 GET/HEAD |
+|---|---|---|---|
+| `/sw.js` | 根 scope Service Worker | `Cache-Control: no-cache`、`Service-Worker-Allowed: /` | 401 |
+| `/_mesh/pwa/manifest.webmanifest` | `id` 为 `/_mesh/pwa`，`start_url`/`scope` 为 `/`，`display: standalone` | `Cache-Control: no-cache` | 401 |
+| `/_mesh/pwa/icon-192.png`、`icon-512.png` | 打包在本仓库的本地图标 | `Cache-Control: no-cache` | 200（唯一匿名例外） |
+
+manifest 的 `id` 与同源的旧原生应用（`id` 为 `/`）分开：浏览器按「源 + id」识别已安装应用，复用 `/` 会把两次安装合并成一个启动器条目，名称与图标随最后一次写入而变。`id` 只是身份标识，不要求可导航；`start_url` 与 `scope` 保持 `/`，应用仍从网关根打开。
 
 Service Worker 脚本只有 `install`（`skipWaiting`）与 `activate`（`clients.claim`）两个监听器，没有 `fetch` 处理函数，也不读写 CacheStorage。它与上游 `/sw.js` 同 URL、同根 scope，因此注册即接管；旧 Workbox precache 不再被使用，但 Mesh 不枚举、不删除任何 CacheStorage 条目。脚本内嵌 `src.__version__`，保证每次发布字节都变化，浏览器才会执行更新检查。图标由上游 v2.0.18 `favicon-v3.svg` 派生，来源、工具版本与哈希记录在 `src/assets/pwa/README.md`；缺少图标文件时 Gateway 启动即报错。
 

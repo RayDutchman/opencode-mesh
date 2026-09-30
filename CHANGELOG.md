@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- 网关 PWA 使用独立应用标识 `id` `/_mesh/pwa`，与同源旧原生应用分开，避免两次安装合并成同一个启动器条目、名称与图标互相覆盖；启动入口与作用域仍为网关根。
+- 启动器图标改为无需凭据即可读取：仅 `/_mesh/pwa/icon-192.png` 与 `icon-512.png` 的 GET/HEAD 匿名放行（Chrome 生成 WebAPK 时不带凭据取图标）。manifest、Service Worker、页面与接口仍需认证，其他方法与相近路径同样拒绝。
+
 - 在线但上游健康未知的设备仍可手动连接；旧 Mesh Agent 缺少健康字段或报告过期时保持灰色，通过实际 OpenCode V2 `/api/info` 验证后进入，不再将未知状态误判为不可连接。
 - Agent 独立探测本机 OpenCode V2 `/api/info`，连续失败与恢复上报分层健康状态；设备菜单和离线页区分 Agent 离线、OpenCode 不可用及状态未知，不再把控制连接在线直接当作业务可用。
 - P2P offer 的 HTTP 断连、取消及未成功答复会撤销对应 Agent 协商；未建立 DataChannel 的 peer 限期清理，重复 offer 不替换原连接。

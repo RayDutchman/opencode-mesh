@@ -22,8 +22,8 @@ import httpx
 import pytest
 
 from src import __version__
-from src.frontend import (PWA_ICON_DIR, PWA_ICON_SIZES, PWA_LINK_BLOCK, asset_prefix,
-                          normalize_pwa_links, pwa_service_worker_source)
+from src.frontend import (PWA_ICON_DIR, PWA_ICON_SIZES, PWA_LINK_BLOCK, PWA_MANIFEST_PATH,
+                          asset_prefix, normalize_pwa_links, pwa_service_worker_source)
 from src.main import Gateway, OFFLINE_PAGE, rewrite_device_html
 
 # Provenance of the derived launcher icons, recorded in src/assets/pwa/README.md.
@@ -57,6 +57,12 @@ def _png_size(body: bytes) -> tuple[int, int]:
 def _client(gateway: Gateway, **kwargs):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app),
                              base_url='http://test', auth=('test', 'test-pass'), **kwargs)
+
+
+def _anonymous(gateway: Gateway, **kwargs):
+    """A browser that has not answered the Basic Auth challenge."""
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app),
+                             base_url='http://test', **kwargs)
 
 
 async def _fetch_icons(client: httpx.AsyncClient) -> dict[int, bytes]:
@@ -173,7 +179,7 @@ def test_manifest_describes_one_gateway_scoped_application(tmp_path):
             return response.json()
     document = asyncio.run(scenario())
 
-    assert document['id'] == '/' and document['start_url'] == '/' and document['scope'] == '/'
+    assert document['start_url'] == '/' and document['scope'] == '/'
     assert document['display'] == 'standalone'
     # A per-launch handoff parameter would break last-route restore and single-app identity.
     assert '?' not in document['start_url'] and '#' not in document['start_url']
@@ -184,6 +190,30 @@ def test_manifest_describes_one_gateway_scoped_application(tmp_path):
         assert icon['type'] == 'image/png'
         assert set(icon['purpose'].split()) == {'any', 'maskable'}
     assert document['theme_color'] == document['background_color'] == '#fafafa'
+
+
+def test_manifest_id_separates_the_gateway_app_from_the_native_app(tmp_path):
+    """A browser keys an installed app by origin plus id, and the native app owns id '/'.
+
+    Reusing '/' merges both installs on one origin: Chrome then shows one app
+    whose launcher name and icon follow whichever install wrote last.
+    """
+    async def scenario():
+        gateway = _gateway(tmp_path / 'registry.json')
+        async with _client(gateway) as client:
+            first = (await client.get('/_mesh/pwa/manifest.webmanifest')).json()
+            second = (await client.get('/_mesh/pwa/manifest.webmanifest')).json()
+            return first, second
+    first, second = asyncio.run(scenario())
+
+    assert first['id'] == '/_mesh/pwa', 'the Gateway app needs its own identity'
+    assert first['id'] != '/', 'the native app on this origin already owns id /'
+    # Stable across requests: a changing id reads as a new application.
+    assert first['id'] == second['id']
+    # The identity must not move with the manifest location or a device.
+    assert PWA_MANIFEST_PATH not in first['id'] and '/device/' not in first['id']
+    # The id is an identity, not an entry point: launching still goes to '/'.
+    assert first['start_url'] == '/' and first['scope'] == '/'
 
 
 # ---------- icons ----------
@@ -434,19 +464,75 @@ def test_proxy_html_and_pwa_routes_both_answer_from_the_gateway(tmp_path):
 
 # ---------- authentication ----------
 
-def test_pwa_surface_stays_behind_basic_auth(tmp_path):
-    """Installability must not become a way around the Gateway credential."""
+def test_manifest_worker_and_pages_stay_behind_basic_auth(tmp_path):
+    """Installability must not become a way around the Gateway credential.
+
+    Only the two icon paths are anonymous, so the manifest, the worker, the
+    proxied page and the device API keep answering 401 with a challenge.
+    """
     async def scenario():
         gateway = _gateway(tmp_path / 'registry.json')
         gateway.registry.devices['device-a'] = {'device_id': 'device-a', 'name': 'Device A',
                                                  'last_seen': time.time(), 'ws': object()}
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app),
                                      base_url='http://test') as client:
-            for path in ('/sw.js', '/_mesh/pwa/manifest.webmanifest', '/_mesh/pwa/icon-192.png',
-                         '/_mesh/pwa/icon-512.png'):
-                denied = await client.get(path)
+            for path in ('/sw.js', PWA_MANIFEST_PATH, '/', '/_mesh/devices'):
+                denied = await client.get(path, headers={'accept': 'text/html'})
                 assert denied.status_code == 401, path
-                assert 'Basic' in denied.headers['www-authenticate']
+                assert 'Basic' in denied.headers['www-authenticate'], path
+    asyncio.run(scenario())
+
+
+def test_icons_are_readable_without_credentials_and_nothing_else(tmp_path):
+    """Chrome's WebAPK icon hasher omits credentials (CredentialsMode::kOmit).
+
+    A 401 there costs the launcher icon, so an unauthenticated read of the two
+    exact icon paths is answered. A write is still a credential question first:
+    without one it is 401, and with one it is 405 because icons are read only.
+    """
+    async def scenario():
+        gateway = _gateway(tmp_path / 'registry.json')
+        async with _client(gateway) as client, _anonymous(gateway) as guest:
+            for size in PWA_ICON_SIZES:
+                path = f'/_mesh/pwa/icon-{size}.png'
+                for method in ('GET', 'HEAD'):
+                    read = await guest.request(method, path)
+                    assert read.status_code == 200, (method, path)
+                    assert read.headers['content-type'] == 'image/png'
+                # The anonymous read must be the same committed bytes, not a
+                # second or generated variant.
+                assert (await guest.get(path)).content == (await client.get(path)).content, path
+                # A query is a cache-buster, not a different resource.
+                assert (await guest.get(path + '?v=2')).status_code == 200
+                assert (await guest.post(path)).status_code == 401, path
+                assert (await client.post(path)).status_code == 405, path
+                assert (await client.put(path)).status_code == 405, path
+            # The manifest and the worker are not part of that allowance.
+            for path in ('/sw.js', PWA_MANIFEST_PATH):
+                assert (await guest.get(path)).status_code == 401, path
+                assert (await guest.head(path)).status_code == 401, path
+    asyncio.run(scenario())
+
+
+def test_icon_allowlist_matches_no_variant_path(tmp_path):
+    """The allowance is two exact paths, not a prefix and not a pattern.
+
+    Anything that merely looks like an icon path must still challenge, or the
+    anonymous surface would grow with every new asset under /_mesh/pwa/.
+    """
+    variants = ('/_mesh/pwa/icon-192.png/',   # trailing slash
+                '/_mesh/pwa/icon-64.png',     # size that is not served
+                '/_mesh/pwa/ICON-192.PNG',    # case variant
+                '/_mesh/pwa/sub/icon-192.png',  # nested path
+                '/_mesh/pwa/icon-192.png.bak',  # suffixed file
+                '/_mesh/pwa/icon-192.png%2F')  # encoded slash
+    async def scenario():
+        gateway = _gateway(tmp_path / 'registry.json')
+        async with _anonymous(gateway) as guest:
+            for path in variants:
+                denied = await guest.get(path)
+                assert denied.status_code == 401, path
+                assert 'Basic' in denied.headers['www-authenticate'], path
     asyncio.run(scenario())
 
 

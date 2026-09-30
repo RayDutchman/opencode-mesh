@@ -670,10 +670,16 @@ class Gateway:
     def routes(self):
         app = self.app
 
+        # WebAPK icon hashing can fetch without credentials. Expose only these
+        # static icon reads; all other PWA resources and writes stay protected.
+        anonymous_reads = {pwa_icon_path(size) for size in PWA_ICON_SIZES}
+
         @app.middleware("http")
         async def basic_auth_middleware(req: Request, call_next):
             path = req.url.path
             if path == "/_mesh/register" or path.startswith("/_mesh/agent/") or path.startswith("/_mesh/deregister/"):
+                return await call_next(req)
+            if req.method in ("GET", "HEAD") and path in anonymous_reads:
                 return await call_next(req)
             if not self.check_auth(req):
                 client_ip = req.client.host if req.client else "unknown"
@@ -685,7 +691,8 @@ class Gateway:
 
         # The PWA surface is origin-scoped and answered by the Gateway itself: it
         # never reaches a device, never stores anything and never intercepts
-        # traffic. The basic auth middleware above keeps all of it credentialed.
+        # traffic. Apart from the two icon reads above, the basic auth
+        # middleware keeps all of it credentialed.
         pwa_methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 
         def pwa_resource(label: str, path: str, body: bytes, media_type: str, headers: dict[str, str]) -> None:
