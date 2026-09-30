@@ -4,15 +4,16 @@
 
 ## 1. 先确认事实来源
 
-### 网关级 PWA（2026-09-30，已合入并部署 2f5e845；边界调整已实现未提交）
+### 网关级 PWA（2026-09-30，已合入并部署 2f5e845；身份隔离与匿名图标已部署 814fda2）
 
-- 已批准边界调整（2026-09-30，**用户书面批准**，`src/frontend.py`、`src/main.py` 已改，**未提交、未部署**，等主 agent 独立验证）：
+- 身份隔离与匿名图标（2026-09-30，**用户书面批准**，提交 `814fda2` **已提交并部署**到 VPS Gateway）：
   - manifest `id` 由 `/` 改为固定 `/_mesh/pwa`，`start_url` 与 `scope` 仍是 `/`。依据：浏览器按「源 + id」识别已安装应用，同源旧原生应用已占用 `id` `/`，复用会让两次安装合并成一个启动器条目，名称与图标随最后一次写入而变（手机 Chrome 实测名称在 Mesh/OpenCode 间切换）。`id` 只是身份标识，不要求可导航。
   - 认证中间件新增唯一匿名例外：**精确匹配** `/_mesh/pwa/icon-192.png` 与 `/_mesh/pwa/icon-512.png` 的 GET/HEAD。依据：Chrome 生成 WebAPK 时以 `CredentialsMode::kOmit` 取图标，带 Basic Auth 挑战会丢掉启动器图标；研究同时确认存在 bitmap fallback，因此这是兼容风险处置，**不是已证实的手机根因**。manifest、`/sw.js`、页面、API 及其他方法仍走认证：未认证写图标 401，认证写图标 405；变体路径（尾斜杠、大小写、未提供尺寸、子目录、后缀、编码斜杠）一律 401，白名单不可扩展为前缀。
   - 未改动旧 manifest 代理路由、未清任何缓存、未卸载旧应用、未改 Android。
-- 部署状态（2026-09-30，提交 `2f5e845`）：已合入原工作分支、推送 `origin/main` 并仅部署 Gateway；服务 active 与完整 `.mesh-revision` 核对通过。线上 HTTPS 的 manifest、192/512 图标与 `/sw.js` 均返回 200 且图标/SW 与本地字节一致，首页及恢复页包含 credentialed manifest；该版本**匿名 manifest/SW/图标均为 401**（上述匿名图标例外尚未部署）。未重启 Agent、未改 OpenCode 认证、未重打包或删除 Android。手机安装、standalone 冷启动与业务体验待用户验收；以上 HTTP 检查不等同线上浏览器安装通过。
+- 部署核验（2026-09-30，提交 `814fda2`，主 agent 独立执行）：远端 revision 为 `814fda2c473ab6329c92c63b540a0f68cf03ac5c`，`opencode-mesh-gateway.service` active。线上 HTTPS 实测：匿名 GET/HEAD `/_mesh/pwa/icon-192.png` → 200 `image/png` 628 字节、`/_mesh/pwa/icon-512.png` → 200 1964 字节；匿名 POST 两个图标均 401；匿名 GET `/_mesh/pwa/manifest.webmanifest`、`/sw.js`、`/_mesh/devices` 均 401；已认证 manifest 为 `id=/_mesh/pwa`、`start_url=/`、`scope=/`、`name=OpenCode Mesh`；已认证 GET `/` → 200 且含新的 manifest 链接；已认证 POST 图标 → 405。仅部署 Gateway，未重启任何 Agent、未部署 PVE、未重打包 APK；版本仍为 0.3.2，tag `91de7aa` 未动。以上均为 HTTP 层核验，**不等同浏览器安装通过**。
+- 前次部署（2026-09-30，提交 `2f5e845`）：已合入原工作分支、推送 `origin/main` 并仅部署 Gateway；服务 active 与完整 `.mesh-revision` 核对通过。线上 HTTPS 的 manifest、192/512 图标与 `/sw.js` 均返回 200 且图标/SW 与本地字节一致，首页及恢复页包含 credentialed manifest；**该版本匿名 manifest/SW/图标均为 401**，上述匿名图标例外由 `814fda2` 引入。未重启 Agent、未改 OpenCode 认证、未重打包或删除 Android。
 - 目标：恢复 Mesh 网页 PWA，同时不引入离线缓存。manifest 与 Service Worker 由 Gateway 提供，不依赖在线 Agent；所有导航与业务请求不经 Service Worker、不被重放；Mesh 代码不读写 CacheStorage，也不枚举删除任何旧缓存。
-- 实现（分支 `feat/mesh-pwa`，worktree `.worktrees/mesh-pwa`，基线 `8b87e95`，已合入运行分支并部署 `2f5e845`；下列边界调整未提交）：
+- 实现（分支 `feat/mesh-pwa`，worktree `.worktrees/mesh-pwa`，基线 `8b87e95`；已合入运行分支，先后部署 `2f5e845` 与 `814fda2`）：
   - `src/frontend.py` 新增 PWA 路径常量、`pwa_manifest_document()`、`pwa_service_worker_source(version)`、`load_pwa_icons()`、`normalize_pwa_links()`。`src/main.py` 在设备 catch-all 之前注册 `/sw.js`、`/_mesh/pwa/manifest.webmanifest`、`/_mesh/pwa/icon-192.png`、`/_mesh/pwa/icon-512.png`：仅 GET/HEAD，其他方法 405（避免落到设备转发），`Cache-Control: no-cache`，`/sw.js` 附 `Service-Worker-Allowed: /`，脚本内嵌 `src.__version__`；图标缺失时 `Gateway.__init__` 直接报错。
   - Service Worker 脚本只有 `install`（`skipWaiting`）与 `activate`（`clients.claim`），无 `fetch` 处理函数、无 `respondWith`、无 `importScripts`、无 `caches`。旧 Workbox precache 保留但不再使用，登记为风险 R-4：Mesh 不清理它。
   - `rewrite_device_html()` 先删除所有 `rel="manifest"`/`rel="icon"`/`rel="apple-touch-icon"` 链接再在 `</head>` 前插入唯一一组网关链接，manifest 带 `crossorigin="use-credentials"`（Basic Auth 需要凭据随请求发送）；缺标签或无 `</head>` 的片段只追加不报错；规范化幂等。`og:image` 保持设备路径。`OFFLINE_PAGE` 带同一组链接并内联注册 `/sw.js`，仍为 `no-store`。
@@ -25,7 +26,7 @@
   - 由此得到的结论：V-1 的注入侧、V-2、V-4 在**本环境**成立（V-2 不 401 → R-2 在此不成立，因此暂不需要"单个脚本免认证"回退）。
   - 不能据此宣称：headless 下 CDP `Page.getManifestIcons` 的 optional `primaryIcon` 为空，既不证明图标失败，也**不构成启动器图标已验证**；本轮无真实 OpenCode 2.0.18 设备页面（观察到的是恢复页），因此**设备 HTML 规范化的浏览器侧行为、真实设备会话与业务链路未在浏览器验证**。
 - 仍为未验证（不得当作通过）：线上 HTTPS 下缺 `crossorigin` 的原始表现（V-1 另一半）、Chrome 2026 自动安装提示（V-3）、**手机冷启动 last-route 的最终目标与在途归属（V-5）**、真实安装与启动器图标与冷启动（V-6，用户手机验收）。Android 手机与线上环境均未验证，验收 V-6 前不评估是否可移除 Android 客户端。
-- 边界调整的验证状态：新 `id` 与匿名图标只有单元/ASGI 层证据（`tests/test_v2_pwa.py`），**尚未部署、未在真实浏览器或手机上复验**；旧的浏览器 PASS 记录对应 `2f5e845` 之前的代码，不能当作新代码的浏览器证据。重装后启动器是否出现独立图标、名称是否稳定为 Mesh，属 V-6 手机验收。
+- 边界调整的验证状态：新 `id` 与匿名图标已有单元/ASGI 层证据（`tests/test_v2_pwa.py`）与线上 HTTP 层证据（`814fda2` 部署核验，见上），但 **V-7 真机 WebAPK 安装仍未验证**——`2f5e845` 时代手机反馈「安装后无桌面图标、名称在 Mesh/OpenCode 间切换」，重装后是否出现独立图标、名称是否稳定为 Mesh、standalone 冷启动与业务体验，全部待用户手机验收；本次 HTTP 核验与旧的浏览器 PASS 记录（对应 `2f5e845` 之前的代码）都不能替代真机安装证据。旧应用不卸载、不清缓存，重装后预期为两个独立启动器条目。
 - 保留边界（用户已明确接受）：网关不可达冷启动显示浏览器自身离线错误页，Mesh 无离线壳；网关可达但设备不可用时走既有恢复页。
 - 收尾复验：实现子会话限流后，主 agent 核对已保存的审查修正，独立运行全套得到 **377 passed / 1 skipped**，隔离 Chromium 探针再次 PASS，diff 检查通过。当前 OpenCode 上游 401 故障独立于本轮 PWA；未修改生产认证配置或重启生产服务。
 
