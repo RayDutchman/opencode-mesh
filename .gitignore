@@ -29,3 +29,9 @@ dist/
 # Deployment metadata and on-host source backups
 .mesh-revision
 .mesh-backups/
+
+# Android build artifacts and private signing identities
+*.apk
+*.apk.idsig
+*.jks
+*.keystore

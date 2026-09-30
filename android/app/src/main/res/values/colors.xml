@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Background of the adaptive launcher icon; matches the #131010 backdrop
+         of the upstream favicon-v3.svg the foreground is derived from. -->
+    <color name="ic_launcher_background">#131010</color>
+</resources>

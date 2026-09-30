@@ -47,6 +47,7 @@
 | `src/p2p.py` | WebRTC 接入、分片、大小与装配预算、背压和清理 |
 | `src/static_adapter.py` | 浏览器 URL/fetch/WS 适配、设备发现、通道选择及状态栏 |
 | `src/frontend.py` | 集中启动契约适配、静态资源命名空间、旧书签迁移 |
+| `android/` | 内置固定版 OpenCode 前端的 Android WebView 预览客户端；构建、安装与验收限制见 `android/README.md` |
 | `tests/test_mesh_reliability.py` | 代理、分片及生命周期回归 |
 | `tests/test_v2_*.py` | 实际 Node 浏览器接口行为及 V2 错误、启动、上传、WS 边界 |
 | `tests/test_v2_offline_page.py` | 统一在线判据（列表/路由/P2P/浏览器 ws gate）、离线页行为与轮询失败/永不返回恢复（ASGI 直驱 websocket + Node 真实页面脚本） |
@@ -204,6 +205,18 @@ UI 或传输行为变更应按受影响范围检查：
 - 最终验证：完整 `.venv/bin/python -m pytest -q -p no:cacheprovider -W error::DeprecationWarning` 为 `274 passed in 7.53s`（前台健康测试共 16 项）；`git diff --check` 和实际适配器 `node --check` 通过。独立 reviewer 服务报错未完成，由主 agent 复核并补上述红绿证据。未提交、未部署、未重新打包 APK；安卓浏览器锁屏现场仍待用户验证。
 - 后续状态：上述最终验证段末尾的“未提交、未部署”为部署前时点；此后已提交、推送和部署 `dff5709`，用户报告安卓浏览器锁屏恢复明显改善。未重新打包 APK，未进行开发者真机全链路验收。
 - 下一步：用户继续浏览器验证，特别是反复锁屏、网络变化和终端恢复；结果回填本节。
+
+### APK UI 层：菜单、主题同步与原生连接状态（2026-09-25，未发布）
+
+本地预览产物已生成：`opencode-mesh-0.1.1-preview.apk`（versionCode 2，10,585,171 字节），SHA-256 `e2dd1d52814179fbaccc12f0cb428596d32e6ac1610a4bf999d869015fa886c9`。复用 0.1.0 签名，可覆盖安装；原预览文件保留。全部 1,103 个资源的包内 hash 和 v2/v3 签名通过校验。源码尚未提交/推送，生产服务未部署此 Android 工作。
+
+- 基线 `bc7d86c`，分支 `feat/android-apk`；与 logo worker 并行（后者拥有 Manifest/`build_apk.py`/`res/`，本项不触碰）。盘满事故后先核对无 ENOSPC 截断再续写；本项全部写入已验证。
+- 任务（用户已批准）：去掉 `MainActivity` 独占高度的原生 Gateway/Reload 工具栏；新增 APK 专用 `android/ui.js`，在传输适配器 `#ocm-mesh-bar` 右侧追加 ⋮ 菜单（Gateway settings/Reload，仅用 `var(--v2-*)` token）；把实际网页背景与明暗同步到原生窗口/系统状态导航栏（target 35 手势背景透明由 window 背景承接，不承诺设置手势 pill 颜色），安全区/键盘用 insets 适配；原生 Gateway 对话框跟随主题；首次配置/priming/失败必须有可见连接状态与 Retry/修改 Gateway，不依赖未加载网页菜单。
+- 关键决定：桥接不用 `addJavascriptInterface`，而是受限 `ocm-app://` 主帧导航（settings/reload/theme），Java 侧以“当前 view 身份 + 主帧 + priming 完成（本地 UI 就绪）+ 页面为固定 Gateway 同源”门槛放行，其余一律拦住；主题回传只含 `r/g/b/a/dark` 整数、绝不携带凭据，颜色由浏览器计算（computed style 经 canvas `getImageData` 归一化，兼容嵌套 `var()`/oklch，不把原始 token 当 hex）。`AppScheme.java` 纯 JVM 负责严格解析/门禁/alpha 合成；`build_frontend.py` 把 `ui.js` 原样打包为 `web/mesh-ui.js` 并更新 index.html 的 pinned patched hash（新 hash `12baf8b3…`），package 必含 mesh-ui.js。认证 priming 精确 GET、JS disabled、15s deadline、view 身份守卫、无 mutation 重放、文件选择器全部保留；`src/static_adapter.py` 未改动。
+- 红绿：`tests/test_android_ui.py`（Node DOM/Canvas shim 驱动真实 `ui.js` 行为 + JVM `AppScheme` 契约 + API-35 android.jar 编译门）与 `tests/test_android_frontend_build.py` 首轮红 `19 failed, 8 passed`，实施后目标 27 项全绿。主 agent 合并并修正 API 26–29 insets 兼容、API 30+ 显式 edge-to-edge、原生弹窗主题后，独立完整复跑 **251 passed**（`-W error::DeprecationWarning`），diff 检查与真实 SDK 构建通过。
+- 浏览器证据：固定版源码重建后，Chromium 对真实 Gateway 加载 73 个 APK 本地资源，0 缺失、0 page errors、0 service worker；将原生 scheme 导航替换成记录器后，设置/重载菜单以及深浅背景主题回传均通过。图标使用固定上游 Web logo，调整至 adaptive icon 安全圆内。
+- 未验证/限制：本次 0.1.1 未做真实 Android 设备/模拟器验收——`ocm-app://` 拦截、系统栏/弹窗主题、insets/键盘均待真机复验；手势 pill 颜色属于系统行为。用户对 0.1.0 的整体认可不代替这些新增路径验收。旧准备目录只恢复 index.html 的原始入口后重新执行固定 hash 的 prepare，前端与原生包已经重建；不再需要重新下载上游或安装依赖。根分区空间有限，临时产物放独立 `/tmp/opencode` 文件系统。
+- 后续状态：UI 与 logo 已合并构建并交付上述 0.1.1-preview。用户决定暂缓 APK，保留源码与产物，后续恢复时再纳入最新适配器并按 android/README.md 第 4 节验收。
 
 ### 统一设备在线判据与离线页行为（2026-09-24，未发布）
 
