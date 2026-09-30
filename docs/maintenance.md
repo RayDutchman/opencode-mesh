@@ -6,6 +6,7 @@
 
 ### 网关级 PWA（2026-09-30，隔离分支实现，本地 loopback 浏览器验收已做，手机与线上未验）
 
+- 部署状态（2026-09-30）：用户授权合入并部署后，`2f5e845` 已合入原工作分支、推送 `origin/main` 并仅部署 Gateway；服务 active 与完整 `.mesh-revision` 核对通过。线上 HTTPS 的 manifest、192/512 图标与 `/sw.js` 均返回 200 且图标/SW 与本地字节一致，首页及恢复页包含 credentialed manifest；匿名 manifest/SW 仍为 401。未重启 Agent、未改 OpenCode 认证、未重打包或删除 Android。手机安装、standalone 冷启动与业务体验待用户验收；以上 HTTP 检查不等同线上浏览器安装通过。
 - 目标：恢复 Mesh 网页 PWA，同时不引入离线缓存。manifest 与 Service Worker 由 Gateway 提供，不依赖在线 Agent；所有导航与业务请求不经 Service Worker、不被重放；Mesh 代码不读写 CacheStorage，也不枚举删除任何旧缓存。
 - 实现（分支 `feat/mesh-pwa`，worktree `.worktrees/mesh-pwa`，回退基线 `8b87e95`，尚未合入运行分支、未部署）：
   - `src/frontend.py` 新增 PWA 路径常量、`pwa_manifest_document()`、`pwa_service_worker_source(version)`、`load_pwa_icons()`、`normalize_pwa_links()`。`src/main.py` 在设备 catch-all 之前注册 `/sw.js`、`/_mesh/pwa/manifest.webmanifest`、`/_mesh/pwa/icon-192.png`、`/_mesh/pwa/icon-512.png`：仅 GET/HEAD，其他方法 405（避免落到设备转发），`Cache-Control: no-cache`，`/sw.js` 附 `Service-Worker-Allowed: /`，脚本内嵌 `src.__version__`；图标缺失时 `Gateway.__init__` 直接报错。
