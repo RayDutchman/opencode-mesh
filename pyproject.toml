@@ -18,3 +18,8 @@ version = {attr = "src.__version__"}
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+# The Gateway PWA icons are read from the installed package; an editable install
+# finds them in the source tree, a built distribution needs them declared.
+[tool.setuptools.package-data]
+src = ["assets/pwa/*"]

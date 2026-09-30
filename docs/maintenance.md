@@ -4,6 +4,25 @@
 
 ## 1. 先确认事实来源
 
+### 网关级 PWA（2026-09-30，隔离分支实现，本地 loopback 浏览器验收已做，手机与线上未验）
+
+- 目标：恢复 Mesh 网页 PWA，同时不引入离线缓存。manifest 与 Service Worker 由 Gateway 提供，不依赖在线 Agent；所有导航与业务请求不经 Service Worker、不被重放；Mesh 代码不读写 CacheStorage，也不枚举删除任何旧缓存。
+- 实现（分支 `feat/mesh-pwa`，worktree `.worktrees/mesh-pwa`，回退基线 `8b87e95`，尚未合入运行分支、未部署）：
+  - `src/frontend.py` 新增 PWA 路径常量、`pwa_manifest_document()`、`pwa_service_worker_source(version)`、`load_pwa_icons()`、`normalize_pwa_links()`。`src/main.py` 在设备 catch-all 之前注册 `/sw.js`、`/_mesh/pwa/manifest.webmanifest`、`/_mesh/pwa/icon-192.png`、`/_mesh/pwa/icon-512.png`：仅 GET/HEAD，其他方法 405（避免落到设备转发），`Cache-Control: no-cache`，`/sw.js` 附 `Service-Worker-Allowed: /`，脚本内嵌 `src.__version__`；图标缺失时 `Gateway.__init__` 直接报错。
+  - Service Worker 脚本只有 `install`（`skipWaiting`）与 `activate`（`clients.claim`），无 `fetch` 处理函数、无 `respondWith`、无 `importScripts`、无 `caches`。旧 Workbox precache 保留但不再使用，登记为风险 R-4：Mesh 不清理它。
+  - `rewrite_device_html()` 先删除所有 `rel="manifest"`/`rel="icon"`/`rel="apple-touch-icon"` 链接再在 `</head>` 前插入唯一一组网关链接，manifest 带 `crossorigin="use-credentials"`（Basic Auth 需要凭据随请求发送）；缺标签或无 `</head>` 的片段只追加不报错；规范化幂等。`og:image` 保持设备路径。`OFFLINE_PAGE` 带同一组链接并内联注册 `/sw.js`，仍为 `no-store`。
+  - 规范化判定用 stdlib `html.parser.HTMLParser`，不用正则（2026-09-30 评审修订）：`rel` 按空格分 token，只有真实 `rel` 属性命中才算 PWA 链接，`data-rel`/`x-rel`/`aria-rel` 不再误删整条 stylesheet/preload 标签；标签范围取解析器给出的原文，引号内的 `>` 不再截断标签、`<script>`/`<style>`/HTML 注释里的同文本不再被改写；插入点取解析出的真实 `</head>` 起始偏移。文档按 latin-1 解码后只做字节拼接，编辑区间之外的字节逐字保留。实测 500 字节应用壳单次 0.058 ms，1.4 MB 文档 163 ms（线性开销，真实路径是应用壳导航）。
+  - `pyproject.toml` 增加 `[tool.setuptools.package-data]`，`pip wheel` 已验证 wheel 内含 `src/assets/pwa/*`。
+- 资产：`src/assets/pwa/icon-192.png`、`icon-512.png` 由上游 `packages/ui/src/assets/favicon/favicon-v3.svg` @ `anomalyco/opencode` **v2.0.18**（仓库根 LICENSE 为 **MIT，Copyright (c) 2025 opencode**，原文以 `LICENSE-OpenCode.txt` 随包分发）派生：logo 组 `translate(64 64) scale(0.75)` 居中以满足 maskable 安全区，`rsvg-convert` 2.61.3 栅格化。源文件、生成命令、实测内容边界与 SHA-256 记录在 `src/assets/pwa/README.md`，并由 `tests/test_v2_pwa.py` 固定哈希与 PNG 几何。
+- 验证：全量 pytest **377 passed, 1 skipped**（基线 356 + 新增 21，跳过项为 Android API-35 工具链缺失）。新增 `tests/test_v2_pwa.py`（20 项）覆盖脚本结构与 `node --check`、无 CacheStorage 路径、PWA 请求不进设备、manifest 字段、图标哈希与 PNG 几何、maskable 安全区（自带 zlib 解码，不新增依赖，实测 bbox/半径与生成时的 PIL 读数一致）、HTML 替换/插入/去重、恢复页包含项、四条路径 401 与 405、图标由 Gateway 构造时载入，以及评审后新增的 6 项 HTML 规范化边界（`data-rel`/`x-rel`/`aria-rel` 不误删、引号内 `>` 整标签删除无残渣、`script`/`style`/注释内文本不变、`rel` token 列表与大小写、截断文档不抛错、整条 `rewrite_device_html` 管线字节级幂等）。`tests/test_v2_bootstrap.py` 的 last-route 用例已重写并改名 `test_restored_last_route_owns_the_page_while_a_pending_request_stays_with_its_device`：预置指向 Device A 的 `opencode.pwa.last-route`、默认设备为 Device B，**切换时该请求尚未 settle**（真实在途），断言它只发一次、留在 B、不被 resolve 或取消，并显式断言切换后最终目标为 A；另断言切换不改投默认 Server 的裸路径请求、已带设备前缀的 URL 不被二次改写。四个反向变异（在途即 settle / 不恢复路由 / 切换后重放 / 发出时即错设备）均如期失败，断言非空。`compileall`、`node --check`（适配器与 `/sw.js`）、`pip wheel` 含 `src/assets/pwa/*`、`git diff --check` 通过。
+- 浏览器验收（2026-09-30，独立探针 `/tmp/opencode/mesh-pwa-probe/run_probe.py --worktree <本worktree>`，PASS）：**范围为本地 loopback + 真实 Chromium + 隔离 profile + 临时 Gateway（无 Agent）+ 浏览器原生 Basic Auth 挑战**，未使用 `Network.setExtraHTTPHeaders` 塞 `Authorization`。
+  - 已观测：恢复页 200 且该导航**不是**由 Service Worker 应答；manifest 200，HTML 内为 `crossorigin="use-credentials"` 的网关链接，CDP manifest 无解析错误、installability errors 为空；`/sw.js` 以同 URL 接管旧 fixture worker、根 scope `/` 安装与激活完成且未 401；旧 CacheStorage 条目与 localStorage sentinel 完整保留、Mesh 未新增任何缓存条目；`icon-192/512` 网络层 200（628/1964 字节）。
+  - 由此得到的结论：V-1 的注入侧、V-2、V-4 在**本环境**成立（V-2 不 401 → R-2 在此不成立，因此暂不需要"单个脚本免认证"回退）。
+  - 不能据此宣称：headless 下 CDP `Page.getManifestIcons` 的 optional `primaryIcon` 为空，既不证明图标失败，也**不构成启动器图标已验证**；本轮无真实 OpenCode 2.0.18 设备页面（观察到的是恢复页），因此**设备 HTML 规范化的浏览器侧行为、真实设备会话与业务链路未在浏览器验证**。
+- 仍为未验证（不得当作通过）：线上 HTTPS 下缺 `crossorigin` 的原始表现（V-1 另一半）、Chrome 2026 自动安装提示（V-3）、**手机冷启动 last-route 的最终目标与在途归属（V-5）**、真实安装与启动器图标与冷启动（V-6，用户手机验收）。Android 手机与线上环境均未验证，验收 V-6 前不评估是否可移除 Android 客户端。
+- 保留边界（用户已明确接受）：网关不可达冷启动显示浏览器自身离线错误页，Mesh 无离线壳；网关可达但设备不可用时走既有恢复页。
+- 收尾复验：实现子会话限流后，主 agent 核对已保存的审查修正，独立运行全套得到 **377 passed / 1 skipped**，隔离 Chromium 探针再次 PASS，diff 检查通过。当前 OpenCode 上游 401 故障独立于本轮 PWA；未修改生产认证配置或重启生产服务。
+
 ### 未知健康状态允许验证连接（2026-09-29，已部署本机与 VPS）
 
 - 用户确认：Agent 在线但健康 unknown（旧 Mesh 不上报、报告过期等）保持灰色，允许手动点击并由实际 `/api/info` 验证 OpenCode V2；明确失败与 Agent 离线继续不可选。

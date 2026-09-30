@@ -12,7 +12,11 @@ import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse, RedirectResponse
 from . import __version__
-from .frontend import ASSET_ROOT, adapt_entry, asset_prefix, parse_asset_route, legacy_server_redirect
+from .frontend import (ASSET_ROOT, PWA_ICON_SIZES, PWA_LINK_BLOCK, PWA_MANIFEST_PATH,
+                       PWA_REGISTRATION_SCRIPT, PWA_SW_PATH, adapt_entry, asset_prefix,
+                       legacy_server_redirect, load_pwa_icons, normalize_pwa_links,
+                       parse_asset_route, pwa_icon_path, pwa_manifest_document,
+                       pwa_service_worker_source)
 from .p2p import (CHUNK_SIZE, CONNECTION_FAILED_REASON, CONTROL_SEND_TIMEOUT,
                    INVALID_ENCODING_REASON, INVALID_SEQUENCE_REASON,
                    PAYLOAD_TOO_LARGE_REASON, REQUEST_TOO_LARGE_REASON,
@@ -100,9 +104,12 @@ def parse_server_route(path: str) -> tuple[str | None, str]:
 
 def rewrite_device_html(body: bytes, device_id: str, bootstrap: bool = False) -> bytes:
     """Rewrite root-relative static assets in device HTML to device-scoped paths."""
+    # PWA links are normalized first: they describe the Gateway, and the
+    # generic rewrite below would otherwise bind them to this device.
+    result = normalize_pwa_links(body)
     prefix = "/_mesh/device/" + quote(device_id, safe="")
     pattern = re.compile(rb"((?:src|href)\s*=\s*[\"'])/(?!/|_mesh/)", re.IGNORECASE)
-    result = pattern.sub(lambda match: match.group(1) + prefix.encode("ascii") + b"/", body)
+    result = pattern.sub(lambda match: match.group(1) + prefix.encode("ascii") + b"/", result)
     if bootstrap:
         result = result.replace((prefix + '/_assets/').encode(), (asset_prefix(device_id) + '/_assets/').encode())
     return result
@@ -161,6 +168,7 @@ OFFLINE_PAGE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OpenCode Mesh</title>
+""" + PWA_LINK_BLOCK + """
 <script id="ocm-offline-theme">
 try {
   var colorScheme = localStorage.getItem('opencode-color-scheme');
@@ -304,6 +312,7 @@ function tick(){
 tick();
 setInterval(tick, 3000);
 </script>
+""" + PWA_REGISTRATION_SCRIPT + """
 </body>
 </html>
 """
@@ -408,6 +417,11 @@ class Gateway:
         self.auth_failures: dict[str, list[float]] = {}
         self.register_attempts: dict[str, list[float]] = {}
         self.app = FastAPI(title="OpenCode Mesh Gateway", lifespan=self.lifespan)
+        # The PWA surface belongs to the Gateway, so it is built once here. Missing
+        # packaged assets must stop startup instead of surfacing as a request error.
+        self.pwa_icons = load_pwa_icons()
+        self.pwa_worker = pwa_service_worker_source(__version__)
+        self.pwa_manifest = json.dumps(pwa_manifest_document()).encode()
         self.routes()
 
     @contextlib.asynccontextmanager
@@ -668,6 +682,31 @@ class Gateway:
                 return JSONResponse({"error": "unauthorized"}, status_code=401,
                                     headers={"WWW-Authenticate": 'Basic realm="OpenCode Mesh"'})
             return await call_next(req)
+
+        # The PWA surface is origin-scoped and answered by the Gateway itself: it
+        # never reaches a device, never stores anything and never intercepts
+        # traffic. The basic auth middleware above keeps all of it credentialed.
+        pwa_methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+        def pwa_resource(label: str, path: str, body: bytes, media_type: str, headers: dict[str, str]) -> None:
+            async def endpoint(req: Request) -> Response:
+                # Refuse other methods here instead of letting the device
+                # catch-all match, which would proxy them to an Agent.
+                if req.method not in ("GET", "HEAD"):
+                    return Response(status_code=405, headers={"allow": "GET, HEAD"})
+                return Response(body, media_type=media_type, headers=headers)
+
+            app.api_route(path, methods=pwa_methods, name=f"pwa_{label}")(endpoint)
+
+        # Taking over the upstream worker means serving the same URL; the scope
+        # header keeps the root scope valid for this script location.
+        pwa_resource("service_worker", PWA_SW_PATH, self.pwa_worker, "text/javascript",
+                     {"cache-control": "no-cache", "service-worker-allowed": "/"})
+        pwa_resource("manifest", PWA_MANIFEST_PATH, self.pwa_manifest, "application/manifest+json",
+                     {"cache-control": "no-cache"})
+        for icon_size in PWA_ICON_SIZES:
+            pwa_resource(f"icon_{icon_size}", pwa_icon_path(icon_size), self.pwa_icons[icon_size],
+                         "image/png", {"cache-control": "no-cache"})
 
         @app.get("/_mesh/devices")
         async def devices(req: Request):

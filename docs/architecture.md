@@ -300,6 +300,26 @@ WebSocket 在 `ws_open` 发出前被关闭时，本地确定终止并清理；�
   - 迟到 pong 或迟到探针超时不影响新连接；重复 visibility/pageshow 既不重启也不延长 3s 时限；探针期间再次隐藏会取消在途探针而不执行过期淘汰，重新可见开启新的完整窗口。
   - 初始可见页面不当作锁屏恢复、不触发探针；无 open 通道的恢复保持原有 hint/退避路径。
 
+### 6.5 网关级 PWA
+
+PWA 由 Gateway 单独提供，不随所服务的设备变化，也不依赖任何在线 Agent。四条 GET/HEAD 路径在设备 catch-all 之前注册，认证中间件覆盖它们（无凭据仍为 401），非 GET/HEAD 方法返回 405，不落到设备转发：
+
+| 路径 | 内容 | 关键响应头 |
+|---|---|---|
+| `/sw.js` | 根 scope Service Worker | `Cache-Control: no-cache`、`Service-Worker-Allowed: /` |
+| `/_mesh/pwa/manifest.webmanifest` | `id`/`start_url`/`scope` 均为 `/`，`display: standalone` | `Cache-Control: no-cache` |
+| `/_mesh/pwa/icon-192.png`、`icon-512.png` | 打包在本仓库的本地图标 | `Cache-Control: no-cache` |
+
+Service Worker 脚本只有 `install`（`skipWaiting`）与 `activate`（`clients.claim`）两个监听器，没有 `fetch` 处理函数，也不读写 CacheStorage。它与上游 `/sw.js` 同 URL、同根 scope，因此注册即接管；旧 Workbox precache 不再被使用，但 Mesh 不枚举、不删除任何 CacheStorage 条目。脚本内嵌 `src.__version__`，保证每次发布字节都变化，浏览器才会执行更新检查。图标由上游 v2.0.18 `favicon-v3.svg` 派生，来源、工具版本与哈希记录在 `src/assets/pwa/README.md`；缺少图标文件时 Gateway 启动即报错。
+
+HTML 改写（`rewrite_device_html`）先做 PWA 规范化：删除所有 `rel="manifest"`、`rel="icon"`、`rel="apple-touch-icon"` 链接，再在 `</head>` 前插入唯一一组网关链接，其中 manifest 带 `crossorigin="use-credentials"`——manifest 走 Basic Auth，缺少该属性时浏览器不会随请求发送凭据。`og:image` 等设备语义属性不改指。规范化是幂等的，缺标签或没有 `</head>` 的片段都只追加、不报错。恢复页（`OFFLINE_PAGE`）带同一组链接并内联注册 `/sw.js`，继续保持 `no-store`。
+
+规范化的判定由 stdlib `html.parser.HTMLParser` 完成，不用正则：`rel` 值按空格分 token，只有真实 `rel` 属性命中 `manifest`/`icon`/`apple-touch-icon` 才算 PWA 链接（`data-rel`、`x-rel`、`aria-rel` 不算，因此带这些属性的 stylesheet/preload 标签原样保留）；标签边界取解析器给出的原文范围，因此引号内的 `>` 不会截断标签，`<script>`/`<style>`/HTML 注释里的同文本属于内容、不会被改写；插入点是解析出的真实 `</head>` 起始位置（大小写不敏感），无 `</head>` 才退化为追加。文档按 latin-1 解码后只做字节拼接，编辑区间之外的字节逐字保留，不重新序列化整份 HTML。
+
+静态资源缓存不在 Service Worker 职责内：既有 `/_mesh/ui/2/{device_id}/...` 命名空间与 HTTP 缓存行为不变，导航与业务请求不经 Service Worker、不被重放。
+
+`start_url` 不带 `?mesh_device=`，冷启动后由原生应用恢复 `opencode.pwa.last-route` 决定最终设备。已发请求结果未知时失败即失败，不改投其他设备。网关不可达时没有离线壳，浏览器显示自身离线错误页；网关可达但设备不可用时走既有恢复页。
+
 ## 7. 消息分片与可靠性边界
 
 P2P DataChannel 和 Agent 控制 WebSocket 都需要面对单帧大小、缓冲区和断线问题。因此 P2P 载荷使用统一信封：
@@ -365,6 +385,7 @@ Agent  --agent_token--> Gateway 控制 WebSocket
 | 请求被取消 | 双向传播 `cancel`，释放 future、队列和装配器 |
 | 设备切换 | 重建当前 P2P 连接；每个请求仍按自身明确 Server 路由，其他 Server 可走 Relay |
 | 后台冻结后遗留旧 open P2P 通道 | 前台恢复时探针 ping，3s 无匹配 pong 则淘汰旧通道并后台重建；验证期新 HTTP/WS 请求走 Relay，mutation 不重放 |
+| PWA 冷启动时网关不可达 | 没有离线壳，浏览器显示自身离线错误页；可达但设备不可用时走恢复页 |
 
 `tests/test_review_protocol_limits.py` 覆盖 Agent 分片预算、有限去重窗口、控制请求跨类型冲突及取消后重发，另以 ASGI disconnect 和可控 peer 验证协商取消、ready/超时清理。`tests/test_v2_incoming_limits.py` 覆盖浏览器 128 条装配、单条/总计 64 MiB、120 秒未完成期限及长流。`tests/test_mesh_reliability.py` 保留分片和真实 Agent 消息处理回归；`tests/test_v2_transport.py` 覆盖设备作用域、上传体、取消、逐跳头及原生 Server 保留。这些测试不替代手机/WebRTC 全链路验收。
 
@@ -381,7 +402,8 @@ opencode-mesh/
 │   ├── main.py
 │   ├── frontend.py
 │   ├── p2p.py
-│   └── static_adapter.py
+│   ├── static_adapter.py
+│   └── assets/pwa/           # 打包的 PWA 图标、上游许可与来源记录
 ├── config/
 │   ├── gateway.example.json
 │   └── agents.example.json
@@ -404,6 +426,7 @@ opencode-mesh/
     ├── test_v2_reconnect_network.py
     ├── test_v2_incoming_limits.py
     ├── test_v2_upload_backpressure.py
+    ├── test_v2_pwa.py
     └── test_v2_websocket.py
 ```
 
@@ -424,7 +447,7 @@ opencode-mesh/
 
 #### `src/frontend.py`
 
-集中适配已验证的 V2 入口 getter，隔离静态资源缓存，并迁移旧 Gateway origin 页面书签。未知启动契约显式失败，不猜测改写其他模块。
+集中适配已验证的 V2 入口 getter，隔离静态资源缓存，并迁移旧 Gateway origin 页面书签。此外定义网关级 PWA 的路径常量、manifest 文档、Service Worker 脚本、图标加载与 HTML 链接规范化。未知启动契约显式失败，不猜测改写其他模块。
 
 #### `src/p2p.py`
 

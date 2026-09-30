@@ -180,6 +180,96 @@ def test_bootstrap_retries_failed_discovery_before_starting_ui():
     assert result.returncode == 0, result.stderr
 
 
+def test_restored_last_route_owns_the_page_while_a_pending_request_stays_with_its_device():
+    """Adapter contract after the native app has restored its last route.
+
+    The Gateway-level PWA restores a plain ``/`` start URL, so the native app
+    replays its stored last route on every cold start. Bootstrap may migrate an
+    origin-alias route to the selected device, but a route that already names a
+    device belongs to that device.
+
+    The route move is simulated through ``history.replaceState``, the same
+    entry point the adapter patches. Upstream ``restorePwaRoute`` and a real
+    display-mode standalone cold start are not executed here: that needs the
+    native app and a phone, so it stays with user acceptance (V-6).
+
+    The pending request is the cold-start case worth pinning: a cold start has
+    no open P2P channel yet, so the request is handed to ``nativeFetch`` with a
+    device-scoped URL while the route is still the default device. Switching the
+    device must not touch it: once a mutation is sent its outcome may be
+    unknown, so it stays on its own device and is never replayed elsewhere.
+    """
+    adapter = TRANSPORT_ADAPTER.split('<script id="ocm-transport-adapter">', 1)[1].split('</script>', 1)[0].replace('__OCM_VERSION_JSON__', '"test"')
+    script = r'''
+    const assert=require('node:assert/strict');global.window=global;
+    const origin='https://mesh.test',deviceA=origin+'/_mesh/device/device-a',deviceB=origin+'/_mesh/device/device-b';
+    const lastRoute='/server/'+Buffer.from(deviceA).toString('base64url')+'/session/ses_a';
+    const storage=new Map([
+      ['opencode.settings.dat:defaultServerUrl',origin],
+      ['opencode.pwa.last-route',lastRoute],
+      ['opencode.global.dat:layout',JSON.stringify({home:{selection:{server:origin}},tabs:{keep:1}})],
+      ['opencode.global.dat:server',JSON.stringify({list:[{type:'http',displayName:'desktop',http:{url:origin}}],projects:{keep:1}})]
+    ]);
+    global.localStorage={getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v)};
+    global.location={origin,host:'mesh.test',pathname:'/',search:'',hash:'',href:origin+'/',reload(){throw Error('late reload forbidden')}};
+    global.document={readyState:'loading',getElementById:()=>null,head:{},body:null,addEventListener(){}};
+    // The native app restores its last route through history; the location must
+    // move before the patched history call reacts to it.
+    global.history={pushState(){},replaceState(state,title,url){const target=new URL(url,location.href);location.pathname=target.pathname;location.search=target.search;location.href=target.href;}};
+    global.addEventListener=()=>{};
+    global.WebSocket=class {};
+    const business=[],manifests=[];
+    global.fetch=async url=>{
+      const href=String(url);
+      if(href==='/_mesh/devices')return {ok:true,json:async()=>({default_device:'device-b',devices:[
+        {device_id:'device-a',name:'A',online:true,upstream_health:'healthy',available:true},
+        {device_id:'device-b',name:'B',online:true,upstream_health:'healthy',available:true}]})};
+      if(href.startsWith('/_mesh/transport-manifest')){manifests.push(href);return {ok:true,json:async()=>({device_id:new URL(href,'https://mesh.test').searchParams.get('device')||'device-b',p2p:{enabled:false}})};}
+      if(href.endsWith('/api/info'))return {ok:true,headers:new Headers({'content-type':'application/json'}),json:async()=>({version:'2.0.18'})};
+      // The session call on the default device never settles, so it is still
+      // in flight when the route changes to another device.
+      const entry={href,settled:false};
+      business.push(entry);
+      const response=href===deviceB+'/api/session'
+        ?new Promise(()=>{})
+        :Promise.resolve({ok:true,headers:new Headers({'content-type':'application/json'}),json:async()=>({ok:true})});
+      return response.then(value=>{entry.settled=true;return value;},error=>{entry.settled=true;throw error;});
+    };
+    ''' + adapter + r'''
+    const wait=async predicate=>{for(let i=0;i<300;i++){if(predicate())return;await new Promise(r=>setTimeout(r,10));}assert.fail('the restored device was never reached');};
+    (async()=>{
+      await window.__ocmBootstrap.ready;
+      await window.__ocmTransport.ready;
+      assert.equal(window.__ocmBootstrap.serverUrl,deviceB,'bootstrap uses the configured default device');
+      assert.equal(storage.get('opencode.pwa.last-route'),lastRoute,'an explicit device route is not stolen by the default');
+      window.fetch('/api/session');
+      await wait(()=>business.length===1);
+      assert.equal(business[0].href,deviceB+'/api/session','the pending request belongs to the default device');
+      assert.equal(business[0].settled,false,'it is still in flight when the device changes');
+      history.replaceState({},'',lastRoute);
+      await wait(()=>window.__ocmTransport.routeDeviceId==='device-a');
+      assert.equal(window.__ocmTransport.routeDeviceId,'device-a','the restored route owns the page after the switch');
+      assert.ok(manifests.some(url=>url.includes('device=device-a')),'the restored route negotiates for its own device');
+      assert.deepEqual(business.map(entry=>entry.href),[deviceB+'/api/session'],'the pending request is neither retargeted nor replayed');
+      assert.equal(business[0].settled,false,'switching devices must not resolve or cancel a request that is already sent');
+      // A bare path stays with the default Server on purpose: page background
+      // requests must not follow the page to another device.
+      const background=await window.fetch('/api/background');
+      assert.ok(background.ok);
+      assert.equal(business[1].href,deviceB+'/api/background','the switch does not retarget default Server traffic');
+      assert.equal(business[1].settled,true,'settlement is observable, so pending false means pending');
+      // A URL that already names the restored device is passed through instead
+      // of being scoped a second time.
+      const owned=await window.fetch(deviceA+'/api/after-switch');
+      assert.ok(owned.ok);
+      assert.equal(business[2].href,deviceA+'/api/after-switch','the restored device serves the page and is not double scoped');
+      process.exit(0);
+    })().catch(error=>{console.error(error);process.exit(1)});
+    '''
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+
 def test_root_handoff_selects_only_a_discovered_online_v2_device_and_consumes_its_query():
     function = 'async function syncNativeServers' + TRANSPORT_ADAPTER.split('async function syncNativeServers', 1)[1].split('  function rejectEntry', 1)[0]
     script = r'''

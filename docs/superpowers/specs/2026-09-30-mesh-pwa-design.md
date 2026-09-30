@@ -62,12 +62,26 @@
 - 上游许可：`v2.0.18` 根 `LICENSE` 为 **MIT License, Copyright (c) 2025 opencode**（文件 SHA-256 `625f0f619133f89bbbb2abe37369613dfa1885eba1e50d02170deb62cb6b`）；`packages/ui/src/assets/favicon/` 下无独立 LICENSE，资产随根 MIT 通知分发。
 - 图标源：`packages/ui/src/assets/favicon/favicon-v3.svg` @ v2.0.18，512×512 viewBox，SHA-256 `e29bbe33380ad1c1ada9134b52f229d30e9776d60481512c9d81f2bb6f37def9`。本机可用栅格化工具 `rsvg-convert` 2.61.3。
 
-### 2.2 未捕获的观测（写作时不得当成已观测）
+### 2.2 未捕获的观测（写作时快照，不得当成已观测）
 
-- **线上浏览器是否因缺 `crossorigin="use-credentials"` 而拿不到 manifest：未观测。** 只知道规范要求该属性、且当前 HTML 缺该属性；浏览器层是否真的 401、是否影响安装，均无捕获证据。列为风险 R-1 与待验项 V-1。
+本小节是**设计写作时**的状态，保留原样不改写；其后的浏览器验收结论见 §2.3。
+
+- **线上浏览器是否因缺 `crossorigin="use-credentials"` 而拿不到 manifest：当时未观测。** 只知道规范要求该属性、且当前 HTML 缺该属性；浏览器层是否真的 401、是否影响安装，均无捕获证据。列为风险 R-1 与待验项 V-1。
 - **旧 Workbox worker 是否实际影响过页面加载：因果未证实。** 只知道 SRI 字节不匹配、`/_mesh` 导航在 fallback 范围内。
-- **浏览器是否会给 SW 脚本请求带上 Basic Auth 凭据：未观测**（V-2）。
+- **浏览器是否会给 SW 脚本请求带上 Basic Auth 凭据：当时未观测**（V-2）。
 - SRI 不匹配的**读路径**行为随 Workbox 版本而异，未在本轮确认；本设计不依赖该行为。
+
+### 2.3 浏览器验收后的观测更新（2026-09-30，本地 loopback）
+
+范围限定：真实 Chromium + 隔离 profile + **临时 Gateway（无 Agent）** + 走浏览器原生 Basic Auth 挑战（未使用 `Network.setExtraHTTPHeaders` 塞 `Authorization`）。因此本节证据**不覆盖线上 HTTPS、真实设备 HTML 页面与 Android 手机**。
+
+- 恢复页 200，且该导航**不是**由 Service Worker 应答（无 fetch 处理函数的直接观测）。
+- manifest 200，HTML 内链接为 `crossorigin="use-credentials"` 的网关链接；CDP manifest 无解析错误，installability errors 为空。
+- `/sw.js` 以同 URL 接管旧 fixture worker，根 scope `/` 安装/激活完成，未 401 → R-2 在此环境下不成立。
+- 旧 CacheStorage 条目与 localStorage sentinel 完整保留，Mesh 未新增任何缓存条目。
+- 192/512 图标经网络层 200（628/1964 字节）。headless 下 CDP `Page.getManifestIcons` 的 optional `primaryIcon` 为空——既不证明图标失败，也**不构成启动器图标已验证**。
+
+仍为**未观测**：线上 HTTPS 下缺 `crossorigin` 的原始表现（V-1 的另一半）、V-3 安装提示、**手机冷启动 last-route 归属（V-5）**、真实安装与启动器图标（V-6）。
 
 ## 3. 缺陷与设计要点
 
@@ -158,6 +172,8 @@ manifest 文档：
 
 理由：为 PWA 而让无关的 HTML 变体整页 500 是不可接受的风险；`adapt_entry` 的 fail-closed 只保留在既有的入口契约上。`og:image`/`twitter:image` 继续走设备路径，不扩大范围。
 
+**2026-09-30 评审修订（保留上文规格，只补匹配机制）**：上述第 1、3 条按"真实 `rel` 属性的 token 列表"判定，不再用正则匹配整标签。原因是正则无法区分三件事：`\brel` 会命中 `data-rel`/`x-rel`/`aria-rel`（从而删掉整条 stylesheet 标签）；`[^>]*>` 会在引号内的 `>` 处提前截断并留下残渣；`<script>` 字符串与 HTML 注释里的同样文本也会被改写。实现改用 stdlib `html.parser.HTMLParser` 定位真实标签与真实 `</head>` 边界，用 latin-1 解码使字符偏移等于字节偏移，只做字节拼接而不重新序列化整份 HTML。规格层面的目标（唯一规范标签、幂等、缺失与无 `</head>` 时不抛错）不变。
+
 ### 4.4 恢复页
 
 `OFFLINE_PAGE`（`src/main.py:158`）增加同一 credentialed manifest 链接，以及内联 `navigator.serviceWorker.register('/sw.js', {scope: '/'}).catch(() => {})`。目的：在"网关可达、设备不可用"状态下页面仍有可安装元数据与已接管的 worker。页面继续 `no-store`。
@@ -201,9 +217,9 @@ manifest 文档：
 3. 四条 PWA 路径不产生设备请求；无设备注册时仍返回 200。
 4. manifest 字段断言：`id`/`start_url`/`scope` 为 `/`、`display: standalone`、含 192/512 图标、`purpose` 合法、`start_url` 无 query。
 5. 图标字节存在、`Content-Type: image/png`、尺寸与 SHA-256 与记录一致。
-6. HTML 规范化：既有 manifest 链接被替换为 credentialed 网关链接；缺失时插入；重复时去重；`/_mesh/` 路径不被二次改写；`rel="icon"`/`apple-touch-icon` 指向网关图标；**manifest 链接缺失不得抛错**。
+6. HTML 规范化：既有 manifest 链接被替换为 credentialed 网关链接；缺失时插入；重复时去重；`/_mesh/` 路径不被二次改写；`rel="icon"`/`apple-touch-icon` 指向网关图标；**manifest 链接缺失不得抛错**。**2026-09-30 评审补充**：还须覆盖 `data-rel`/`x-rel`/`aria-rel` 不被误判、属性值内引号 `>` 时整标签删除无残渣、`<script>`/`<style>`/HTML 注释内的同文本不被改写、`rel` token 列表与大小写、截断文档不抛错，以及整条 `rewrite_device_html` 管线的字节级幂等。
 7. 恢复页含 manifest 链接与 `/sw.js` 注册，仍为 `no-store`；四条 PWA 路径无凭据访问均 401。
-8. standalone 冷启动：预置指向 Device A 的 `opencode.pwa.last-route`、默认设备为 Device B，断言**最终路由与在途请求归属为 A**，切换前已发出的请求不被改投或重放。不要求"只协商一次"。
+8. standalone 冷启动：预置指向 Device A 的 `opencode.pwa.last-route`、默认设备为 Device B，断言**最终路由与在途请求归属为 A**，切换前已发出的请求不被改投或重放。不要求"只协商一次"。**2026-09-30 评审补充**："在途"必须是切换时**尚未 settle** 的真实请求（先前版本先 await 完成再切换，不构成在途证据），并显式断言最终目标为 A。该用例只固定**适配器在 native app 恢复路由之后**的契约：路由移动通过 `history.replaceState` 模拟，未执行上游 `restorePwaRoute` 与 display-mode standalone 冷启动本身（需手机，见 V-6）。
 9. 全量 `.venv/bin/python -m pytest -q -p no:cacheprovider -W error::DeprecationWarning -rs`、`git diff --check`。
 
 ### 7.2 隔离浏览器
@@ -221,16 +237,18 @@ manifest 文档：
 
 **已核实**：§2.1 全部条目（线上 curl 层观测、上游 v2.0.18 源码、本仓库实现、规范条款、上游 MIT 许可与图标源哈希）。
 
+**本地 loopback 浏览器已捕获**（2026-09-30，真实 Chromium + 隔离 profile + 临时 Gateway 无 Agent，范围与限制见 §2.3）：V-1 的注入侧、V-2、V-4 在此环境成立；**不外推到线上 HTTPS、真实设备页面与手机**。
+
 **待验证**：
 
-| 编号 | 待验项 | 影响 |
-|---|---|---|
-| V-1 | 注入 `crossorigin="use-credentials"` 后 manifest 在目标浏览器可获取；以及当前无该属性时线上是否真的取不到 | 决定 R-1 是否成立 |
-| V-2 | SW 脚本请求能否携带 Basic Auth 凭据（不 401） | 若不能，接管在部分浏览器失效；届时再决定是否豁免单个脚本（需用户批准） |
-| V-3 | Chrome 2026 自动安装提示是否仍要求 fetch handler | 只影响提示是否自动出现，不影响菜单安装与 standalone 价值 |
-| V-4 | 旧 worker 是否被及时替换、旧 precache 是否确实不再被使用 | 验证缺陷 3 处置有效 |
-| V-5 | standalone 冷启动恢复 last-route 后的最终目标与在途归属 | 影响 PWA 冷启动体验 |
-| V-6 | 真实安装、启动器图标、冷启动、网关不可达时的离线表现 | 决定是否可替代 Android 客户端 |
+| 编号 | 待验项 | 影响 | 当前状态（2026-09-30） |
+|---|---|---|---|
+| V-1 | 注入 `crossorigin="use-credentials"` 后 manifest 在目标浏览器可获取；以及当前无该属性时线上是否真的取不到 | 决定 R-1 是否成立 | 注入侧已在本地 loopback 观测（manifest 200）；线上 HTTPS 的原始表现仍未观测 |
+| V-2 | SW 脚本请求能否携带 Basic Auth 凭据（不 401） | 若不能，接管在部分浏览器失效；届时再决定是否豁免单个脚本（需用户批准） | 本地 Chromium 已观测为不 401；其他浏览器未验 |
+| V-3 | Chrome 2026 自动安装提示是否仍要求 fetch handler | 只影响提示是否自动出现，不影响菜单安装与 standalone 价值 | 未验（installability errors 为空不等于自动安装提示已验证） |
+| V-4 | 旧 worker 是否被及时替换、旧 precache 是否确实不再被使用 | 验证缺陷 3 处置有效 | 本地 fixture worker 已被同 URL 接管、旧缓存保留且无新增；线上未验 |
+| V-5 | standalone 冷启动恢复 last-route 后的最终目标与在途归属 | 影响 PWA 冷启动体验 | **未验**：本轮浏览器无真实 2.0.18 页面与手机冷启动，仅有自动化回归 |
+| V-6 | 真实安装、启动器图标、冷启动、网关不可达时的离线表现 | 决定是否可替代 Android 客户端 | 未验（用户手机验收；启动器图标未验证） |
 
 ## 8. 风险与回滚
 
