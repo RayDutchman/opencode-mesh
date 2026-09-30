@@ -420,6 +420,8 @@ opencode-mesh/
 - P2P 信令、消息收发和生命周期清理。
 - HTML 注入入口和 uvicorn 启动参数。
 
+`uvicorn.run()` 的参数由 `gateway_server_options()` 从同一份配置推导，避免在入口硬编码：`log_level` 经 `resolve_log_level()` 校验（只接受 uvicorn 的 `critical/error/warning/info/debug/trace`，非法值回退 `info`，因为 uvicorn 自身按 `LOG_LEVELS[level]` 索引未知值会抛 `KeyError`）；`access_log` 直接透传；`ws_max_size` 由 `ws_frame_limit()` 覆盖应用层上限。访问日志的噪声控制见 §10.6。
+
 这是当前项目最大的单体文件，职责按 `Gateway`、`Agent` 和公共辅助函数分区。
 
 #### `src/frontend.py`
@@ -452,7 +454,7 @@ P2P 和分片基础设施：
 
 ### 10.2 配置与部署文件
 
-- `config/gateway.example.json`：Gateway 配置模板，包括监听地址、认证、注册密钥和状态文件。
+- `config/gateway.example.json`：Gateway 配置模板，包括监听地址、认证、注册密钥、状态文件和可选日志项 `log_level`、`access_log`、`access_log_status_min`。
 - `config/agents.example.json`：Agent 统一配置模板，包括公共 Gateway 地址、加入密钥及各实例上游；身份文件由程序维护。
 - Gateway 的 HTTPS 入口由部署环境的反向代理提供，配置要求见 README，不在仓库另放代理模板。
 - systemd 单元由安装脚本生成，不另维护重复模板。
@@ -483,6 +485,21 @@ P2P 和分片基础设施：
 - `tests/test_v2_reconnect_network.py`：在 Node 中运行真实适配器、用可控假时钟模拟网络事件，覆盖重连提示、防抖冷却、任意未打开阶段的取消重建（初始 ICE、重试 ICE、等待打开）、旧协商链的污染防护、hint 启动的重试不继承首轮 fetch 等待、kick 失效静默死亡通道的 pending、40s 总时限（含停滞的 createOffer）和前后台/bfcache 恢复行为。
 - `tests/test_v2_offline_page.py`：在 Node 中运行真实离线页脚本（脚本化 fetch + DOM shim + 假时钟），并直接驱动 ASGI websocket 通道验证浏览器切入点，覆盖统一在线判据（列表/路由/P2P/ws gate，隔离 `state_file`）、目标设备名称安全显示、在线设备切换入口、仅目标恢复时 reload、无目标不自动改投、轮询失败的状态未知与恢复、永不返回轮询的 10 秒 abort 与迟到响应丢弃。
 - `tests/test_v2_foreground_health.py`：在 Node 中运行真实适配器、用可控假时钟驱动 visibilitychange/pageshow 恢复，覆盖旧 open P2P 通道 3s 探针验活、探针/周期 pong 匹配顺序、迟到 pong 与迟到探针超时不影响新连接、验证期 fetch/WS 走 Relay、周期 ping 不覆盖探针槽位、重复恢复不延长时限、探针期间再次隐藏不误淘汰、初始可见不触发探针与 mutation 不重放。
+- `tests/test_gateway_logging.py`：网关日志配置回归，覆盖状态码过滤器对 2xx/101 拒绝与 4xx/5xx 放行、无状态码记录（WebSocket `[accepted]`）保留、过滤器只装到 `uvicorn.access` 而不碰 `uvicorn.error`、缺省配置不改变原有全量访问日志、重复 lifespan 不叠加过滤器，以及配置键到 `uvicorn.run` 实际参数的映射和 `log_level` 合法值与回退。
+
+### 10.6 访问日志降噪
+
+浏览器适配层的设备状态刷新（5 秒 `/_mesh/devices`）、RTT 探测和离线页轮询都是 200 响应，在长期运行的网关上会占访问日志绝大多数行。uvicorn 自带的两个开关都无法只保留错误：`access_log=False` 会清空访问通道的全部 handler，而 `log_level` 同时调整 `uvicorn.error`、`uvicorn.access` 和 `uvicorn.asgi`（`uvicorn/config.py`），连启动行一起压掉。
+
+因此 Mesh 在 `Gateway.lifespan` 里向 `uvicorn.access` 的 handler 装 `AccessStatusFilter`，只按状态码丢弃记录。状态码取自 `record.args` 末位——uvicorn 的 `AccessFormatter` 把它解包为 `(client_addr, method, full_path, http_version, status_code)`；WebSocket 接受行只有两个参数、不含状态码，遇到无法解析的记录一律保留，宁可多留也不静默丢错。装在 lifespan 而不是替换 uvicorn 的 `LOGGING_CONFIG`，是为了不误伤 `uvicorn.error`（启动、关闭、`Exception in ASGI application`）。项目自身 `proxy request`/`proxy response`/p2p/agent 行是 `print()` 到 stdout，与 uvicorn 日志系统无关，任何配置下都保留。
+
+| 配置 | 默认 | 作用 |
+|---|---|---|
+| `log_level` | `info` | 校验后传给 `uvicorn.run`；非法值回退 `info` |
+| `access_log` | `true` | 透传给 uvicorn；`false` 时连错误访问行也没有 |
+| `access_log_status_min` | 未设置 | 省略即保持全量访问日志；`400` 只保留错误响应 |
+
+未设置 `access_log_status_min` 是默认值，因此升级不改变任何现有部署的日志形态；降噪需用户显式配置。已知的未验证项见 `docs/maintenance.md`。
 
 ## 11. 启动和请求示例
 

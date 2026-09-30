@@ -4,6 +4,20 @@
 
 ## 1. 先确认事实来源
 
+### 网关访问日志降噪（2026-10-01，已实现，**未部署**，用户批准后由主 agent 部署）
+
+- 起因：VPS 上 24 小时内约 165k 行日志中 158k 行来自 `opencode-mesh-gateway.service` 的 uvicorn 访问日志，journald 已限制 200M。噪声主体不是「每请求一行」，而是适配层每 5 秒一次的 `/_mesh/devices` 刷新、P2P 未连通时每 10 秒一次的 RTT 探测、离线页 3 秒轮询，全部是 200；`GET /_mesh/devices HTTP/1.1" 200 OK` 占绝大多数。
+- 结论先行：**uvicorn 没有官方的「只留错误」开关**。`access_log=False` 会清空访问通道全部 handler（`uvicorn/config.py` `configure_logging`），`log_level` 同时调整 `uvicorn.error`/`uvicorn.access`/`uvicorn.asgi` 三者，连启动行一起压掉；`UVICORN_ACCESS_LOG`、`UVICORN_LOG_LEVEL` 环境变量对程序内 `uvicorn.run()` 无效，因为 `auto_envvar_prefix` 是 click CLI 特性。
+- 实现（`src/main.py`）：`AccessStatusFilter` 只在 `Gateway.lifespan` 内装到 `uvicorn.access` 的 handler，**不替换 uvicorn 的 `LOGGING_CONFIG`**——整体替换会连 `uvicorn.error` 一起覆盖，是本项最大的实现陷阱。状态码取自 `record.args` 末位（`AccessFormatter` 解包为 `client_addr, method, full_path, http_version, status_code`）。WebSocket `[accepted]` 行只有两个参数、不含状态码，无法解析时一律保留，宁可多留也不静默丢错。
+- 配置键沿用扁平 snake_case + `cfg.get(键, 默认)` 风格，未引入嵌套 `mesh.log.*`：`access_log`（默认 `true`）、`access_log_status_min`（**默认未设置**）、`log_level`（默认 `info`）。`access_log_status_min` 缺省即保持全量访问日志，因此**升级不改变任何现有部署的日志形态**，降噪必须由用户显式配置。
+- `log_level` 必须校验：uvicorn 自身是 `LOG_LEVELS[self.log_level.lower()]` 索引，未知值抛 `KeyError` 会在启动时崩。校验后非法值回退 `info`（含大小写与空白归一）。
+- 入口重构：`uvicorn.run()` 参数改由 `gateway_server_options(cfg)` 推导，`main()` 只剩 `uvicorn.run(Gateway(cfg).app, **gateway_server_options(cfg))`；`host`/`port`/`timeout_graceful_shutdown=5`/`ws_max_size` 取值与原先硬编码一致，有测试锁定。
+- 未改动：`scripts/install.sh` 的 systemd unit（`upgrade.sh` 只替换 `src`/`scripts`/`pyproject.toml`，永不重写 unit，加 `EnvironmentFile` 不会随升级生效）、`uninstall.sh`、PWA 与 `android/`。`reconnect_seconds` 死键未动。
+- 验证：全量 pytest **410 passed, 1 skipped**（基线 380 + 新增 30，跳过项为 Android API-35 工具链缺失）。新增 `tests/test_gateway_logging.py` 30 项，覆盖 200/101/302 拒绝与 400/401/404/500/503 放行、无状态码记录保留、`uvicorn.error` 的 handler 未被装 filter、缺省配置下 200 仍完整记录、重复 lifespan 不叠加 filter、配置键到 `uvicorn.run` 实际参数的映射（真实 `Gateway` + monkeypatch `uvicorn.run`，不启动服务）、`log_level` 六个合法值与八类非法值回退。四个反向变异全部如期失败：`>=` 改 `>`、把 filter 装到 `uvicorn.error`、`resolve_log_level` 不做校验、lifespan 不装 filter。RED 阶段 29 failed / 1 passed，唯一通过项是「缺省配置保持原有全量访问日志」这一反向守卫。
+- 真实进程证据（`/tmp/opencode/livecheck/`，真实 uvicorn Server + 真实 Gateway，非 ASGI 直驱）：`access_log_status_min=400` 时两次 `GET /_mesh/devices` 200 与未知路由 503 中，只剩 500/503 与全部启动关闭行；不配置时两次 200 照旧输出；`access_log=false` 时访问行全无但 `Exception in ASGI application` 仍在。uvicorn 的 handler 由 `Config.configure_logging()` 安装，因此只能在真实 stdout 上观察，测试里改用隔离 logger。
+- **未验证**：其他 uvicorn 版本下 `record.args` 结构未测（本项依赖该内部约定，上游升级需真实浏览器复验）；未在 VPS 实测日志量下降幅度；未做 systemd `LogRateLimit*` 对比实测（属 Mesh 之外的方案，未采纳——按 service 丢消息会连错误和启动行一起丢）。本轮未提交、未推送、未部署、未重启任何服务；VPS 上 200M journald 限额由用户在 `[Journal]` 自行设置，仓库不代改。
+- 下一步：主 agent 部署 Gateway 后核对 `.mesh-revision` 与日志量；用户可先只加 `access_log_status_min` 观察，不满意直接删除该键即回到全量。
+
 ### 未知健康状态允许验证连接（2026-09-29，已部署本机与 VPS）
 
 - 用户确认：Agent 在线但健康 unknown（旧 Mesh 不上报、报告过期等）保持灰色，允许手动点击并由实际 `/api/info` 验证 OpenCode V2；明确失败与 Agent 离线继续不可选。
@@ -51,6 +65,7 @@
 | `tests/test_mesh_reliability.py` | 代理、分片及生命周期回归 |
 | `tests/test_v2_*.py` | 实际 Node 浏览器接口行为及 V2 错误、启动、上传、WS 边界 |
 | `tests/test_v2_offline_page.py` | 统一在线判据（列表/路由/P2P/浏览器 ws gate）、离线页行为与轮询失败/永不返回恢复（ASGI 直驱 websocket + Node 真实页面脚本） |
+| `tests/test_gateway_logging.py` | 访问日志状态码过滤、`uvicorn.error` 通道不受影响、缺省行为不变、配置键到 `uvicorn.run` 参数的映射与 `log_level` 回退 |
 
 原生 OpenCode 管理 Server 名称、项目、会话和终端 UI；Mesh 仍注入适配脚本与状态栏。当前活动设备使用一条 P2P 通道，其他 Server 请求按明确地址走 Relay。
 
@@ -116,6 +131,8 @@ UI 或传输行为变更应按受影响范围检查：
 
 依据任务授权更新版本、CHANGELOG、完成测试和审阅后创建新 tag；不要移动旧 tag。部署命令及回滚流程以 [README](../README.md#更新已有部署推荐) 为准。文档整理通常无需递增运行版本或重启服务。
 
+只在 `src/` 与 `tests/` 内的改动（例如访问日志配置）随 `upgrade.sh` 正常生效，因为升级只替换 `src`、`scripts`、`pyproject.toml`。`config/gateway.json` 不被升级覆盖，改配置后重启对应实例即可。systemd unit 里的改动**不会**随升级生效——`upgrade.sh` 从不重写 unit，只能重装或手工编辑。日志量本身不是部署问题：journald 上限由 `[Journal]` 的 `SystemMaxUse` 控制，属于主机配置，仓库不代改。
+
 服务 `active` 只是进程存活，交付还需核对 `.mesh-revision`、设备在线状态及受影响链路。若维护会话运行于被管理的 OpenCode 服务内，重启它可能中断执行，操作前核实进程依赖。
 
 ## 6. 文档脱敏与更新规则
@@ -131,6 +148,43 @@ UI 或传输行为变更应按受影响范围检查：
 精简重复代码字面的说明；将会话式排查叙述迁入记录；保留通道绑定、取消顺序、预算和身份归属等设计原因。单独审阅注释 diff，避免大范围语言替换掩盖逻辑修改。
 
 ## 7. 压缩或结束会话前的交接模板
+
+本轮交接（网关访问日志降噪）：
+
+```text
+任务目标与当前授权范围：
+  降低网关 uvicorn 访问日志噪音，做成配置项并可定义 log level；默认行为不变。
+  用户已批准范围，部署由主 agent 执行；本会话未提交、未推送、未部署。
+基线提交 / 当前提交 / 未提交改动：
+  基线与 HEAD 均为 db1990e（分支 feat/mesh-pwa）。未提交改动：
+  src/main.py、config/gateway.example.json、docs/architecture.md、
+  docs/maintenance.md、CHANGELOG.md、README.md，
+  新增 tests/test_gateway_logging.py。
+已完成与证据：
+  AccessStatusFilter + lifespan 装配 + 三个配置键 + 入口参数收敛到
+  gateway_server_options()。全量 410 passed / 1 skipped；
+  四个反向变异如期失败；真实 uvicorn 进程三种配置均已核对。
+未完成、阻塞、未复现问题：
+  未部署、未在 VPS 实测下降幅度；其他 uvicorn 版本的 record.args 结构未验证；
+  未实测 systemd LogRateLimit* 方案（未采纳）。
+验证命令、结果与适用版本：
+  .venv/bin/python -m pytest -q -p no:cacheprovider -W error::DeprecationWarning -rs
+  → 410 passed, 1 skipped（基线 380）。uvicorn 0.53.0 / Python 3.14 / Linux。
+  git diff --check 通过。
+关键决定、理由和代价：
+  装 filter 而非替换 LOGGING_CONFIG（后者会误伤 uvicorn.error）；
+  access_log_status_min 缺省不设置（升级不改变现有部署行为）；
+  状态码依赖 uvicorn 内部 record.args 约定，是已登记的上游风险；
+  无法解析的记录保留而非丢弃。
+下一步与涉及文件：
+  主 agent 部署 Gateway 后核对 .mesh-revision 与实际日志量；
+  用户按需在 gateway.json 加 access_log_status_min。
+相关提交、当前文档与脱敏历史记录：
+  CHANGELOG.md [Unreleased]；docs/architecture.md §10.1/§10.2/§10.5/新增 §10.6；
+  docs/maintenance.md §1/§2/§5/§7；README.md 配置参考。
+本地私有证据是否存在、是否已备份：
+  一次性探针在 /tmp/opencode/livecheck/，未纳入仓库，无需备份。
+```
 
 ### 全面审查修复（2026-09-29，部署结果待续记）
 

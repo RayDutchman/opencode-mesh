@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- 网关新增可选日志配置 `log_level`、`access_log` 和 `access_log_status_min`。默认行为不变，仍记录全部访问日志；配置 `access_log_status_min` 为 `400` 后只保留错误响应，抑制设备状态刷新、连接探测等 200 请求产生的大量访问行。启动、关闭、异常日志和 Mesh 自身代理日志不受影响。`log_level` 填写 uvicorn 不接受的值时回退 `info`，不再导致启动失败。
 - 在线但上游健康未知的设备仍可手动连接；旧 Mesh Agent 缺少健康字段或报告过期时保持灰色，通过实际 OpenCode V2 `/api/info` 验证后进入，不再将未知状态误判为不可连接。
 - Agent 独立探测本机 OpenCode V2 `/api/info`，连续失败与恢复上报分层健康状态；设备菜单和离线页区分 Agent 离线、OpenCode 不可用及状态未知，不再把控制连接在线直接当作业务可用。
 - P2P offer 的 HTTP 断连、取消及未成功答复会撤销对应 Agent 协商；未建立 DataChannel 的 peer 限期清理，重复 offer 不替换原连接。
