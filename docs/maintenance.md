@@ -4,18 +4,25 @@
 
 ## 1. 先确认事实来源
 
-### 离线设备的浏览器本地 503 门禁（2026-10-02，已实现并部署 `50120ec`，浏览器侧验收待用户刷新页面后核对）
+### 离线设备的浏览器本地 503 门禁（2026-10-02，已实现；`50120ec` 已部署但范围有缺陷，本轮扩大范围，未部署）
 
-- 起因：VPS 访问日志观测到，页面停在已离线设备时上游 OpenCode V2 SDK 仍以约 1.2s 固定节奏重试 `/api/event`，单个离线设备约 3018 次/小时；这些请求此前由适配层原样转发，Gateway 每次都立即返回 503。每 10s 一次的 `/api/info` RTT 探测属 Mesh 内部流量，本轮不处理。
-- 实现（`src/static_adapter.py`）：`window.fetch` 在同源/控制面判定之后、交 P2P 或 Relay 之前调用 `offlineDeviceRefusal(url)`。设备归属复用 `scopeNativeRequest` 的判据（显式 `/_mesh/device/{id}` 前缀优先，裸路径绑定 `state.defaultDevice`，`/server/` 与非设备 `/_mesh/` 路径不解析设备），不新增第二套 URL 解释；拦截位置也保证了跨源请求、`/_mesh/devices`、`/_mesh/ui/`、`/_mesh/offers/` 不受影响。
-- 判据必须比 Gateway 保守：快照中存在该设备、`online === false`，且最近一次成功 `/_mesh/devices`（5s 轮询）不超过 `DEVICE_SNAPSHOT_TTL_MS = 15000`（容忍三次漏轮）。`setDeviceStatusUnknown()` 把 `state.deviceSnapshotAt` 置空，因此发现失败或 10s 内未返回都会作废快照；`refreshDeviceStatus()` 与 `syncNativeServers()` 在每次成功发现后写入时间戳。
+- 起因：VPS 访问日志观测到，页面停在已离线设备时上游 OpenCode V2 SDK 仍以约 1.2s 固定节奏重试 `/api/event`，单个离线设备约 3018 次/小时；这些请求此前由适配层原样转发，Gateway 每次都立即返回 503。每 10s 一次的 `/api/info` RTT 探测属 Mesh 内部流量，不在本门禁范围。
+- 实现（`src/static_adapter.py`）：`window.fetch` 在任何传输选择之前调用 `offlineDeviceRefusal(url, input, init)`。设备归属复用 `scopeNativeRequest` 的判据（显式 `/_mesh/device/{id}` 前缀优先，裸路径绑定 `state.defaultDevice`，`/server/` 与非设备 `/_mesh/` 路径不解析设备），不新增第二套 URL 解释。
+- 判据必须比 Gateway 保守：同源、`Accept` 不含 `text/html`、快照中存在该设备且 `online === false`，并且最近一次成功 `/_mesh/devices`（5s 轮询）不超过 `DEVICE_SNAPSHOT_TTL_MS = 15000`（容忍三次漏轮）。`setDeviceStatusUnknown()` 把 `state.deviceSnapshotAt` 置空，因此发现失败或 10s 内未返回都会作废快照；`refreshDeviceStatus()` 与 `syncNativeServers()` 在每次成功发现后写入时间戳。
 - 应答与 `Gateway.offline_response` 语义一致：503、`content-type: application/json`、正文 `{"error":"Specified device offline or not found","device_id":"<id>"}`（测试用真实 `Gateway` 实例产出服务端应答，逐字节比对本地应答）。方法不限——服务端对任何方法都这样回答，本地只是复现，不另立「哪些请求可以走」策略；因为什么都没发出，「已发 mutation 不重放」不受影响。
-- 未改动：Gateway 路由、离线页、P2P/Relay 选择、认证、`window.WebSocket`、`scripts/`、`android/`、PWA、`reconnect_seconds`。
-- 已知边界（已在架构文档登记）：只覆盖页面自身设备，他机显式前缀请求保持原生直通（拦截位置的直接结果）；Mesh RTT 探测与 `/api/info` 探测直接用 `nativeFetch`，不在门禁内；`state.manifest` 缺失时不生效。
-- 验证：新增 `tests/test_v2_offline_gate.py` 11 项（Node 中跑真实适配器 + 脚本化 `/_mesh/devices` + 假时钟），全量 pytest **397 passed, 1 skipped**（基线 386 + 11）。四个反向变异全部如期失败：删除新鲜度检查（陈旧快照、发现失败、永不返回三例）、`if (!device) return null` 改为放行（恢复、在线守卫、缺 `online` 字段三例）、删除 `requestDeviceId` 的 `/_mesh/`+`/server/` 守卫并把拦截移到直通判定之前（控制面/跨源/他机一例）、只把拦截上移（跨源请求变 503；临时移除跨源断言后，他机离线设备 C 也被本地拒绝）。
+- 导航例外：`Accept` 含 `text/html` 的请求一律放行，由 Gateway 返回离线恢复页，判据与 `Gateway.wants_html` 一致。接受头从 `init.headers` 和 `Request` 输入两处读取；读不出来时按导航处理（多发一次请求只是浪费，错误拒绝会顶掉恢复页）。
+- 未改动：`src/main.py`、Gateway 路由、离线页、P2P/Relay 选择、认证、`window.WebSocket`、`scripts/`、`android/`、PWA、`reconnect_seconds`。
+- 已知边界（已在架构文档登记）：Mesh RTT 探测与 `/api/info` 探测直接用 `nativeFetch`，不在门禁内；`/server/...`、控制面、跨源请求永远走既有路径。
 - 实现约束：`tests/test_v2_bootstrap.py` 与 `tests/test_v2_transport.py` 会截取适配器源码片段单独求值，因此写入快照时间戳的两处必须就地内联，不能抽 `applyDeviceSnapshot()` 之类的辅助函数，否则片段内 `ReferenceError`。
-- 部署与线上核验（2026-10-02，提交 `50120ec`，主 agent 独立执行）：已推送分支 `fix/offline-device-request-gate`、仅部署 VPS Gateway；远端 revision `50120ec483b8c627a5728c0663e23f7b52ba50a8` 与 `.mesh-revision` 一致、服务 active，首页与 `/_mesh/devices` 均 200，且**线上返回的 HTML 已包含门禁代码**（`DEVICE_SNAPSHOT_TTL_MS`／`offlineDeviceRefusal`）。部署时观测到 `/api/event` 503 仍在继续（3 分钟 164 次），原因是浏览器中已加载的旧页面仍持旧适配器——适配器在页面加载时注入，**必须刷新所有网关标签页才生效**，这不是部署失败。
-- **未验证（部署后仍需用户配合）**：刷新页面后 `/api/event` 是否真的归零、离线判定与恢复（设备恢复后 ≤5s 自动恢复）是否如设计；本轮只有单元回归、静态论证与「代码已上线」的证据，**没有端到端浏览器证据**。
+
+**第一版范围缺陷与线上证据（`50120ec`，已部署）**
+
+- 部署：主 agent 已推送 `fix/offline-device-request-gate` 并仅部署 VPS Gateway，线上 HTML 确认包含门禁代码；适配器在页面加载时注入，必须刷新所有标签页才生效。
+- 刷新后的实测（主 agent 取证）：12:44:41 与 12:44:42 两次 `GET /` 都在 12:44:21 网关重启之后，确认浏览器拿到了新适配器；`/_mesh/devices` 每 5 秒正常轮询、`/api/info` 正常探测，但 `GET /_mesh/device/<另一台已注册设备>/api/event` 仍以约 50 次/分钟持续返回 503。
+- 结论：第一版门禁**范围不足**，是实现缺陷而非部署失败。`window.fetch` 里既有的直通判定 `virtualDeviceId(url.pathname) !== state.manifest?.device_id` 会在「请求设备 ≠ 页面设备」时直接 `return nativeFetch(...)`，而门禁排在其后，因此永不执行。用户的页面同时订阅多台设备（页面自己是一台，另一台是已注册 Server 的事件流），这是上游 OpenCode 的正常用法；只有页面自己的设备被覆盖。
+- 修正（本轮）：门禁移到直通判定之前，改为按显式 `/_mesh/device/<id>` 前缀逐台判断，不再要求等于 `state.manifest.device_id`；导航请求按上文例外放行。跨源、`/_mesh/` 非 device 路径、`/server/...` 的排除逻辑因此从「直通判定提供」改为「门禁自身提供」，不再依赖拦截位置。
+- 验证：全量 pytest **400 passed, 1 skipped**（基线 397 + 3；`tests/test_v2_offline_gate.py` 14 项）。RED 阶段 4 项失败，分别是：他机离线设备仍返回 200（两处）、导航被本地拒绝（两处）；其余 10 项既有测试全通过，说明新期望不与既有行为冲突。反向变异全部如期失败：删除 Accept 排除（两项导航测试）、把门禁移回直通判定之后（3 项他机断言）、删除门禁内的同源检查（跨源）、删除 `requestDeviceId` 的 `/_mesh/`+`/server/` 守卫（控制面）、Accept 只读 `init.headers`（`Request` 输入的导航测试）。
+- **未验证**：本轮扩大范围后**未部署、未做真实浏览器端到端验收**；VPS 上他机 `/api/event` 的 503 是否归零需部署后用日志核对。第一版除上述范围缺陷外，「页面自己的设备被本地拒绝」这一半是否已在浏览器中生效也仍只有单元证据。
 
 ### 网关访问日志降噪（2026-10-01，已实现并部署 `1c56330`，主机侧限额另行处理）
 
@@ -80,7 +87,7 @@
 | `tests/test_mesh_reliability.py` | 代理、分片及生命周期回归 |
 | `tests/test_v2_*.py` | 实际 Node 浏览器接口行为及 V2 错误、启动、上传、WS 边界 |
 | `tests/test_v2_offline_page.py` | 统一在线判据（列表/路由/P2P/浏览器 ws gate）、离线页行为与轮询失败/永不返回恢复（ASGI 直驱 websocket + Node 真实页面脚本） |
-| `tests/test_v2_offline_gate.py` | 离线设备请求的浏览器本地 503 复现、快照新鲜度预算与方法规则、控制面/跨源/他机请求不被门禁 |
+| `tests/test_v2_offline_gate.py` | 离线设备请求的浏览器本地 503 复现（含他机显式目标）、导航例外、快照新鲜度预算与方法规则、控制面/跨源/`/server/` 不被门禁 |
 | `tests/test_gateway_logging.py` | 访问日志状态码过滤、`uvicorn.error` 通道不受影响、缺省行为不变、配置键到 `uvicorn.run` 参数的映射与 `log_level` 回退 |
 
 原生 OpenCode 管理 Server 名称、项目、会话和终端 UI；Mesh 仍注入适配脚本与状态栏。当前活动设备使用一条 P2P 通道，其他 Server 请求按明确地址走 Relay。
@@ -92,7 +99,7 @@
 - Gateway origin 不作为额外业务 Server；设备显示名、默认选择和稳定身份是不同概念。
 - 默认设备短时不可达时保持旧项目的 canonical 归属；首次默认选择可以选择在线设备，显式用户选择保持。
 - 上传超限回 Relay 要保留已读前缀和剩余字节；不依赖全量 `arrayBuffer()` 探测，也不自动重放已发 mutation。
-- 离线设备的 503 由 Gateway 和适配层两处「一致复现」，不是两套策略：判据比服务端保守（只认 15s 内快照里的显式 `online === false`），宁可放行也不误判可达设备；任何方法都被应答，因为服务端对任何方法都这样回答。
+- 离线设备的 503 由 Gateway 和适配层两处「一致复现」，不是两套策略：判据比服务端保守（只认 15s 内快照里的显式 `online === false`，且导航请求放行），宁可放行也不误判可达设备、也不顶掉离线恢复页；任何方法都被应答，因为服务端对任何方法都这样回答。覆盖范围按显式设备前缀逐台判断：页面订阅多台设备时每台离线设备都有独立重试循环，只挡页面自己那一台是不够的。
 
 ## 3. 开发与检查
 
@@ -132,7 +139,7 @@ UI 或传输行为变更应按受影响范围检查：
 4. PTY 创建、connect-token、WS 连接、文本/二进制帧及终端输入输出均验证。
 5. 关闭 P2P 后，后续请求可回 Relay；对结果未知的在途 mutation 不做自动重放。
 6. 启动发现失败可恢复；取消、关闭及弱网重连有对应生命周期证据。
-7. 页面设备离线时请求立即得到 503（页面内报错而不是长时间等待）；设备恢复后 ≤5s 自动恢复，无需刷新页面。
+7. 页面设备离线时请求立即得到 503（页面内报错而不是长时间等待）；设备恢复后 ≤5s 自动恢复，无需刷新页面。订阅的其他离线设备不再持续产生 503；在浏览器里打开离线设备的地址仍显示 Gateway 恢复页，而不是裸 JSON。
 
 浏览器自动化不是当前 pytest 的一部分。正式回归测试受 Git 管理；临时探针、日志、截图及 manifest 可保存在忽略的 `data/diagnostics/`，长期证据另行备份。归档脚本可能有旧版本假设和环境路径，先审阅再运行。公开记录只写脱敏方法、结果及限制，不复制真实身份或认证头、ticket、会话正文。
 
@@ -144,7 +151,7 @@ UI 或传输行为变更应按受影响范围检查：
 - Python/JS 的部分稳定错误 reason 双端维护，需要同步核对。
 - 上游入口契约升级须重新验收；VPS 同机独立 Agent 目前是部署设计，不能据此声称已实际安装验证。
 - PWA、不同移动浏览器及实际移动网络不是完整自动验收覆盖；模型供应商限流、额度错误与 Mesh 传输故障分别归因。
-- 离线设备的本地 503 只在浏览器内成立：他机显式前缀请求、`window.WebSocket`、Mesh 自身的 RTT 与 `/api/info` 探测都不经过该判据，跨设备流量的重试噪声没有被本地消除。
+- 离线设备的本地 503 只覆盖 `window.fetch`：`window.WebSocket`、Mesh 自身的 RTT 与 `/api/info` 探测都不经过该判据；`/server/...`、控制面与跨源请求永远走既有路径。导航请求（`Accept: text/html`）有意放行，因此打开离线设备地址仍由 Gateway 返回恢复页。
 
 ## 5. 发布与部署
 
@@ -168,49 +175,55 @@ UI 或传输行为变更应按受影响范围检查：
 
 ## 7. 压缩或结束会话前的交接模板
 
-本轮交接（离线设备的浏览器本地 503 门禁）：
+本轮交接（离线设备门禁的范围修正：覆盖他机离线设备 + 导航例外）：
 
 ```text
 任务目标与当前授权范围：
-  浏览器适配器对「新鲜 /_mesh/devices 快照明确标记 online:false」的页面设备请求
-  在本地返回与 Gateway 一致的 503，止住上游 SDK 的重试噪声（实测约 3018 次/小时）。
-  授权范围：src/static_adapter.py、新测试、本文档与 CHANGELOG；禁止提交/推送/部署、
-  禁止改 scripts/、android/、PWA 与 reconnect_seconds。本会话未提交、未推送、未部署。
+  修正上一轮已部署版本（50120ec）的范围缺陷：门禁移到 fetch 内既有的他机直通
+  判定之前，按显式 /_mesh/device/<id> 逐台判断；同时为 Accept: text/html 的导航
+  请求放行，让 Gateway 的离线恢复页仍然生效。线上证据：刷新页面后另一台已注册
+  设备的 /api/event 仍约 50 次/分钟 503（12:44:41、12:44:42 两次 GET / 确认拿到
+  新适配器，12:44:21 网关重启之后）。
+  授权范围：src/static_adapter.py、tests/test_v2_offline_gate.py、文档与 CHANGELOG；
+  禁止提交/推送/部署/重启，禁止改 src/main.py、scripts/、android/、PWA、
+  reconnect_seconds，不指定 model、不派子 agent。本会话未提交、未推送、未部署。
 基线提交 / 当前提交 / 未提交改动：
-  基线与 HEAD 均为 1c56330（分支 fix/offline-device-request-gate，worktree
+  基线与 HEAD 均为 d497850（分支 fix/offline-device-request-gate，worktree
   .worktrees/offline-gate）。未提交改动：src/static_adapter.py、
-  docs/architecture.md、docs/maintenance.md、CHANGELOG.md，
-  新增 tests/test_v2_offline_gate.py。
+  tests/test_v2_offline_gate.py、docs/architecture.md、docs/maintenance.md、
+  CHANGELOG.md。
 已完成与证据：
-  DEVICE_SNAPSHOT_TTL_MS=15000 + state.deviceSnapshotAt（成功发现写入、
-  setDeviceStatusUnknown 置空）+ requestDeviceId/offlineDeviceRefusal 两个辅助函数
-  + fetch 补丁内的门禁调用。全量 397 passed / 1 skipped（基线 386 + 11）；
-  四个反向变异全部如期失败；适配器 node --check 与 compileall 通过。
+  offlineDeviceRefusal(url, input, init) 移到直通判定之前；新增 acceptsHtml(input,
+  init)（读 init.headers 与 Request 输入，读不出按导航处理）与门禁自身的同源检查；
+  他机显式前缀不再要求等于 state.manifest.device_id。
+  RED：4 项失败（他机离线仍 200 两处、导航被本地拒绝两处），其余 10 项既有测试通过。
+  全量 400 passed / 1 skipped（基线 397 + 3；test_v2_offline_gate.py 共 14 项）。
+  五个反向变异全部如期失败：删 Accept 排除、门禁移回直通判定之后、删门禁内同源检查、
+  删 requestDeviceId 的 /_mesh/ + /server/ 守卫、Accept 只读 init.headers。
+  适配器 node --check、compileall、git diff --check 通过。
 未完成、阻塞、未复现问题：
-  未部署、未做真实浏览器端到端验收；VPS 上 /api/event 是否真的下降未实测。
-  他机显式前缀请求、window.WebSocket、Mesh RTT 与 /api/info 探测仍走原路径（有意为之，
-  但意味着跨设备噪声未消除）。state.manifest 缺失时门禁不生效。
+  本轮未部署、未做真实浏览器端到端验收；VPS 上他机 /api/event 的 503 是否归零待部署后
+  用日志核对。第一版「页面自己设备被本地拒绝」也仍只有单元证据。
+  有意不覆盖：window.WebSocket、Mesh RTT 与 /api/info 探测、/server/...、控制面、跨源。
 验证命令、结果与适用版本：
   /home/chenweibo/opencode-mesh/.venv/bin/python -m pytest -q -p no:cacheprovider
   -W error::DeprecationWarning -rs
-  → 397 passed, 1 skipped（基线 386）。Python 3.14 / Node v22。
-  git diff --check 通过。
+  → 400 passed, 1 skipped。Python 3.14 / Node v22。
 关键决定、理由和代价：
-  拦截点定在 fetch 补丁内、同源/控制面判定之后：跨源与 /_mesh/ 控制面天然不受影响，
-  代价是显式他机请求不再本地拒绝。
-  设备归属复用 scopeNativeRequest 判据，不另立 URL 解释。
-  TTL 15000ms（约三次漏轮）容忍后台定时器节流；快照过期/失败即放行，误判代价高于多发一次。
-  方法不限：服务端对任何方法都答 503，本地只是复现；未发出任何字节，故不触碰
-  「已发 mutation 不重放」。不抽 applyDeviceSnapshot()：bootstrap/transport 测试会截取
-  源码片段求值，辅助函数会 ReferenceError。
+  门禁按显式设备前缀逐台判断：页面订阅多台设备是 V2 正常用法，每台离线设备都有独立
+  重试循环；代价是排除逻辑必须自己承担，不再依赖拦截位置。
+  导航放行是唯一的请求形状例外，判据与 Gateway.wants_html 对齐：本地拒绝会顶掉恢复页，
+  代价只是多发一次请求。读不出 Accept 时偏向放行。
+  其余决定沿用上一轮：设备归属复用 scopeNativeRequest；TTL 15000ms；方法不限；
+  不抽 applyDeviceSnapshot()（bootstrap/transport 测试会截取源码片段求值）。
 下一步与涉及文件：
-  用户批准后由主 agent 部署并用 VPS 日志核对 /api/event 量；
-  真实浏览器验收：设备离线时页面立即报错、设备恢复后 ≤5s 自行恢复。
+  用户批准后由主 agent 提交并部署，然后核对 VPS 日志里他机 /api/event 是否归零；
+  浏览器验收：页面设备与其他订阅设备离线时不再持续 503；地址栏打开离线设备仍是恢复页。
 相关提交、当前文档与脱敏历史记录：
-  CHANGELOG.md [Unreleased]；docs/architecture.md §6.1/§6.2/新增 §6.5/§10.1/§10.5/§12.5；
+  CHANGELOG.md [Unreleased]；docs/architecture.md §6.1/§6.2/§6.5/§10.1/§10.5/§12.5；
   docs/maintenance.md §1/§2/§4/§7。
 本地私有证据是否存在、是否已备份：
-  绿色版本适配器副本 /tmp/opencode/adapter-green.py、变异对照副本在 /tmp/opencode/，
+  绿色版本适配器副本 /tmp/opencode/adapter-green2.py 及变异对照副本在 /tmp/opencode/，
   未纳入仓库，无需备份。
 ```
 

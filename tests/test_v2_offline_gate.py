@@ -12,15 +12,21 @@ local behaviour:
 
 - a device-level request for a device a fresh snapshot marks `online === false`
   is answered in the browser with a 503 whose JSON body is byte-identical to the
-  Gateway's own offline response, and never touches nativeFetch or P2P;
+  Gateway's own offline response, and never touches nativeFetch or P2P. This
+  covers every explicit `/_mesh/device/<id>/...` target, not only the page's own
+  device: a V2 page routinely subscribes several registered Servers at once, and
+  an unwatched target was measured leaving ~50 503/min on the wire;
+- navigation requests are never answered locally, because the Gateway serves its
+  offline recovery page for them (`Gateway.wants_html`); Accept is read from both
+  `init.headers` and a `Request` input;
 - recovery is unchanged, because online status is still discovered by the 5s
   `/_mesh/devices` poll (≤5s latency), and an online device is never gated;
 - the snapshot has a freshness budget: a stale snapshot, a failed or hung
   discovery, a device that is absent, and a device without an explicit
   `online: false` all keep the request on the normal transport, because a wrong
   "offline" verdict would break a reachable device;
-- Mesh control-plane endpoints (`/_mesh/devices`, `/_mesh/ui/...`, offers) and
-  cross-origin / `/server/...` requests are never gated;
+- Mesh control-plane endpoints (`/_mesh/devices`, `/_mesh/ui/...`, offers),
+  cross-origin requests and `/server/...` requests are never gated;
 - every method is gated, because the Gateway answers 503 for every method when a
   device is offline: the local answer is a reproduction of the server answer,
   not a second policy about which requests may travel.
@@ -66,6 +72,10 @@ const discoveryCalls = () => global.fetchCalls.filter(call => call.url.includes(
 const eventCalls = () => global.fetchCalls.filter(call => call.url.includes('/api/event'));
 const offlineEvent = () => window.fetch('https://mesh.test/_mesh/device/device-b/api/event',
   { headers: { accept: 'text/event-stream' } });
+// The reported incident: the page device is online or offline independently of
+// the other registered Server it subscribes in parallel.
+const foreignEvent = () => window.fetch('https://mesh.test/_mesh/device/device-c/api/event',
+  { headers: { accept: 'text/event-stream' } });
 """.replace('__OFFLINE_BODY__', json.dumps(OFFLINE_BODY))
 
 FINISHER_TAIL = r"""
@@ -78,8 +88,8 @@ FINISHER_TAIL = r"""
 """
 
 # A page bound to device-b. The layout selection pins the route before bootstrap,
-# so the manifest and every explicit device request belong to device-b and reach
-# the adapter instead of its early native passthrough for foreign devices.
+# so the manifest and the page own explicit device requests belong to device-b and
+# take the P2P/Relay selection instead of the passthrough for other devices.
 PAGE_ON_DEVICE_B = r"""
 storage.set('opencode.global.dat:server', JSON.stringify({ list: [
   { type: 'http', displayName: 'Device B', http: { url: 'https://mesh.test/_mesh/device/device-b' } },
@@ -304,9 +314,10 @@ def test_device_without_an_explicit_offline_flag_is_not_gated():
     run_gate(build_preamble(snapshot({"device_id": "device-b", "name": "Device B", "upstream_health": "unknown"})), body)
 
 
-def test_control_plane_cross_origin_and_foreign_device_requests_are_never_gated():
+def test_control_plane_cross_origin_and_native_server_requests_are_never_gated():
     """Mesh control endpoints, native server routes and cross-origin traffic keep
-    their existing path even while the page device is marked offline."""
+    their existing path even while the page device and another device are both
+    marked offline. Only explicit device paths are the gate's business."""
     body = FINISHER + ARM_OFFLINE_SNAPSHOT + r"""
   const polled = discoveryCalls().length;
   const discovery = await window.fetch('/_mesh/devices', { credentials: 'same-origin', cache: 'no-store' });
@@ -325,16 +336,77 @@ def test_control_plane_cross_origin_and_foreign_device_requests_are_never_gated(
   assert.equal(route.status, 200, 'a native server route is not resolved to a device here');
   assert.ok(global.fetchCalls.some(call => call.url === 'https://mesh.test/server/encoded/api/event'),
     'a native server route keeps its own address');
-  const foreign = await window.fetch('https://mesh.test/_mesh/device/device-a/api/event');
-  assert.equal(foreign.status, 200, 'a request addressed to another device keeps the existing native passthrough');
-  const foreignOffline = await window.fetch('https://mesh.test/_mesh/device/device-c/api/event');
-  assert.equal(foreignOffline.status, 200,
-    'the gate covers only the page own device; a request for another device keeps the existing native passthrough');
+  const online = await window.fetch('https://mesh.test/_mesh/device/device-a/api/event',
+    { headers: { accept: 'text/event-stream' } });
+  assert.equal(online.status, 200, 'a reachable device keeps the existing native passthrough');
+  const foreign = await foreignEvent();
+  assert.equal(foreign.status, 503, 'another offline device is refused locally too');
+  assert.equal(await foreign.text(), OFFLINE_BODY.replace('device-b', 'device-c'),
+    'the local body names the device that was requested');
   const gated = await offlineEvent();
-  assert.equal(gated.status, 503, 'precondition: the page device request is still gated');
+  assert.equal(gated.status, 503, 'the page device request is still gated');
   assert.deepEqual(eventCalls().map(call => call.url), ['https://mesh.test/server/encoded/api/event',
-    'https://mesh.test/_mesh/device/device-a/api/event', 'https://mesh.test/_mesh/device/device-c/api/event'],
-    'only the page device request was gated; every other path left through the transport');
+    'https://mesh.test/_mesh/device/device-a/api/event'],
+    'only the offline device requests were gated; every other path left through the transport');
+""" + FINISHER_TAIL
+    run_gate(online_preamble(OFFLINE_C), body)
+
+
+def test_offline_foreign_device_request_is_answered_locally_without_any_network_call():
+    """Regression for the deployed scope defect: the gate used to sit behind the
+    foreign-device passthrough, so a page that also subscribes another registered
+    Server kept answering its retry loop from the Gateway (~50 503/min measured
+    on the VPS) instead of refusing it locally."""
+    body = FINISHER + ARM_OFFLINE_SNAPSHOT + r"""
+  assert.equal(s.manifest.device_id, 'device-b', 'precondition: the page is bound to device-b');
+  assert.equal(onlineFlag('device-c'), false, 'precondition: the same snapshot reports device-c offline');
+  const before = global.fetchCalls.length;
+  const response = await foreignEvent();
+  assert.equal(response.status, 503, 'a request for another offline device is refused locally');
+  assert.equal(response.ok, false, 'the SDK must not see a success');
+  assert.equal(response.headers.get('content-type'), 'application/json', 'the refusal stays a JSON body');
+  assert.equal(await response.text(), OFFLINE_BODY.replace('device-b', 'device-c'),
+    'the local body carries the requested device id');
+  assert.equal(global.fetchCalls.length, before, 'the watched device retry loop never reached native fetch');
+""" + FINISHER_TAIL
+    run_gate(online_preamble(OFFLINE_C), body)
+
+
+def test_html_navigation_to_an_offline_device_is_never_gated():
+    """A navigation is not a retry loop: the Gateway answers Accept: text/html
+    with its offline recovery page, so the local refusal must stay out of the
+    way. Accept arrives in init.headers here, the form the SDK-less callers and
+    location-driven loads use."""
+    body = FINISHER + ARM_OFFLINE_SNAPSHOT + r"""
+  const before = global.fetchCalls.length;
+  const own = await window.fetch('https://mesh.test/',
+    { headers: { accept: 'text/html,application/xhtml+xml' } });
+  assert.equal(own.status, 200, 'a navigation to the offline page device must reach the Gateway recovery page');
+  const watched = await window.fetch('https://mesh.test/_mesh/device/device-c/session/ses_abc',
+    { headers: { accept: 'text/html' } });
+  assert.equal(watched.status, 200, 'a navigation to another offline device must reach the Gateway recovery page');
+  assert.equal(global.fetchCalls.length, before + 2, 'both navigations left through the native transport');
+  assert.ok(global.fetchCalls.some(call => call.url.includes('/_mesh/device/device-c/session/ses_abc')),
+    'the watched navigation kept its explicit device address');
+""" + FINISHER_TAIL
+    run_gate(online_preamble(OFFLINE_C), body)
+
+
+def test_request_object_html_navigation_to_an_offline_device_is_never_gated():
+    """The same navigation exemption with the Accept header carried by a Request
+    object instead of init. A Request for the same device without an HTML Accept
+    is still refused, so the exemption cannot leak into API traffic."""
+    body = FINISHER + ARM_OFFLINE_SNAPSHOT + r"""
+  const navigation = new Request('https://mesh.test/_mesh/device/device-c/session/ses_abc',
+    { headers: { accept: 'text/html' } });
+  assert.equal((await window.fetch(navigation)).status, 200,
+    'a Request carrying Accept: text/html reaches the Gateway recovery page');
+  const api = new Request('https://mesh.test/_mesh/device/device-c/api/event',
+    { headers: { accept: 'text/event-stream' } });
+  const refused = await window.fetch(api);
+  assert.equal(refused.status, 503, 'a Request without an HTML Accept is still refused locally');
+  assert.deepEqual(eventCalls().map(call => call.url), [],
+    'only the navigation left the browser');
 """ + FINISHER_TAIL
     run_gate(online_preamble(OFFLINE_C), body)
 

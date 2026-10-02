@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- 浏览器适配器对「新鲜设备快照明确标记离线」的页面设备请求在本地直接返回与 Gateway 一致的 503，止住上游 OpenCode V2 SDK 固定节奏的重试（实测单个离线设备约 3018 次/小时 `/api/event`）。判据比服务端保守：只认 15s 内的 `/_mesh/devices` 快照且设备显式 `online: false`，发现失败或快照过期一律照常走正常传输；Gateway 路由、离线页、P2P/Relay 选择与认证不变。
+- 浏览器适配器对「新鲜设备快照明确标记离线」的设备请求在本地直接返回与 Gateway 一致的 503，止住上游 OpenCode V2 SDK 固定节奏的重试（实测单个离线设备约 3018 次/小时 `/api/event`）。覆盖任意显式 `/_mesh/device/<id>` 目标，不限于页面自己的设备：页面同时订阅多台设备时，每台离线设备的重试循环都会被挡住。判据比服务端保守：只认 15s 内的 `/_mesh/devices` 快照且设备显式 `online: false`，发现失败或快照过期一律照常走正常传输；接受头含 `text/html` 的导航请求放行，由 Gateway 返回离线恢复页而不是裸 JSON；跨源、控制面、`/server/...` 请求不受影响。Gateway 路由、离线页、P2P/Relay 选择与认证不变。
 
 - 网关新增可选日志配置 `log_level`、`access_log` 和 `access_log_status_min`。默认行为不变，仍记录全部访问日志；配置 `access_log_status_min` 为 `400` 后只保留错误响应，抑制设备状态刷新、连接探测等 200 请求产生的大量访问行。启动、关闭、异常日志和 Mesh 自身代理日志不受影响。`log_level` 填写 uvicorn 不接受的值时回退 `info`，不再导致启动失败。
 - 在线但上游健康未知的设备仍可手动连接；旧 Mesh Agent 缺少健康字段或报告过期时保持灰色，通过实际 OpenCode V2 `/api/info` 验证后进入，不再将未知状态误判为不可连接。

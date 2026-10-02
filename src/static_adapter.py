@@ -527,15 +527,40 @@ TRANSPORT_ADAPTER = r"""
     if (url.pathname.startsWith('/_mesh/') || url.pathname.startsWith('/server/')) return null;
     return state.defaultDevice || null;
   };
+  // A navigation is not a retry loop. The Gateway answers Accept: text/html with
+  // its offline recovery page (Gateway.wants_html uses the same test), so the
+  // local refusal must stay out of the way and let the request travel. Accept
+  // reaches fetch through init.headers, through a Request input, or through
+  // both; init.headers wins in the platform, and an Accept that cannot be read
+  // here is treated as a navigation, because forwarding costs one request while
+  // refusing would replace the recovery page with raw JSON.
+  const acceptsHtml = (input, init) => {
+    const sources = [init && init.headers, typeof input === 'string' || input instanceof URL ? null : input && input.headers];
+    for (const headers of sources) {
+      if (!headers) continue;
+      try {
+        const accept = new Headers(headers).get('accept');
+        if (accept) return accept.includes('text/html');
+      } catch (_) {
+        return true;
+      }
+    }
+    return false;
+  };
   // Last-resort local refusal for a device the recent snapshot marks offline.
   // The Gateway answers 503 immediately for that device anyway, so this only
   // keeps an upstream retry loop off the network (an offline device previously
-  // drew about 3000 requests per hour). It is deliberately narrow: no snapshot,
-  // a stale one, a failed one, an absent or ambiguous device, or an online
-  // device all fall through to the normal transport. Every method is answered,
-  // because the server refuses all of them; nothing is sent, so a request that
-  // is refused here is known not to have been emitted anywhere.
-  const offlineDeviceRefusal = url => {
+  // drew about 3000 requests per hour). It covers every explicit device target,
+  // not just the page own device: a V2 page subscribes several registered
+  // Servers at once and each offline one keeps its own retry loop alive. It is
+  // deliberately narrow: a foreign origin, a navigation, no snapshot, a stale
+  // one, a failed one, an absent or ambiguous device, or an online device all
+  // fall through to the normal transport. Every method is answered, because the
+  // server refuses all of them; nothing is sent, so a request that is refused
+  // here is known not to have been emitted anywhere.
+  const offlineDeviceRefusal = (url, input, init) => {
+    if (url.origin !== location.origin) return null;
+    if (acceptsHtml(input, init)) return null;
     if (state.deviceSnapshotAt == null) return null;
     if (Date.now() - state.deviceSnapshotAt > DEVICE_SNAPSHOT_TTL_MS) return null;
     const deviceId = requestDeviceId(url);
@@ -1547,11 +1572,12 @@ TRANSPORT_ADAPTER = r"""
       return window.fetch(input, init);
     }
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);
-    if (url.origin !== location.origin || (url.pathname.startsWith('/_mesh/') && !url.pathname.startsWith('/_mesh/device/')) || (virtualDeviceId(url.pathname) && virtualDeviceId(url.pathname) !== state.manifest?.device_id)) return nativeFetch(input, init);
-    // Same-origin Mesh device traffic for a device already known offline is
-    // answered here; anything else continues to the normal transport path.
-    const offlineRefusal = offlineDeviceRefusal(url);
+    // The offline refusal is asked before the passthrough below, because a
+    // foreign-device request never reaches it: a V2 page subscribes several
+    // registered Servers, and each offline one keeps its own retry loop alive.
+    const offlineRefusal = offlineDeviceRefusal(url, input, init);
     if (offlineRefusal) return offlineRefusal;
+    if (url.origin !== location.origin || (url.pathname.startsWith('/_mesh/') && !url.pathname.startsWith('/_mesh/device/')) || (virtualDeviceId(url.pathname) && virtualDeviceId(url.pathname) !== state.manifest?.device_id)) return nativeFetch(input, init);
     // While a foreground probe verifies the old open channel, new requests go
     // to Relay; P2P is only restored after a matching pong.
     if (!state.probing && state.channel && state.channel.readyState === 'open') return p2pFetch(input, init);
