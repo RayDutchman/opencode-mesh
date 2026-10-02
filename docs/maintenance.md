@@ -4,7 +4,7 @@
 
 ## 1. 先确认事实来源
 
-### 离线设备的浏览器本地 503 门禁（2026-10-02，已实现，**未部署**，未做真实浏览器验收）
+### 离线设备的浏览器本地 503 门禁（2026-10-02，已实现并部署 `50120ec`，浏览器侧验收待用户刷新页面后核对）
 
 - 起因：VPS 访问日志观测到，页面停在已离线设备时上游 OpenCode V2 SDK 仍以约 1.2s 固定节奏重试 `/api/event`，单个离线设备约 3018 次/小时；这些请求此前由适配层原样转发，Gateway 每次都立即返回 503。每 10s 一次的 `/api/info` RTT 探测属 Mesh 内部流量，本轮不处理。
 - 实现（`src/static_adapter.py`）：`window.fetch` 在同源/控制面判定之后、交 P2P 或 Relay 之前调用 `offlineDeviceRefusal(url)`。设备归属复用 `scopeNativeRequest` 的判据（显式 `/_mesh/device/{id}` 前缀优先，裸路径绑定 `state.defaultDevice`，`/server/` 与非设备 `/_mesh/` 路径不解析设备），不新增第二套 URL 解释；拦截位置也保证了跨源请求、`/_mesh/devices`、`/_mesh/ui/`、`/_mesh/offers/` 不受影响。
@@ -14,7 +14,8 @@
 - 已知边界（已在架构文档登记）：只覆盖页面自身设备，他机显式前缀请求保持原生直通（拦截位置的直接结果）；Mesh RTT 探测与 `/api/info` 探测直接用 `nativeFetch`，不在门禁内；`state.manifest` 缺失时不生效。
 - 验证：新增 `tests/test_v2_offline_gate.py` 11 项（Node 中跑真实适配器 + 脚本化 `/_mesh/devices` + 假时钟），全量 pytest **397 passed, 1 skipped**（基线 386 + 11）。四个反向变异全部如期失败：删除新鲜度检查（陈旧快照、发现失败、永不返回三例）、`if (!device) return null` 改为放行（恢复、在线守卫、缺 `online` 字段三例）、删除 `requestDeviceId` 的 `/_mesh/`+`/server/` 守卫并把拦截移到直通判定之前（控制面/跨源/他机一例）、只把拦截上移（跨源请求变 503；临时移除跨源断言后，他机离线设备 C 也被本地拒绝）。
 - 实现约束：`tests/test_v2_bootstrap.py` 与 `tests/test_v2_transport.py` 会截取适配器源码片段单独求值，因此写入快照时间戳的两处必须就地内联，不能抽 `applyDeviceSnapshot()` 之类的辅助函数，否则片段内 `ReferenceError`。
-- **未验证**：未做真实浏览器端到端验收，未部署，未提交、未推送、未重启任何服务；门禁是否真的让 VPS 上的 `/api/event` 请求下降需部署后用日志核对（当前只有静态论证与单元回归）。
+- 部署与线上核验（2026-10-02，提交 `50120ec`，主 agent 独立执行）：已推送分支 `fix/offline-device-request-gate`、仅部署 VPS Gateway；远端 revision `50120ec483b8c627a5728c0663e23f7b52ba50a8` 与 `.mesh-revision` 一致、服务 active，首页与 `/_mesh/devices` 均 200，且**线上返回的 HTML 已包含门禁代码**（`DEVICE_SNAPSHOT_TTL_MS`／`offlineDeviceRefusal`）。部署时观测到 `/api/event` 503 仍在继续（3 分钟 164 次），原因是浏览器中已加载的旧页面仍持旧适配器——适配器在页面加载时注入，**必须刷新所有网关标签页才生效**，这不是部署失败。
+- **未验证（部署后仍需用户配合）**：刷新页面后 `/api/event` 是否真的归零、离线判定与恢复（设备恢复后 ≤5s 自动恢复）是否如设计；本轮只有单元回归、静态论证与「代码已上线」的证据，**没有端到端浏览器证据**。
 
 ### 网关访问日志降噪（2026-10-01，已实现并部署 `1c56330`，主机侧限额另行处理）
 
