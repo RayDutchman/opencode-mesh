@@ -241,7 +241,7 @@ Gateway 只对符合条件的 OpenCode HTML 页面注入 `src/static_adapter.py`
 
 | 浏览器 API | 适配行为 |
 |---|---|
-| `fetch` | 优先走 P2P，不可用时使用原生请求走 Relay |
+| `fetch` | 优先走 P2P，不可用时使用原生请求走 Relay；新鲜设备快照标记离线的页面设备在本地直接得到与 Gateway 一致的 503（见 6.5） |
 | `WebSocket` | 通过 P2P 或 Relay 桥接文本、二进制和 subprotocol |
 | `URL` | 仅在同源 Mesh Server 基址与绝对 `/api/...` 路径组合时保留设备前缀，其他情况沿用原生解析 |
 | `XMLHttpRequest` / `EventSource` | 保留原生实现，不再提供自定义模拟类 |
@@ -262,6 +262,8 @@ Mesh 生成的协议/上游错误均声明 JSON 类型。流式首帧前失败�
 4. 跨源外部 Server 保持原地址，交给原生传输，不进入 Mesh P2P。
 
 例如，同时访问 A 的旧会话和 B 的会话列表时，两条请求各自保留 A/B 的明确地址；不能因为首页刚选了 B，就把 A 的请求也发到 B。页面和选中 Server 用于选择当前 P2P 连接及显示状态，不覆盖请求中已有的 Server 身份。
+
+6.5 的离线本地拒绝复用同一套归属判据，不另立一套「这个 URL 属于哪台设备」的解释。
 
 ### 6.3 原生 Server 列表与设备切换
 
@@ -299,6 +301,25 @@ WebSocket 在 `ws_open` 发出前被关闭时，本地确定终止并清理；�
   - 3s 无 pong：旧通道按断开处理（失败旧 pending/stream/ws，已发 mutation 结果未知不重放），随后后台重建 P2P。
   - 迟到 pong 或迟到探针超时不影响新连接；重复 visibility/pageshow 既不重启也不延长 3s 时限；探针期间再次隐藏会取消在途探针而不执行过期淘汰，重新可见开启新的完整窗口。
   - 初始可见页面不当作锁屏恢复、不触发探针；无 open 通道的恢复保持原有 hint/退避路径。
+
+### 6.5 离线设备的本地拒绝
+
+Gateway 对 `online === false` 的设备本来就立即回答 503，不等待控制连接。但上游 OpenCode V2 SDK 不接受这个结论：`/api/event` 按固定约 1.2s 节奏重试（实测 VPS 上单个离线设备约 3018 次/小时），适配层此前照原样转发，这部分噪声全部落在网关和链路上。
+
+因此 `window.fetch` 在把请求交给 P2P 或 Relay **之前**先复现这个服务端应答。三项条件全部成立才拒绝：
+
+1. 请求是同源、不是 `/_mesh/` 控制面（`/_mesh/device/...` 除外），且归属设备就是页面自己的设备——判据与 6.2、`scopeNativeRequest` 完全一致（显式设备前缀优先，裸路径绑定 `state.defaultDevice`）。
+2. 最近一次成功的 `/_mesh/devices` 快照仍在 15s 新鲜预算内。轮询每 5s 一次，该预算容忍三次漏轮（后台标签页定时器节流、页面卡顿）。发现失败、10s 内未返回或快照过期都使快照作废：把一台可达设备误判为离线的代价高于多发一次请求。
+3. 快照确实列出了该设备，且 `online === false`。设备缺项、缺 `online` 字段都按「未知」处理，不按离线处理。
+
+命中的请求在浏览器内得到与 Gateway 语义一致的应答：状态 503、`content-type: application/json`、正文 `{"error":"Specified device offline or not found","device_id":"<id>"}`；之后既不调用 `nativeFetch` 也不走 P2P。方法和请求体一概不论——服务端对任何方法都这样回答，本地只是复现该应答，不在此另立一条「哪些请求可以走」的策略。因为一个字节都没有发出，被拒绝的请求确定没有在任何通道上发出，与「已发 mutation 结果未知不重放」的约束不冲突。
+
+在线判定仍由 5s `/_mesh/devices` 轮询决定，恢复延迟与现状相同（≤5s）；发现、重连、设备切换和 Gateway 路由均未改变。已知边界：
+
+- 只覆盖页面自身设备：显式指向其他设备前缀的请求保持既有原生直通，即使那台设备也离线。这是拦截位置（位于 6.1 的同源/控制面判定之后）的直接结果，不是独立策略。
+- `window.WebSocket` 不在该判据内，WebSocket 的拒绝规则仍在 Gateway 侧。
+- Mesh 自身的 RTT 探测和 `/api/info` 健康探测直接使用 `nativeFetch`，不经过该判据；它们各有 10s/5s 固定节奏。
+- `state.manifest` 缺失时请求不进设备路径，本地拒绝同样不生效。
 
 ## 7. 消息分片与可靠性边界
 
@@ -447,6 +468,7 @@ P2P 和分片基础设施：
 - P2P/Relay 请求选择。
 - fetch、WebSocket 适配及受限的 URL 基址保留。
 - 原生 Server 列表的 V2 设备补充和请求设备归属。
+- 新鲜设备快照标记离线时，在浏览器内复现 Gateway 的 503 应答（6.5）。
 - 浏览器侧分片信封发送和接收。
 - fetch 响应流桥接、取消和传输状态栏。
 - 网络事件提示驱动的重连（防抖/冷却）、generation 守卫和 40s 总时限。
@@ -485,6 +507,7 @@ P2P 和分片基础设施：
 - `tests/test_v2_reconnect_network.py`：在 Node 中运行真实适配器、用可控假时钟模拟网络事件，覆盖重连提示、防抖冷却、任意未打开阶段的取消重建（初始 ICE、重试 ICE、等待打开）、旧协商链的污染防护、hint 启动的重试不继承首轮 fetch 等待、kick 失效静默死亡通道的 pending、40s 总时限（含停滞的 createOffer）和前后台/bfcache 恢复行为。
 - `tests/test_v2_offline_page.py`：在 Node 中运行真实离线页脚本（脚本化 fetch + DOM shim + 假时钟），并直接驱动 ASGI websocket 通道验证浏览器切入点，覆盖统一在线判据（列表/路由/P2P/ws gate，隔离 `state_file`）、目标设备名称安全显示、在线设备切换入口、仅目标恢复时 reload、无目标不自动改投、轮询失败的状态未知与恢复、永不返回轮询的 10 秒 abort 与迟到响应丢弃。
 - `tests/test_v2_foreground_health.py`：在 Node 中运行真实适配器、用可控假时钟驱动 visibilitychange/pageshow 恢复，覆盖旧 open P2P 通道 3s 探针验活、探针/周期 pong 匹配顺序、迟到 pong 与迟到探针超时不影响新连接、验证期 fetch/WS 走 Relay、周期 ping 不覆盖探针槽位、重复恢复不延长时限、探针期间再次隐藏不误淘汰、初始可见不触发探针与 mutation 不重放。
+- `tests/test_v2_offline_gate.py`：在 Node 中运行真实适配器、用脚本化 `/_mesh/devices` 与假时钟驱动设备快照，覆盖新鲜快照标记 `online === false` 时本地复现 Gateway 的 503（正文与 `Gateway.offline_response` 逐字节比对）且不经 `nativeFetch`/P2P、在线后自动恢复、任何方法都被应答而什么都不会发出、快照过期/发现失败或永不返回时失效作废、设备缺项或缺 `online` 字段不拒绝，以及控制面、跨源、`/server/...` 和他机请求保持原路径。
 - `tests/test_gateway_logging.py`：网关日志配置回归，覆盖状态码过滤器对 2xx/101 拒绝与 4xx/5xx 放行、无状态码记录（WebSocket `[accepted]`）保留、过滤器只装到 `uvicorn.access` 而不碰 `uvicorn.error`、缺省配置不改变原有全量访问日志、重复 lifespan 不叠加过滤器，以及配置键到 `uvicorn.run` 实际参数的映射和 `log_level` 合法值与回退。
 
 ### 10.6 访问日志降噪
@@ -563,6 +586,12 @@ P2P 和 Relay 切换可能发生在请求已经部分发送之后。对带副作
 - 后台重试不占用业务请求等待时间：只有页面 bootstrap 的首轮协商允许 fetch 等 1.2s，hint 重建或退避启动的新尝试（即使取代了首轮）一律走 Relay。
 
 这样保证 hint 带来的收益（更早恢复 P2P）有上界，不会因事件风暴放大协商次数、产生并发协商或延迟业务请求。
+
+### 12.5 为什么离线设备的请求在浏览器本地作答
+
+服务端对离线设备已经是快速失败（503），本地复现不改变业务结果，只是不再把注定失败的请求送上网。替代方案（让请求照旧转发、依赖 SDK 自己放弃）已被实测否定：SDK 的重试节奏固定，噪声随在线页面数量线性增长，且这部分请求全部经过网关和公网链路。
+
+代价是本地多了一份「设备是否离线」的判断，因此判据必须比 Gateway 更保守：只认新鲜快照里的显式 `online === false`，其余情况一律放行。设备恢复仍由既有 5s 轮询发现，不引入第二套状态机。
 
 ## 13. 阅读和修改建议
 

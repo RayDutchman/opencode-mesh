@@ -4,7 +4,19 @@
 
 ## 1. 先确认事实来源
 
-### 网关访问日志降噪（2026-10-01，已实现，**未部署**，用户批准后由主 agent 部署）
+### 离线设备的浏览器本地 503 门禁（2026-10-02，已实现，**未部署**，未做真实浏览器验收）
+
+- 起因：VPS 访问日志观测到，页面停在已离线设备时上游 OpenCode V2 SDK 仍以约 1.2s 固定节奏重试 `/api/event`，单个离线设备约 3018 次/小时；这些请求此前由适配层原样转发，Gateway 每次都立即返回 503。每 10s 一次的 `/api/info` RTT 探测属 Mesh 内部流量，本轮不处理。
+- 实现（`src/static_adapter.py`）：`window.fetch` 在同源/控制面判定之后、交 P2P 或 Relay 之前调用 `offlineDeviceRefusal(url)`。设备归属复用 `scopeNativeRequest` 的判据（显式 `/_mesh/device/{id}` 前缀优先，裸路径绑定 `state.defaultDevice`，`/server/` 与非设备 `/_mesh/` 路径不解析设备），不新增第二套 URL 解释；拦截位置也保证了跨源请求、`/_mesh/devices`、`/_mesh/ui/`、`/_mesh/offers/` 不受影响。
+- 判据必须比 Gateway 保守：快照中存在该设备、`online === false`，且最近一次成功 `/_mesh/devices`（5s 轮询）不超过 `DEVICE_SNAPSHOT_TTL_MS = 15000`（容忍三次漏轮）。`setDeviceStatusUnknown()` 把 `state.deviceSnapshotAt` 置空，因此发现失败或 10s 内未返回都会作废快照；`refreshDeviceStatus()` 与 `syncNativeServers()` 在每次成功发现后写入时间戳。
+- 应答与 `Gateway.offline_response` 语义一致：503、`content-type: application/json`、正文 `{"error":"Specified device offline or not found","device_id":"<id>"}`（测试用真实 `Gateway` 实例产出服务端应答，逐字节比对本地应答）。方法不限——服务端对任何方法都这样回答，本地只是复现，不另立「哪些请求可以走」策略；因为什么都没发出，「已发 mutation 不重放」不受影响。
+- 未改动：Gateway 路由、离线页、P2P/Relay 选择、认证、`window.WebSocket`、`scripts/`、`android/`、PWA、`reconnect_seconds`。
+- 已知边界（已在架构文档登记）：只覆盖页面自身设备，他机显式前缀请求保持原生直通（拦截位置的直接结果）；Mesh RTT 探测与 `/api/info` 探测直接用 `nativeFetch`，不在门禁内；`state.manifest` 缺失时不生效。
+- 验证：新增 `tests/test_v2_offline_gate.py` 11 项（Node 中跑真实适配器 + 脚本化 `/_mesh/devices` + 假时钟），全量 pytest **397 passed, 1 skipped**（基线 386 + 11）。四个反向变异全部如期失败：删除新鲜度检查（陈旧快照、发现失败、永不返回三例）、`if (!device) return null` 改为放行（恢复、在线守卫、缺 `online` 字段三例）、删除 `requestDeviceId` 的 `/_mesh/`+`/server/` 守卫并把拦截移到直通判定之前（控制面/跨源/他机一例）、只把拦截上移（跨源请求变 503；临时移除跨源断言后，他机离线设备 C 也被本地拒绝）。
+- 实现约束：`tests/test_v2_bootstrap.py` 与 `tests/test_v2_transport.py` 会截取适配器源码片段单独求值，因此写入快照时间戳的两处必须就地内联，不能抽 `applyDeviceSnapshot()` 之类的辅助函数，否则片段内 `ReferenceError`。
+- **未验证**：未做真实浏览器端到端验收，未部署，未提交、未推送、未重启任何服务；门禁是否真的让 VPS 上的 `/api/event` 请求下降需部署后用日志核对（当前只有静态论证与单元回归）。
+
+### 网关访问日志降噪（2026-10-01，已实现并部署 `1c56330`，主机侧限额另行处理）
 
 - 起因：VPS 上 24 小时内约 165k 行日志中 158k 行来自 `opencode-mesh-gateway.service` 的 uvicorn 访问日志，journald 已限制 200M。噪声主体不是「每请求一行」，而是适配层每 5 秒一次的 `/_mesh/devices` 刷新、P2P 未连通时每 10 秒一次的 RTT 探测、离线页 3 秒轮询，全部是 200；`GET /_mesh/devices HTTP/1.1" 200 OK` 占绝大多数。
 - 结论先行：**uvicorn 没有官方的「只留错误」开关**。`access_log=False` 会清空访问通道全部 handler（`uvicorn/config.py` `configure_logging`），`log_level` 同时调整 `uvicorn.error`/`uvicorn.access`/`uvicorn.asgi` 三者，连启动行一起压掉；`UVICORN_ACCESS_LOG`、`UVICORN_LOG_LEVEL` 环境变量对程序内 `uvicorn.run()` 无效，因为 `auto_envvar_prefix` 是 click CLI 特性。
@@ -15,8 +27,10 @@
 - 未改动：`scripts/install.sh` 的 systemd unit（`upgrade.sh` 只替换 `src`/`scripts`/`pyproject.toml`，永不重写 unit，加 `EnvironmentFile` 不会随升级生效）、`uninstall.sh`、PWA 与 `android/`。`reconnect_seconds` 死键未动。
 - 验证：全量 pytest **410 passed, 1 skipped**（基线 380 + 新增 30，跳过项为 Android API-35 工具链缺失）。新增 `tests/test_gateway_logging.py` 30 项，覆盖 200/101/302 拒绝与 400/401/404/500/503 放行、无状态码记录保留、`uvicorn.error` 的 handler 未被装 filter、缺省配置下 200 仍完整记录、重复 lifespan 不叠加 filter、配置键到 `uvicorn.run` 实际参数的映射（真实 `Gateway` + monkeypatch `uvicorn.run`，不启动服务）、`log_level` 六个合法值与八类非法值回退。四个反向变异全部如期失败：`>=` 改 `>`、把 filter 装到 `uvicorn.error`、`resolve_log_level` 不做校验、lifespan 不装 filter。RED 阶段 29 failed / 1 passed，唯一通过项是「缺省配置保持原有全量访问日志」这一反向守卫。
 - 真实进程证据（`/tmp/opencode/livecheck/`，真实 uvicorn Server + 真实 Gateway，非 ASGI 直驱）：`access_log_status_min=400` 时两次 `GET /_mesh/devices` 200 与未知路由 503 中，只剩 500/503 与全部启动关闭行；不配置时两次 200 照旧输出；`access_log=false` 时访问行全无但 `Exception in ASGI application` 仍在。uvicorn 的 handler 由 `Config.configure_logging()` 安装，因此只能在真实 stdout 上观察，测试里改用隔离 logger。
-- **未验证**：其他 uvicorn 版本下 `record.args` 结构未测（本项依赖该内部约定，上游升级需真实浏览器复验）；未在 VPS 实测日志量下降幅度；未做 systemd `LogRateLimit*` 对比实测（属 Mesh 之外的方案，未采纳——按 service 丢消息会连错误和启动行一起丢）。本轮未提交、未推送、未部署、未重启任何服务；VPS 上 200M journald 限额由用户在 `[Journal]` 自行设置，仓库不代改。
-- 下一步：主 agent 部署 Gateway 后核对 `.mesh-revision` 与日志量；用户可先只加 `access_log_status_min` 观察，不满意直接删除该键即回到全量。
+- 部署（2026-10-01，提交 `1c56330`，主 agent 独立执行）：已推送 `origin/main` 并仅部署 VPS Gateway；远端 revision 与 `.mesh-revision` 核对一致、服务 active，首页与 `/_mesh/devices` 均 200。**VPS 的 `gateway.json` 未添加任何新键**，因此线上访问日志形态与部署前一致——本轮只交付了可配置能力，降噪需显式配置。未重启任何 Agent、未部署 PVE、未重打包 APK；版本仍 `0.3.2`。
+- 主机侧 journald 限额（2026-10-01，非仓库改动）：VPS 的 `/etc/systemd/journald.conf` 原本只有一个空的 `[Journal]` 段，没有任何保留上限，日志只增不减（当时 `/var/log/journal` 已达约 1.2G、24 小时内 96% 条目来自 gateway）。已新增 `/etc/systemd/journald.conf.d/mesh-limits.conf`（`SystemMaxUse=200M`、`SystemKeepFree=512M`）并重启 `systemd-journald`，把占用从 1.2G 降到约 181M；原 `journald.conf` 未改动。这属于主机配置，**不会随 `upgrade.sh` 部署，仓库不代改**，重装主机后需重建该 drop-in。
+- **未验证**：其他 uvicorn 版本下 `record.args` 结构未测（本项依赖该内部约定，上游升级需真实浏览器复验）；`access_log_status_min` 上线后的实际下降幅度未实测（因为 VPS 尚未配置该键）；未做 systemd `LogRateLimit*` 对比实测（属 Mesh 之外的方案，未采纳——按 service 丢消息会连错误和启动行一起丢）。
+- 下一步：如要降噪，在 VPS `gateway.json` 加 `access_log_status_min: 400` 并重启 gateway，然后核对 `/api/event` 等 503 流量是否仍占多数（状态码过滤不区分响应体，**已知 503 不会被过滤掉**，需另见离线设备本地门禁一条）；不满意直接删除该键即回到全量。
 
 ### 未知健康状态允许验证连接（2026-09-29，已部署本机与 VPS）
 
@@ -65,6 +79,7 @@
 | `tests/test_mesh_reliability.py` | 代理、分片及生命周期回归 |
 | `tests/test_v2_*.py` | 实际 Node 浏览器接口行为及 V2 错误、启动、上传、WS 边界 |
 | `tests/test_v2_offline_page.py` | 统一在线判据（列表/路由/P2P/浏览器 ws gate）、离线页行为与轮询失败/永不返回恢复（ASGI 直驱 websocket + Node 真实页面脚本） |
+| `tests/test_v2_offline_gate.py` | 离线设备请求的浏览器本地 503 复现、快照新鲜度预算与方法规则、控制面/跨源/他机请求不被门禁 |
 | `tests/test_gateway_logging.py` | 访问日志状态码过滤、`uvicorn.error` 通道不受影响、缺省行为不变、配置键到 `uvicorn.run` 参数的映射与 `log_level` 回退 |
 
 原生 OpenCode 管理 Server 名称、项目、会话和终端 UI；Mesh 仍注入适配脚本与状态栏。当前活动设备使用一条 P2P 通道，其他 Server 请求按明确地址走 Relay。
@@ -76,6 +91,7 @@
 - Gateway origin 不作为额外业务 Server；设备显示名、默认选择和稳定身份是不同概念。
 - 默认设备短时不可达时保持旧项目的 canonical 归属；首次默认选择可以选择在线设备，显式用户选择保持。
 - 上传超限回 Relay 要保留已读前缀和剩余字节；不依赖全量 `arrayBuffer()` 探测，也不自动重放已发 mutation。
+- 离线设备的 503 由 Gateway 和适配层两处「一致复现」，不是两套策略：判据比服务端保守（只认 15s 内快照里的显式 `online === false`），宁可放行也不误判可达设备；任何方法都被应答，因为服务端对任何方法都这样回答。
 
 ## 3. 开发与检查
 
@@ -115,6 +131,7 @@ UI 或传输行为变更应按受影响范围检查：
 4. PTY 创建、connect-token、WS 连接、文本/二进制帧及终端输入输出均验证。
 5. 关闭 P2P 后，后续请求可回 Relay；对结果未知的在途 mutation 不做自动重放。
 6. 启动发现失败可恢复；取消、关闭及弱网重连有对应生命周期证据。
+7. 页面设备离线时请求立即得到 503（页面内报错而不是长时间等待）；设备恢复后 ≤5s 自动恢复，无需刷新页面。
 
 浏览器自动化不是当前 pytest 的一部分。正式回归测试受 Git 管理；临时探针、日志、截图及 manifest 可保存在忽略的 `data/diagnostics/`，长期证据另行备份。归档脚本可能有旧版本假设和环境路径，先审阅再运行。公开记录只写脱敏方法、结果及限制，不复制真实身份或认证头、ticket、会话正文。
 
@@ -126,6 +143,7 @@ UI 或传输行为变更应按受影响范围检查：
 - Python/JS 的部分稳定错误 reason 双端维护，需要同步核对。
 - 上游入口契约升级须重新验收；VPS 同机独立 Agent 目前是部署设计，不能据此声称已实际安装验证。
 - PWA、不同移动浏览器及实际移动网络不是完整自动验收覆盖；模型供应商限流、额度错误与 Mesh 传输故障分别归因。
+- 离线设备的本地 503 只在浏览器内成立：他机显式前缀请求、`window.WebSocket`、Mesh 自身的 RTT 与 `/api/info` 探测都不经过该判据，跨设备流量的重试噪声没有被本地消除。
 
 ## 5. 发布与部署
 
@@ -149,38 +167,85 @@ UI 或传输行为变更应按受影响范围检查：
 
 ## 7. 压缩或结束会话前的交接模板
 
-本轮交接（网关访问日志降噪）：
+本轮交接（离线设备的浏览器本地 503 门禁）：
+
+```text
+任务目标与当前授权范围：
+  浏览器适配器对「新鲜 /_mesh/devices 快照明确标记 online:false」的页面设备请求
+  在本地返回与 Gateway 一致的 503，止住上游 SDK 的重试噪声（实测约 3018 次/小时）。
+  授权范围：src/static_adapter.py、新测试、本文档与 CHANGELOG；禁止提交/推送/部署、
+  禁止改 scripts/、android/、PWA 与 reconnect_seconds。本会话未提交、未推送、未部署。
+基线提交 / 当前提交 / 未提交改动：
+  基线与 HEAD 均为 1c56330（分支 fix/offline-device-request-gate，worktree
+  .worktrees/offline-gate）。未提交改动：src/static_adapter.py、
+  docs/architecture.md、docs/maintenance.md、CHANGELOG.md，
+  新增 tests/test_v2_offline_gate.py。
+已完成与证据：
+  DEVICE_SNAPSHOT_TTL_MS=15000 + state.deviceSnapshotAt（成功发现写入、
+  setDeviceStatusUnknown 置空）+ requestDeviceId/offlineDeviceRefusal 两个辅助函数
+  + fetch 补丁内的门禁调用。全量 397 passed / 1 skipped（基线 386 + 11）；
+  四个反向变异全部如期失败；适配器 node --check 与 compileall 通过。
+未完成、阻塞、未复现问题：
+  未部署、未做真实浏览器端到端验收；VPS 上 /api/event 是否真的下降未实测。
+  他机显式前缀请求、window.WebSocket、Mesh RTT 与 /api/info 探测仍走原路径（有意为之，
+  但意味着跨设备噪声未消除）。state.manifest 缺失时门禁不生效。
+验证命令、结果与适用版本：
+  /home/chenweibo/opencode-mesh/.venv/bin/python -m pytest -q -p no:cacheprovider
+  -W error::DeprecationWarning -rs
+  → 397 passed, 1 skipped（基线 386）。Python 3.14 / Node v22。
+  git diff --check 通过。
+关键决定、理由和代价：
+  拦截点定在 fetch 补丁内、同源/控制面判定之后：跨源与 /_mesh/ 控制面天然不受影响，
+  代价是显式他机请求不再本地拒绝。
+  设备归属复用 scopeNativeRequest 判据，不另立 URL 解释。
+  TTL 15000ms（约三次漏轮）容忍后台定时器节流；快照过期/失败即放行，误判代价高于多发一次。
+  方法不限：服务端对任何方法都答 503，本地只是复现；未发出任何字节，故不触碰
+  「已发 mutation 不重放」。不抽 applyDeviceSnapshot()：bootstrap/transport 测试会截取
+  源码片段求值，辅助函数会 ReferenceError。
+下一步与涉及文件：
+  用户批准后由主 agent 部署并用 VPS 日志核对 /api/event 量；
+  真实浏览器验收：设备离线时页面立即报错、设备恢复后 ≤5s 自行恢复。
+相关提交、当前文档与脱敏历史记录：
+  CHANGELOG.md [Unreleased]；docs/architecture.md §6.1/§6.2/新增 §6.5/§10.1/§10.5/§12.5；
+  docs/maintenance.md §1/§2/§4/§7。
+本地私有证据是否存在、是否已备份：
+  绿色版本适配器副本 /tmp/opencode/adapter-green.py、变异对照副本在 /tmp/opencode/，
+  未纳入仓库，无需备份。
+```
+
+### 网关访问日志降噪（2026-10-01，已提交并部署 1c56330）
 
 ```text
 任务目标与当前授权范围：
   降低网关 uvicorn 访问日志噪音，做成配置项并可定义 log level；默认行为不变。
-  用户已批准范围，部署由主 agent 执行；本会话未提交、未推送、未部署。
+  用户批准范围：src/main.py、新测试、config 示例、docs 与 CHANGELOG；
+  禁止改 scripts/unit、android/、PWA 与 reconnect_seconds。部署由主 agent 执行。
 基线提交 / 当前提交 / 未提交改动：
-  基线与 HEAD 均为 db1990e（分支 feat/mesh-pwa）。未提交改动：
-  src/main.py、config/gateway.example.json、docs/architecture.md、
-  docs/maintenance.md、CHANGELOG.md、README.md，
-  新增 tests/test_gateway_logging.py。
+  基线 db1990e（PWA 工作分支）；实现提交 1c56330，基于 8b87e95（main）。
+  改动：src/main.py、tests/test_gateway_logging.py、
+  config/gateway.example.json、docs/architecture.md、docs/maintenance.md、
+  CHANGELOG.md、README.md。
 已完成与证据：
-  AccessStatusFilter + lifespan 装配 + 三个配置键 + 入口参数收敛到
-  gateway_server_options()。全量 410 passed / 1 skipped；
-  四个反向变异如期失败；真实 uvicorn 进程三种配置均已核对。
+  AccessStatusFilter + Gateway.lifespan 装配 + 三个配置键
+  （log_level / access_log / access_log_status_min）+ 入口参数收敛到
+  gateway_server_options()。全量 410 passed / 1 skipped；四个反向变异如期失败；
+  真实 uvicorn 进程三种配置均已核对；VPS 部署后 revision 与 active 核对通过。
 未完成、阻塞、未复现问题：
-  未部署、未在 VPS 实测下降幅度；其他 uvicorn 版本的 record.args 结构未验证；
-  未实测 systemd LogRateLimit* 方案（未采纳）。
+  其他 uvicorn 版本的 record.args 结构未验证；VPS 未启用 access_log_status_min，
+  故实际下降幅度未实测。状态码过滤不覆盖 503，离线设备重试噪声需另有对策。
 验证命令、结果与适用版本：
-  .venv/bin/python -m pytest -q -p no:cacheprovider -W error::DeprecationWarning -rs
-  → 410 passed, 1 skipped（基线 380）。uvicorn 0.53.0 / Python 3.14 / Linux。
-  git diff --check 通过。
+  /home/chenweibo/opencode-mesh/.venv/bin/python -m pytest -q -p no:cacheprovider
+  -W error::DeprecationWarning -rs → 410 passed, 1 skipped（基线 380）。
+  uvicorn 0.53.0 / Python 3.14 / Linux。git diff --check 通过。
 关键决定、理由和代价：
   装 filter 而非替换 LOGGING_CONFIG（后者会误伤 uvicorn.error）；
   access_log_status_min 缺省不设置（升级不改变现有部署行为）；
   状态码依赖 uvicorn 内部 record.args 约定，是已登记的上游风险；
-  无法解析的记录保留而非丢弃。
+  无法解析的记录保留而非丢弃；不改 systemd unit（upgrade.sh 从不重写 unit）。
 下一步与涉及文件：
-  主 agent 部署 Gateway 后核对 .mesh-revision 与实际日志量；
-  用户按需在 gateway.json 加 access_log_status_min。
+  用户按需在 gateway.json 加 access_log_status_min 并重启 gateway。
 相关提交、当前文档与脱敏历史记录：
-  CHANGELOG.md [Unreleased]；docs/architecture.md §10.1/§10.2/§10.5/新增 §10.6；
+  提交 1c56330；CHANGELOG.md [Unreleased]；docs/architecture.md §10.1/§10.2/§10.5/§10.6；
   docs/maintenance.md §1/§2/§5/§7；README.md 配置参考。
 本地私有证据是否存在、是否已备份：
   一次性探针在 /tmp/opencode/livecheck/，未纳入仓库，无需备份。
