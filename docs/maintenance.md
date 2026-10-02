@@ -4,7 +4,7 @@
 
 ## 1. 先确认事实来源
 
-### 离线设备的浏览器本地 503 门禁（2026-10-02，已实现；`50120ec` 已部署但范围有缺陷，本轮扩大范围，未部署）
+### 离线设备的浏览器本地 503 门禁（2026-10-02，已实现并部署 `50120ec` → 修范围缺陷 `f45a964`；线上浏览器端到端已验证）
 
 - 起因：VPS 访问日志观测到，页面停在已离线设备时上游 OpenCode V2 SDK 仍以约 1.2s 固定节奏重试 `/api/event`，单个离线设备约 3018 次/小时；这些请求此前由适配层原样转发，Gateway 每次都立即返回 503。每 10s 一次的 `/api/info` RTT 探测属 Mesh 内部流量，不在本门禁范围。
 - 实现（`src/static_adapter.py`）：`window.fetch` 在任何传输选择之前调用 `offlineDeviceRefusal(url, input, init)`。设备归属复用 `scopeNativeRequest` 的判据（显式 `/_mesh/device/{id}` 前缀优先，裸路径绑定 `state.defaultDevice`，`/server/` 与非设备 `/_mesh/` 路径不解析设备），不新增第二套 URL 解释。
@@ -22,7 +22,8 @@
 - 结论：第一版门禁**范围不足**，是实现缺陷而非部署失败。`window.fetch` 里既有的直通判定 `virtualDeviceId(url.pathname) !== state.manifest?.device_id` 会在「请求设备 ≠ 页面设备」时直接 `return nativeFetch(...)`，而门禁排在其后，因此永不执行。用户的页面同时订阅多台设备（页面自己是一台，另一台是已注册 Server 的事件流），这是上游 OpenCode 的正常用法；只有页面自己的设备被覆盖。
 - 修正（本轮）：门禁移到直通判定之前，改为按显式 `/_mesh/device/<id>` 前缀逐台判断，不再要求等于 `state.manifest.device_id`；导航请求按上文例外放行。跨源、`/_mesh/` 非 device 路径、`/server/...` 的排除逻辑因此从「直通判定提供」改为「门禁自身提供」，不再依赖拦截位置。
 - 验证：全量 pytest **400 passed, 1 skipped**（基线 397 + 3；`tests/test_v2_offline_gate.py` 14 项）。RED 阶段 4 项失败，分别是：他机离线设备仍返回 200（两处）、导航被本地拒绝（两处）；其余 10 项既有测试全通过，说明新期望不与既有行为冲突。反向变异全部如期失败：删除 Accept 排除（两项导航测试）、把门禁移回直通判定之后（3 项他机断言）、删除门禁内的同源检查（跨源）、删除 `requestDeviceId` 的 `/_mesh/`+`/server/` 守卫（控制面）、Accept 只读 `init.headers`（`Request` 输入的导航测试）。
-- **未验证**：本轮扩大范围后**未部署、未做真实浏览器端到端验收**；VPS 上他机 `/api/event` 的 503 是否归零需部署后用日志核对。第一版除上述范围缺陷外，「页面自己的设备被本地拒绝」这一半是否已在浏览器中生效也仍只有单元证据。
+- 第二轮部署与**线上浏览器端到端验证**（2026-10-02，提交 `f45a964`，主 agent 独立执行）：仅部署 VPS Gateway，远端 revision 与 `.mesh-revision` 一致、服务 active、线上 HTML 含新门禁代码。随后用隔离 Chromium（独立 profile，浏览器原生 Basic Auth）直接访问线上 `https://oc.252327.xyz:8443/`：页面自身设备为 `787a…`，快照中 ehang `61f39bb15b396e6c` 为 `online === false`；令页面执行 `fetch('/_mesh/device/61f39bb15b396e6c/api/event', {headers:{accept:'text/event-stream'}})` 得到**本地 503、`content-type: application/json`、正文与 `Gateway.offline_response` 一致，且该请求未产生任何网络请求**；同一离线设备的 HTML 导航（`accept: text/html`）返回 **200 `text/html`** 并确实发往服务器，即恢复页未被本地拒绝。两者合起来证明「他机离线设备被本地拦截」与「导航例外」在真实浏览器中成立。脚本 `/tmp/opencode/livegate/check.py`，未纳入仓库。
+- **未验证**：用户浏览器中已加载的旧适配器仍会继续发出该噪声，**必须刷新页面**才换上新适配器；「刷新后 VPS 上该设备的 `/api/event` 是否归零」尚待日志核对。另外仅验证了该 JSON/HTML 两例，未穷举其他方法与其他端点。
 
 ### 网关访问日志降噪（2026-10-01，已实现并部署 `1c56330`，主机侧限额另行处理）
 
