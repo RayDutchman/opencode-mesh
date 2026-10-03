@@ -1599,6 +1599,9 @@ TRANSPORT_ADAPTER = r"""
       'screen ' + window.screen.height + '  avail ' + window.screen.availHeight,
       'root ' + (rootRect ? Math.round(rootRect.top) + '..' + Math.round(rootRect.bottom) + ' h' + Math.round(rootRect.height) : '-')
         + '  css ' + (root ? getComputedStyle(root).height : '-'),
+      'html h ' + getComputedStyle(document.documentElement).height
+        + '  body h ' + getComputedStyle(document.body).height
+        + '  doc client ' + document.documentElement.clientHeight,
       'standalone ' + (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches),
     ].join('\n');
   }
@@ -1606,6 +1609,29 @@ TRANSPORT_ADAPTER = r"""
   else tempLayoutReadout();
   window.addEventListener('resize', tempLayoutReadout);
   if (window.visualViewport) window.visualViewport.addEventListener('resize', tempLayoutReadout);
+
+  // Height the app box from the visible viewport instead of a CSS viewport unit.
+  // The app declares h-dvh, which measures the layout viewport, and that measure
+  // runs past what the user can actually see in two independent cases: an
+  // installed WebAPK draws under the system navigation bar, and an open IME
+  // shrinks the visible area without shrinking 100dvh. Either way the surplus
+  // lands on the composer, and body{overflow:hidden} makes it unreachable rather
+  // than scrollable. visualViewport.height is the only measure here that already
+  // accounts for both, so it -- not dvh -- decides the box height. The stylesheet
+  // keeps a calc() fallback for the window before this runs.
+  function applyVisibleViewportHeight() {
+    const root = document.getElementById('root');
+    const bar = document.getElementById('ocm-mesh-bar');
+    if (!root || !bar) return;
+    const visual = window.visualViewport;
+    const available = (visual ? visual.height : window.innerHeight) - bar.getBoundingClientRect().height;
+    root.style.height = Math.max(0, Math.round(available)) + 'px';
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyVisibleViewportHeight, { once: true });
+  else applyVisibleViewportHeight();
+  window.addEventListener('resize', applyVisibleViewportHeight);
+  window.addEventListener('orientationchange', applyVisibleViewportHeight);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', applyVisibleViewportHeight);
   // The native entry module waits for discovery to finish before starting; a
   // root handoff additionally holds the transport itself until its target is
   // confirmed, so no old selected device can receive a manifest or bare API.

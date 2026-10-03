@@ -568,3 +568,37 @@ def test_app_root_height_subtracts_bar_and_bottom_safe_area():
     assert re.fullmatch(
         r'height:calc\(100dvh - 36px - env\(safe-area-inset-bottom,0px\)\)',
         match.group(1)), match.group(1)
+
+
+def test_app_box_height_follows_the_visible_viewport_not_dvh():
+    """The app box must be sized from what is visible, not from a viewport unit.
+
+    100dvh measures the layout viewport. On an installed WebAPK it runs past the
+    system navigation bar, and an open IME shrinks the visible area without
+    shrinking it, so a dvh-derived box puts the composer below the fold where
+    body{overflow:hidden} strands it. visualViewport.height is the measure that
+    already accounts for both, and it has to track the bar height too.
+    """
+    start = TRANSPORT_ADAPTER.index('  function applyVisibleViewportHeight()')
+    end = TRANSPORT_ADAPTER.index("window.addEventListener('resize', applyVisibleViewportHeight)", start)
+    script = r'''
+const assert=require('node:assert/strict');
+const bar={getBoundingClientRect:()=>({height:36})};
+const root={style:{}};
+global.document={getElementById:id=>(id==='root'?root:id==='ocm-mesh-bar'?bar:null)};
+global.window={innerHeight:900,visualViewport:{height:640}};
+''' + TRANSPORT_ADAPTER[start:end] + r'''
+applyVisibleViewportHeight();
+assert.equal(root.style.height,'604px','an IME-shrunk visible viewport shortens the box by the bar height');
+window.visualViewport.height=900;
+applyVisibleViewportHeight();
+assert.equal(root.style.height,'864px','the box grows back when the keyboard closes');
+window.visualViewport=null;
+applyVisibleViewportHeight();
+assert.equal(root.style.height,'864px','innerHeight stands in where visualViewport is absent');
+document.getElementById=()=>null;
+applyVisibleViewportHeight();
+assert.equal(root.style.height,'864px','a not-yet-mounted app root is left alone');
+'''
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
