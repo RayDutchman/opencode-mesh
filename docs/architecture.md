@@ -246,10 +246,15 @@ Gateway 只对符合条件的 OpenCode HTML 页面注入 `src/static_adapter.py`
 | `URL` | 仅在同源 Mesh Server 基址与绝对 `/api/...` 路径组合时保留设备前缀，其他情况沿用原生解析 |
 | `XMLHttpRequest` / `EventSource` | 保留原生实现，不再提供自定义模拟类 |
 | `visualViewport` | 决定注入 `#root` 的内联高度（见下）；缺失时退回 `innerHeight` |
+| 状态条标题 | 渲染为真正的 `<button>`，点击即 `location.reload()`（见下） |
 
 状态栏高度由 `static_adapter.py` 的 `BAR_HEIGHT_PX` 单独定义，状态条自身样式、`#root` 的样式兜底和高度脚本三处全部引用它，不得另行写死数值。
 
 `#root` 的高度由脚本按「可见高度 − 状态条高度」写入内联样式，并在 `DOMContentLoaded`、`resize`、`orientationchange` 和 `visualViewport.resize` 时重算。**高度只能来自用户真正看得见的那块，不能用 `vh`/`dvh`/`svh`/`lvh` 推算**：视口单位量的是布局视口，装成 WebAPK 或打开输入法时它都会大于可见区域，而上游 `body{overflow:hidden}` 会让多出来的那段既看不见也滚不到，底部输入框因此被裁掉一半。样式表里的 `calc(100dvh - …)` 只是脚本执行前的兜底，脚本一跑就以内联样式为准。
+
+装成 WebAPK 后没有浏览器界面，页面因此没有任何刷新入口。**浏览器的下拉刷新在这个页面上不可用**，有两个各自独立的阻断点，都是上游自身的 CSS：根滚动容器没有可超滚的余量（`scrollHeight` 等于 `clientHeight`，因为这是个定高 SPA，滚动的是内部的 `.scroll-view__viewport`），且 `body` 上声明了 `overscroll-behavior-y:none`；而 Chrome 只在根滚动容器上提供下拉刷新，不会从内部容器冒泡。给 `body` 加上滚动余量来解锁它会与上面那套定高布局冲突，所以不做。
+
+刷新入口由状态条标题承担：标题渲染为 `<button type="button">`，绑 `location.reload()`，并带 `title` 与 `aria-label` 说明用途。它保留产品名作为可见文字，靠 `font:inherit`、`border:0`、`margin:0`、`padding:0`、`background:transparent` 抹掉按钮默认外观，只留 `cursor:pointer`——注意 `font:inherit` 必须排在 `font-weight:600` 之前，它是简写属性，会把字重一并重置。标题还需 `white-space:nowrap`：它是横条里宽度最固定的一档标签，一旦允许折行就会成为 flex 里让步的那个，两行标题会高过 36px 的横条并压到下方内容上；让宽度可变的传输状态去吸收挤压，标题才能保持单行。同一根横条上还有设备菜单按钮，两个按钮的职责不可互换。
 
 V2 SDK 的 SSE 使用 fetch 流。Mesh 转发流式响应状态、头和数据，由 SDK 处理事件解析及业务重连，不另造 EventSource 语义。
 

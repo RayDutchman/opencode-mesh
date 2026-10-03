@@ -81,12 +81,12 @@ TRANSPORT_ADAPTER = r"""
   const BAR_HEIGHT_PX = 36;
   const BAR_CSS = `
   #ocm-mesh-bar{display:flex;align-items:center;gap:8px;height:${BAR_HEIGHT_PX}px;padding:0 10px;font-size:13px;line-height:20px;flex:0 0 auto;border-bottom:1px solid var(--v2-border-border-base);background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-muted);-webkit-user-select:none;user-select:none}
-  #ocm-mesh-bar .ocm-title{font-weight:600;color:var(--v2-text-text-base)}
+  #ocm-mesh-bar .ocm-title{font:inherit;font-weight:600;color:var(--v2-text-text-base);border:0;margin:0;padding:0;background:transparent;text-align:left;cursor:pointer;white-space:nowrap}
   #ocm-mesh-bar .ocm-version{font-size:11px;color:var(--v2-text-text-faint);white-space:nowrap}
   #ocm-mesh-bar .ocm-device-menu-wrap{position:relative;min-width:0}
   #ocm-mesh-bar .ocm-device-menu-button{display:flex;align-items:center;gap:6px;min-width:0;border:1px solid var(--v2-border-border-base);border-radius:6px;padding:2px 8px;background:var(--v2-background-bg-layer-02);color:var(--v2-text-text-base);font:inherit;line-height:20px;cursor:pointer}
   #ocm-mesh-bar .ocm-device-menu-button[data-offline="true"]{color:var(--v2-text-text-faint)}
-  #ocm-mesh-bar .ocm-device-menu-button:focus-visible,#ocm-device-menu .ocm-device-menu-item:focus-visible{outline:2px solid var(--v2-border-border-base);outline-offset:2px}
+  #ocm-mesh-bar .ocm-title:focus-visible,#ocm-mesh-bar .ocm-device-menu-button:focus-visible,#ocm-device-menu .ocm-device-menu-item:focus-visible{outline:2px solid var(--v2-border-border-base);outline-offset:2px}
   #ocm-mesh-bar .ocm-device-menu-label{max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #ocm-device-menu{position:fixed;z-index:2147483646;min-width:0;max-width:calc(100vw - 16px);max-height:calc(100dvh - 16px);overflow:auto;padding:4px;background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-base);font-family:inherit;font-size:13px;font-weight:440;line-height:20px;border-radius:6px;box-shadow:var(--v2-elevation-floating,0 8px 16px rgba(0,0,0,.04),0 4px 8px rgba(0,0,0,.08),0 0 0 .5px rgba(0,0,0,.12))}
   #ocm-device-menu .ocm-device-menu-item{display:flex;align-items:center;gap:8px;width:100%;min-width:0;border:0;border-radius:6px;padding:6px 8px;background:transparent;color:inherit;font-family:inherit;font-size:13px;font-weight:440;line-height:20px;text-align:left;cursor:pointer;transition:background 120ms}
@@ -125,15 +125,31 @@ TRANSPORT_ADAPTER = r"""
     document.head.appendChild(style);
   }
 
+  // An installed WebAPK has no browser chrome, so the page has no reload control
+  // of its own, and the browser's pull-to-refresh cannot be used either: this app
+  // is a fixed-height SPA whose root scroller has nothing to overscroll
+  // (scrollHeight equals clientHeight) and which sets overscroll-behavior-y:none
+  // on the body, while Chrome only offers the gesture on the root scroller
+  // regardless. Making the root scrollable to unlock it would fight the layout
+  // rules above, so the bar title carries the reload instead.
+  function reloadPage() {
+    location.reload();
+  }
+
   function ensureBar() {
     let bar = document.getElementById('ocm-mesh-bar');
     if (bar || !document.body) return bar;
     ensureBarStyle();
     bar = document.createElement('div');
     bar.id = 'ocm-mesh-bar';
-    const title = document.createElement('span');
+    const reloadLabel = '重新加载页面';
+    const title = document.createElement('button');
+    title.type = 'button';
     title.className = 'ocm-title';
     title.textContent = 'OpenCode Mesh';
+    title.setAttribute('title', reloadLabel);
+    title.setAttribute('aria-label', reloadLabel);
+    title.addEventListener('click', reloadPage);
     const version = document.createElement('span');
     version.className = 'ocm-version';
     version.textContent = 'v' + MESH_VERSION;
@@ -1563,13 +1579,13 @@ TRANSPORT_ADAPTER = r"""
   setTimeout(measureRelayRtt, 1500);
   // Height the app box from the visible viewport instead of a CSS viewport unit.
   // The app declares h-dvh, which measures the layout viewport, and that measure
-  // runs past what the user can actually see in two independent cases: an
-  // installed WebAPK draws under the system navigation bar, and an open IME
-  // shrinks the visible area without shrinking 100dvh. Either way the surplus
-  // lands on the composer, and body{overflow:hidden} makes it unreachable rather
-  // than scrollable. visualViewport.height is the only measure here that already
-  // accounts for both, so it -- not dvh -- decides the box height. The stylesheet
-  // keeps a calc() fallback for the window before this runs.
+  // runs past what the user can actually see: the box already starts a bar-height
+  // down the page, so sizing it to the full viewport pushes its bottom past the
+  // fold, and an open IME shrinks the visible area without shrinking 100dvh.
+  // body{overflow:hidden} then makes that surplus unreachable rather than
+  // scrollable. visualViewport.height already tracks the IME, so it -- not dvh --
+  // decides the box height. The stylesheet keeps a calc() fallback for the window
+  // before this runs.
   function applyVisibleViewportHeight() {
     const root = document.getElementById('root');
     if (!root || !document.getElementById('ocm-mesh-bar')) return;

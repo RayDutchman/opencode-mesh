@@ -709,3 +709,126 @@ assert.equal(bare.root.style.height,'123px','a not-yet-mounted app root is left 
               .replace('__D__', str(900 - bar)))
     result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
+
+
+
+
+# ---------- reload control ----------
+
+
+def reload_control_region() -> str:
+    """The reload control: its handler and the bar construction that binds it.
+
+    Sliced the same way as the layout wiring, so a missing binding shows up as
+    an assertion instead of an opaque index error.
+    """
+    start = TRANSPORT_ADAPTER.index('  function ensureBarStyle()')
+    last = '    return bar;\n  }'
+    return TRANSPORT_ADAPTER[start:TRANSPORT_ADAPTER.index(last, start) + len(last)]
+
+
+RELOAD_HARNESS = r'''
+const assert=require('node:assert/strict');
+const vm=require('node:vm');
+
+// Only what ensureBar() touches: it builds the bar and binds handlers, and does
+// no network work, so a minimal element stub is enough.
+class Element {
+  constructor(tag){
+    this.tagName=tag.toUpperCase();this.children=[];this.className='';this.id='';
+    this.textContent='';this.style={};this.attributes={};this.listeners={};this.parentNode=null;
+  }
+  append(...nodes){for(const node of nodes){node.parentNode=this;this.children.push(node);}}
+  appendChild(node){this.append(node);return node;}
+  insertBefore(node,before){node.parentNode=this;this.children.splice(this.children.indexOf(before),0,node);}
+  setAttribute(key,value){this.attributes[key]=String(value);}
+  getAttribute(key){return this.attributes[key]??null;}
+  // Reflected IDL attribute: the real element maps it onto the content
+  // attribute, so reading it back after a property assignment has to work.
+  get type(){return this.getAttribute('type')??'';}
+  set type(value){this.setAttribute('type',value);}
+  addEventListener(type,listener){(this.listeners[type]??=[]).push(listener);}
+  dispatch(type,event={}){for(const listener of this.listeners[type]??[])listener({target:this,preventDefault(){},...event});}
+  descendants(){return this.children.flatMap(node=>[node,...node.descendants()]);}
+  querySelector(selector){return this.descendants().find(node=>node.className.split(' ').includes(selector.slice(1)))||null;}
+}
+
+const body=new Element('body');
+const head=new Element('head');
+global.document={
+  body,head,readyState:'complete',
+  createElement:tag=>new Element(tag),
+  getElementById:id=>[head,...head.children,...body.descendants()].find(node=>node.id===id)||null,
+};
+global.window=global;
+global.location={reloads:0,reload(){this.reloads++;}};
+global.MESH_VERSION='test';
+global.BAR_CSS='';
+global.BAR_HEIGHT_PX=36;
+// The device menu has its own tests; here it only has to exist, because the
+// bar binds it and this is about making sure the title does not shadow it.
+function toggleDeviceMenu(){}
+
+vm.runInThisContext(__REGION__);
+
+const bar=ensureBar();
+const title=bar.querySelector('.ocm-title');
+assert.ok(title,'the bar must have a title control');
+assert.equal(title.tagName,'BUTTON','the title has to be a button to be clickable and focusable');
+assert.equal(title.getAttribute('type'),'button','and must not submit anything');
+assert.ok(title.getAttribute('title'),'the control needs a hover hint');
+assert.ok(title.getAttribute('aria-label'),'and a name for screen readers');
+assert.equal(title.textContent,'OpenCode Mesh','the visible label stays the product name');
+
+// Two buttons share this bar; one reloads and one opens a menu. A mis-bound
+// handler here would reload the page every time a device was picked.
+const device=bar.querySelector('.ocm-device-menu-button');
+device.dispatch('click');
+assert.equal(location.reloads,0,'the device button must not reload the page');
+
+title.dispatch('click');
+assert.equal(location.reloads,1,'clicking the title reloads');
+title.dispatch('click');
+assert.equal(location.reloads,2,'and keeps working for the next reload');
+'''
+
+
+def test_bar_title_reloads_the_page():
+    """An installed WebAPK has no reload button, so the bar title has to be one.
+
+    Native pull-to-refresh is not available on this page: the root scroller has
+    no overscroll range, the body sets overscroll-behavior-y:none, and Chrome
+    only offers the gesture on the root scroller. Making the root scrollable to
+    unlock it would fight the fixed-height layout, so the title carries the
+    reload. It has to be a real button, otherwise it is not focusable and a
+    keyboard cannot reach the only reload the installed app has.
+    """
+    script = RELOAD_HARNESS.replace('__REGION__', json.dumps(reload_control_region()))
+    result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
+def test_bar_title_keeps_the_plain_text_look():
+    """The title became a button, so the browser's button chrome has to go.
+
+    font:inherit has to come before font-weight:600, because the shorthand
+    resets the weight and a rule that follows it would win -- the title would
+    silently stop being bold.
+
+    white-space:nowrap is not cosmetic. The title is the widest fixed label in a
+    bar that also carries a variable-width transport string, so once the title
+    is allowed to wrap it becomes the flex item that gives way, and a two-line
+    title overflows the bar's 36px. Letting the transport absorb the squeeze
+    instead keeps the control on one line.
+    """
+    rule = re.search(
+        r'#ocm-mesh-bar \.ocm-title\{((?:[^{}]|\{[^{}]*\})*)\}', TRANSPORT_ADAPTER)
+    assert rule, 'the title rule must exist'
+    declarations = rule.group(1)
+    for reset in ('font:inherit', 'border:0', 'margin:0', 'padding:0',
+                  'background:transparent', 'cursor:pointer', 'white-space:nowrap'):
+        assert reset in declarations, f'the title needs {reset}'
+    assert declarations.index('font:inherit') < declarations.index('font-weight:600'), \
+        'font:inherit resets the weight, so it has to precede font-weight:600'
+    assert '#ocm-mesh-bar .ocm-title:focus-visible' in TRANSPORT_ADAPTER, \
+        'the only reachable control needs a focus ring'
