@@ -552,32 +552,30 @@ def test_recovery_page_carries_manifest_link_and_registration():
 
 # ---------- installed window layout ----------
 
-def test_app_root_height_subtracts_bar_and_bottom_safe_area():
-    """Mesh owns the app box height, so it owns every deduction from the viewport.
+def test_app_root_height_reserves_the_mesh_bar():
+    """The stylesheet fallback exists, and it reserves Mesh's own bar.
 
     The app declares its own h-dvh, so Mesh overrides it and states the box
-    explicitly. Two things sit between the viewport and the composer: Mesh's own
-    36px bar, and -- only in an installed WebAPK -- the system navigation bar the
-    window draws under. Missing either one leaves the composer below the fold,
+    explicitly, otherwise the bar pushes the app one bar-height past the fold
     and body{overflow:hidden} makes that unreachable rather than scrollable.
-    env() resolves to 0 wherever there is no inset, so this stays a no-op in a
-    desktop window or a browser tab.
+    This only has to hold for the window before applyVisibleViewportHeight()
+    runs, which is why it is pinned as a shape rather than as device behaviour.
     """
     match = re.search(r'#root\{([^}]*)\}', TRANSPORT_ADAPTER)
     assert match, 'the adapter must state the app root height itself'
-    assert re.fullmatch(
-        r'height:calc\(100dvh - 36px - env\(safe-area-inset-bottom,0px\)\)',
-        match.group(1)), match.group(1)
+    # A pre-script fallback only: it must still reserve the bar, and it must not
+    # grow a dependency on an inset the installed WebAPK never reports.
+    assert re.fullmatch(r'height:calc\(100dvh - 36px\)', match.group(1)), match.group(1)
 
 
 def test_app_box_height_follows_the_visible_viewport_not_dvh():
     """The app box must be sized from what is visible, not from a viewport unit.
 
-    100dvh measures the layout viewport. On an installed WebAPK it runs past the
-    system navigation bar, and an open IME shrinks the visible area without
-    shrinking it, so a dvh-derived box puts the composer below the fold where
-    body{overflow:hidden} strands it. visualViewport.height is the measure that
-    already accounts for both, and it has to track the bar height too.
+    100dvh measures the layout viewport, and a real device showed it disagreeing
+    with the visible area: the app box ran 36px past the fold with the IME open.
+    So a dvh-derived height cannot be repaired by a constant correction.
+    visualViewport.height is the measure that already matches what the user can
+    see, and it has to account for the bar as well.
     """
     start = TRANSPORT_ADAPTER.index('  function applyVisibleViewportHeight()')
     end = TRANSPORT_ADAPTER.index("window.addEventListener('resize', applyVisibleViewportHeight)", start)
