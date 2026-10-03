@@ -552,6 +552,35 @@ def test_recovery_page_carries_manifest_link_and_registration():
 
 # ---------- installed window layout ----------
 
+BAR_HEIGHT_RE = re.compile(r'const BAR_HEIGHT_PX = (\d+);')
+
+
+def visible_height_fn() -> str:
+    start = TRANSPORT_ADAPTER.index('  function applyVisibleViewportHeight()')
+    end = TRANSPORT_ADAPTER.index("window.addEventListener('resize', applyVisibleViewportHeight)", start)
+    return TRANSPORT_ADAPTER[start:end]
+
+
+def bar_height() -> int:
+    match = BAR_HEIGHT_RE.search(TRANSPORT_ADAPTER)
+    assert match, 'the bar height must be declared once'
+    return int(match.group(1))
+
+
+def test_bar_height_is_declared_once_and_referenced_everywhere():
+    """Three places depend on the bar height, so only one may state it.
+
+    The bar itself, the app box fallback and the script that measures the
+    visible area all subtract or reserve it. A second literal would let the bar
+    change and leave one of them stale, which is the same class of drift that put
+    the composer below the fold in the first place.
+    """
+    height = bar_height()
+    assert f'height:${{BAR_HEIGHT_PX}}px' in TRANSPORT_ADAPTER, 'the bar must size itself from the constant'
+    assert f'calc(100dvh - ${{BAR_HEIGHT_PX}}px)' in TRANSPORT_ADAPTER, 'the app box fallback must read it too'
+    assert f'{height}px' not in TRANSPORT_ADAPTER, f'{height}px must never be written out by hand'
+
+
 def test_app_root_height_reserves_the_mesh_bar():
     """The stylesheet fallback exists, and it reserves Mesh's own bar.
 
@@ -561,42 +590,40 @@ def test_app_root_height_reserves_the_mesh_bar():
     This only has to hold for the window before applyVisibleViewportHeight()
     runs, which is why it is pinned as a shape rather than as device behaviour.
     """
-    match = re.search(r'#root\{([^}]*)\}', TRANSPORT_ADAPTER)
+    match = re.search(r'#root\{((?:[^{}]|\{[^{}]*\})*)\}', TRANSPORT_ADAPTER)
     assert match, 'the adapter must state the app root height itself'
-    # A pre-script fallback only: it must still reserve the bar, and it must not
-    # grow a dependency on an inset the installed WebAPK never reports.
-    assert re.fullmatch(r'height:calc\(100dvh - 36px\)', match.group(1)), match.group(1)
+    assert re.fullmatch(
+        r'height:calc\(100dvh - \$\{BAR_HEIGHT_PX\}px\)', match.group(1)), match.group(1)
 
 
 def test_app_box_height_follows_the_visible_viewport_not_dvh():
     """The app box must be sized from what is visible, not from a viewport unit.
 
     100dvh measures the layout viewport, and a real device showed it disagreeing
-    with the visible area: the app box ran 36px past the fold with the IME open.
-    So a dvh-derived height cannot be repaired by a constant correction.
-    visualViewport.height is the measure that already matches what the user can
-    see, and it has to account for the bar as well.
+    with the visible area: the app box ran a full bar-height past the fold with
+    the IME open. So a dvh-derived height cannot be repaired by a constant
+    correction. visualViewport.height is the measure that already matches what
+    the user can see, and it has to account for the bar as well.
     """
-    start = TRANSPORT_ADAPTER.index('  function applyVisibleViewportHeight()')
-    end = TRANSPORT_ADAPTER.index("window.addEventListener('resize', applyVisibleViewportHeight)", start)
+    bar = bar_height()
     script = r'''
 const assert=require('node:assert/strict');
-const bar={getBoundingClientRect:()=>({height:36})};
+const BAR_HEIGHT_PX = ''' + str(bar) + r''';
 const root={style:{}};
-global.document={getElementById:id=>(id==='root'?root:id==='ocm-mesh-bar'?bar:null)};
+global.document={getElementById:id=>(id==='root'?root:id==='ocm-mesh-bar'?{}:null)};
 global.window={innerHeight:900,visualViewport:{height:640}};
-''' + TRANSPORT_ADAPTER[start:end] + r'''
+''' + visible_height_fn() + f'''
 applyVisibleViewportHeight();
-assert.equal(root.style.height,'604px','an IME-shrunk visible viewport shortens the box by the bar height');
+assert.equal(root.style.height,'{640 - bar}px','an IME-shrunk visible viewport shortens the box by the bar height');
 window.visualViewport.height=900;
 applyVisibleViewportHeight();
-assert.equal(root.style.height,'864px','the box grows back when the keyboard closes');
+assert.equal(root.style.height,'{900 - bar}px','the box grows back when the keyboard closes');
 window.visualViewport=null;
 applyVisibleViewportHeight();
-assert.equal(root.style.height,'864px','innerHeight stands in where visualViewport is absent');
+assert.equal(root.style.height,'{900 - bar}px','innerHeight stands in where visualViewport is absent');
 document.getElementById=()=>null;
 applyVisibleViewportHeight();
-assert.equal(root.style.height,'864px','a not-yet-mounted app root is left alone');
+assert.equal(root.style.height,'{900 - bar}px','a not-yet-mounted app root is left alone');
 '''
     result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr

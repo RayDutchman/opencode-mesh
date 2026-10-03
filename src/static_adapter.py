@@ -75,8 +75,12 @@ TRANSPORT_ADAPTER = r"""
 
   const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), incoming: new Map(), incomingBytes: 0, incomingTombstones: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, networkTimer: null, lastNetworkAttempt: null, lastAttemptTime: null, activeController: null, isInitialAttempt: false, devices: [], defaultDevice: null, deviceSnapshotAt: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null, p2pSendTail: Promise.resolve(), probing: false, probe: null, transportStarted: false, handoffPending: !!rootHandoffDevice };
 
+  // Single source for the bar height. The bar, the app box fallback and the
+  // script that measures the visible area all read it, so changing the bar can
+  // never leave one of them behind.
+  const BAR_HEIGHT_PX = 36;
   const BAR_CSS = `
-  #ocm-mesh-bar{display:flex;align-items:center;gap:8px;height:36px;padding:0 10px;font-size:13px;line-height:20px;flex:0 0 auto;border-bottom:1px solid var(--v2-border-border-base);background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-muted);-webkit-user-select:none;user-select:none}
+  #ocm-mesh-bar{display:flex;align-items:center;gap:8px;height:${BAR_HEIGHT_PX}px;padding:0 10px;font-size:13px;line-height:20px;flex:0 0 auto;border-bottom:1px solid var(--v2-border-border-base);background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-muted);-webkit-user-select:none;user-select:none}
   #ocm-mesh-bar .ocm-title{font-weight:600;color:var(--v2-text-text-base)}
   #ocm-mesh-bar .ocm-version{font-size:11px;color:var(--v2-text-text-faint);white-space:nowrap}
   #ocm-mesh-bar .ocm-device-menu-wrap{position:relative;min-width:0}
@@ -110,7 +114,7 @@ TRANSPORT_ADAPTER = r"""
      effect there at all -- and applyVisibleViewportHeight() below overrules it once
      the script runs. An installed WebAPK also reports no safe-area inset here: its
      window covers the full available height, so there is nothing to subtract. */
-  #root{height:calc(100dvh - 36px)}
+  #root{height:calc(100dvh - ${BAR_HEIGHT_PX}px)}
   `;
 
   function ensureBarStyle() {
@@ -1568,10 +1572,9 @@ TRANSPORT_ADAPTER = r"""
   // keeps a calc() fallback for the window before this runs.
   function applyVisibleViewportHeight() {
     const root = document.getElementById('root');
-    const bar = document.getElementById('ocm-mesh-bar');
-    if (!root || !bar) return;
+    if (!root || !document.getElementById('ocm-mesh-bar')) return;
     const visual = window.visualViewport;
-    const available = (visual ? visual.height : window.innerHeight) - bar.getBoundingClientRect().height;
+    const available = (visual ? visual.height : window.innerHeight) - BAR_HEIGHT_PX;
     root.style.height = Math.max(0, Math.round(available)) + 'px';
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyVisibleViewportHeight, { once: true });
