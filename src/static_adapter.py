@@ -418,7 +418,7 @@ TRANSPORT_ADAPTER = r"""
     // A pending explicit handoff names its target without claiming it is ready.
     const id = state.handoffPending ? rootHandoffDevice : activeDeviceId();
     const device = state.devices.find(item => item.device_id === id);
-    return { name: (device && device.name) || id || 'no device', online: device ? !!device.online : undefined,
+    return { name: (device && device.name) || (state.handoffPending ? 'Switching…' : id || 'no device'), online: device ? !!device.online : undefined,
       health: device?.upstream_health === undefined ? 'unknown' : device.upstream_health, available: device?.available === true };
   }
 
