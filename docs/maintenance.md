@@ -35,6 +35,8 @@
 - **已知代价（有意接受）**：标题没有可见的刷新图标，桌面端靠 `title` 提示，手机端只能靠摸索；标题紧邻设备按钮，两者之间没有分隔，误触标题会丢掉未发送的输入。硬重载不保留草稿。
 - 验证：`test_bar_title_reloads_the_page` 与 `test_bar_title_keeps_the_plain_text_look`；15 项变异（删绑定、删重载调用、标题退回 span、删 type/title/aria-label、把绑定挪到设备按钮、`font:inherit` 顺序反了、逐个删掉按钮样式重置、删 `white-space:nowrap`、删焦点环）全部被测试抓到。真实 Chromium 里另外核过：标题单行、高度不超过横条、不与设备按钮重叠、真实点击确实整页重载、点设备按钮不会重载。全量 **430 passed / 1 skipped**（skip 恒为缺 API-35 `android.jar`）。
 - **发布 0.3.3 并部署（提交 `216f2e6`）**：版本从 0.3.2 递增到 0.3.3，按 `.mesh-revision` 放行的机制与上一轮相同。远端 revision `216f2e6b143086ec0bce78c71af6464eff631947`（= 部署时的本地 HEAD），`opencode-mesh-gateway.service` active，线上复核 **21/21 通过**。线上真实 Chromium（移动视口 390×844、触摸开启、带凭据）核过：标题渲染为 `BUTTON`/`type=button`、`aria-label` 与 `title` 均为「重新加载页面」、单行 20px 不超出 36px 横条、不与设备按钮重叠、边框 0、字重 600、横条版本显示 `v0.3.3`；**真实点击标题确实整页重载，点设备按钮不重载**；页面无 JS 报错。`/sw.js` 首行已是 `version 0.3.3`，字节契约按预期变更，已装的 WebAPK 会取到新 worker（该 worker 只退役上游 worker、不含 fetch 处理，无缓存影响）。未推送、未创建 tag `v0.3.3`、未重启任何 Agent、未部署 PVE、未重打包 APK。其后只追加了本节文档提交，线上运行的仍是 `216f2e6`。
+- **发布到远端（`bc83ac0`，上一条记录的后续）**：本仓库每个发布 tag 都落在 `main` 上（`v0.3.0`/`v0.3.1`/`v0.3.2` 均为 `main` 的祖先），而 `feat/mesh-pwa` 当时领先 `main` 14 个提交、落后 0 个，因此先把 `main` 纯快进到 `bc83ac0`（无冲突，无丢弃提交），再在 `main` 上创建 annotated tag `v0.3.3`（说明 `OpenCode Mesh v0.3.3`，与既有 tag 同格式）。已推送 `origin/main`、`origin/feat/mesh-pwa` 与 `refs/tags/v0.3.3`，三者均指向 `bc83ac0`，远端 refs 与本地一致。
+- **tag 与线上运行 revision 的差别**：`v0.3.3` 指向 `bc83ac0`，VPS 运行的是其父提交 `216f2e6`。两者只差 `docs/maintenance.md`，而 `upgrade.sh` 只投递 `src`、`scripts`、`pyproject.toml`，因此运行内容完全相同。需要与线上逐字节一致时部署 `216f2e6` 或其后的任一提交。
 - **仍未验证**：真机（装成 WebAPK）上的实际点按手感与误触概率，只能由用户在手机浏览器里确认；standalone 冷启动是否正常全屏、网关不可达时离线页表现仍未复验。
 
 ### 网关级 PWA（2026-09-30，实现 `2f5e845` + `814fda2`；09-30 曾部署、10-01 回退、**10-03 随合并 `91cd283` 重新部署并在线**）
