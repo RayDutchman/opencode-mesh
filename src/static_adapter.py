@@ -415,14 +415,15 @@ TRANSPORT_ADAPTER = r"""
   });
 
   function currentDeviceInfo() {
-    const routeId = currentDeviceId();
-    const id = routeId || (state.manifest && state.manifest.device_id) || state.defaultDevice;
+    // A pending explicit handoff names its target without claiming it is ready.
+    const id = state.handoffPending ? rootHandoffDevice : activeDeviceId();
     const device = state.devices.find(item => item.device_id === id);
     return { name: (device && device.name) || id || 'no device', online: device ? !!device.online : undefined,
       health: device?.upstream_health === undefined ? 'unknown' : device.upstream_health, available: device?.available === true };
   }
 
   function deviceHealthInfo(info) {
+    if (state.handoffPending) return { state: 'unknown', label: 'Switching…' };
     if (info.online === false) return { state: 'offline', label: 'Agent offline' };
     if (info.available && info.health === 'healthy') return { state: 'healthy', label: 'OpenCode healthy' };
     if (info.health === 'auth_failed') return { state: 'unavailable', label: 'OpenCode authentication failed' };
@@ -471,7 +472,7 @@ TRANSPORT_ADAPTER = r"""
     device.dataset.health = health.state;
     device.setAttribute('title', health.label);
     device.setAttribute('aria-label', info.name + ': ' + health.label);
-    const transportLabel = health.state === 'healthy' ? transport.label : health.label + ' · ' + transport.label;
+    const transportLabel = state.handoffPending ? health.label : health.state === 'healthy' ? transport.label : health.label + ' · ' + transport.label;
     bar.querySelector('.ocm-transport').innerHTML =
       '<span class="ocm-dot" data-kind="' + transport.kind + '" data-health="' + health.state + '"></span><span title="' + health.label + '">' + transportLabel + '</span>';
   }
@@ -1606,6 +1607,7 @@ TRANSPORT_ADAPTER = r"""
     window.__ocmBootstrap.ready = bootstrapServers().then(() => {
       state.handoffPending = false;
       startInitialTransport();
+      renderBar();
     });
   } else {
     startInitialTransport();

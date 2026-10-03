@@ -33,7 +33,9 @@ const document={body,head,hidden:false,readyState:'complete',activeElement:null,
 global.document=document;global.window=global;global.innerWidth=420;global.innerHeight=800;global.location={assign(url){this.assigned=url}};global.AbortController=class{constructor(){this.signal={aborted:false}}abort(){this.signal.aborted=true}};
 let requests=[];let responders=[];const nativeFetch=(url,options)=>{requests.push({url,options});return responders.shift()};
 const state={devices:[{device_id:'device-a',name:'Old',online:true,upstream_health:'healthy',available:true}],defaultDevice:'device-a'};
-const currentDeviceId=()=>null;const selectedServerDeviceId=()=>null;const activeDeviceId=()=>state.defaultDevice;
+let selectedDevice=null;
+const rootHandoffDevice='device-b';
+const currentDeviceId=()=>null;const selectedServerDeviceId=()=>selectedDevice;const activeDeviceId=()=>selectedServerDeviceId()||state.manifest?.device_id||state.defaultDevice;
 const MESH_VERSION='test';
 const BAR_CSS='';
 const timers=[];const setTimeout=(fn,ms)=>{const timer={fn,ms};timers.push(timer);return timer};const clearTimeout=()=>{};
@@ -122,6 +124,19 @@ const settle=()=>new Promise(resolve=>setImmediate(resolve));
   button.dispatch('click');scheduleDeviceStatusRefresh();const statusTimer=timers.filter(timer=>timer.ms===5000).at(-1);scheduleDeviceStatusRefresh();assert.equal(timers.filter(timer=>timer.ms===5000).at(-1),statusTimer,'closed-menu status refresh has one periodic owner');
   const background=deferred(),beforeBackground=requests.filter(request=>request.url==='/_mesh/devices').length;responders.push(background.promise);statusTimer.fn();refreshDeviceStatus();assert.equal(requests.filter(request=>request.url==='/_mesh/devices').length,beforeBackground+1,'menu and background refresh share one request');
   background.resolve({ok:true,json:()=>Promise.resolve({devices:[{device_id:'device-a',name:'A',online:true,upstream_health:'healthy',available:true}]})});await settle();renderBar();assert.equal(button.dataset.health,'healthy','a closed-menu refresh restores the current-device health indicator');
+  state.devices.push({device_id:'device-b',name:'B',online:true,upstream_health:'healthy',available:true});
+  state.manifest={device_id:'device-a'};state.handoffPending=true;
+  renderBar();
+  assert.equal(button.querySelector('.ocm-device-menu-label').textContent,'B','a pending handoff names its target, not the gateway default');
+  assert.equal(button.dataset.health,'unknown','a pending handoff must not claim to be connected');
+  assert.match(button.getAttribute('aria-label'),/Switching/);
+  assert.doesNotMatch(ensureBar().querySelector('.ocm-transport').innerHTML,/Relay|P2P/,'pending transport has not been selected yet');
+  state.devices=state.devices.filter(device=>device.device_id!=='device-b');renderBar();
+  assert.equal(button.querySelector('.ocm-device-menu-label').textContent,'device-b','an undiscovered target never falls back to another device name');
+  state.devices.push({device_id:'device-b',name:'B',online:true,upstream_health:'healthy',available:true});
+  state.handoffPending=false;selectedDevice='device-b';renderBar();
+  assert.equal(button.querySelector('.ocm-device-menu-label').textContent,'B','confirmed selection wins over a stale transport manifest');
+  assert.equal(button.dataset.health,'healthy');
 })().catch(error=>{console.error(error);process.exitCode=1});
 '''
     result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)

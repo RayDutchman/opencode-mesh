@@ -421,6 +421,10 @@ global.MANIFEST_BEHAVIOR = 'ok-hang';
 def test_valid_handoff_starts_ui_before_stalled_p2p_and_uses_bounded_relay_wait():
     """Validated selection must not make the entry await a 40-second negotiation."""
     preamble = r"""
+const label = {textContent:''}, transportLabel = {innerHTML:''};
+const deviceButton = {dataset:{}, attributes:{}, querySelector:()=>label, setAttribute(key,value){this.attributes[key]=value;}};
+const bar = {querySelector:selector=>selector==='.ocm-device-menu-button'?deviceButton:transportLabel};
+document.getElementById = id => id==='ocm-mesh-bar'?bar:null;
 storage.set('opencode.global.dat:layout', JSON.stringify({home:{selection:{server:'https://mesh.test/_mesh/device/device-a'}}}));
 global.location = {origin:'https://mesh.test',host:'mesh.test',pathname:'/',search:'?mesh_device=device-b',hash:'',href:'https://mesh.test/?mesh_device=device-b'};
 global.history = {state:null,pushState(){},replaceState(state,title,path){location.href=location.origin+path;location.search=new URL(location.href).search;}};
@@ -433,6 +437,8 @@ global.MANIFEST_BEHAVIOR = 'ok-hang';
   for (let i = 0; i < 10; i++) await tick();
   assert.equal(entryStarted, true, 'entry waits for selection, not P2P negotiation');
   assert.equal(window.__ocmTransport.handoffPending, false);
+  assert.equal(label.textContent, 'device-b', 'the confirmed target is shown before any periodic refresh');
+  assert.doesNotMatch(deviceButton.attributes['aria-label'], /Switching/, 'selection completion immediately exits the pending display');
   assert.equal(manifestFetches.length, 1);
   assert.ok(manifestFetches[0].url.includes('device=device-b'));
   assert.equal(hangFetches.length, 1, 'P2P is still negotiating');
