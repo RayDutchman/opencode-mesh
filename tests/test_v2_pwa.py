@@ -9,6 +9,7 @@ ASGI requests plus the real HTML rewriter, and they never touch a device.
 import asyncio
 import base64
 import hashlib
+import json
 import math
 import re
 import struct
@@ -555,9 +556,19 @@ def test_recovery_page_carries_manifest_link_and_registration():
 BAR_HEIGHT_RE = re.compile(r'const BAR_HEIGHT_PX = (\d+);')
 
 
-def visible_height_fn() -> str:
+def visible_height_region() -> str:
+    """The height function together with every registration that drives it.
+
+    The registrations are the behaviour, not incidental setup: without the
+    visualViewport hook the box stops tracking the keyboard, which is the exact
+    defect the function exists to fix. So the tested region has to reach past the
+    last listener, and a missing one has to fail as an assertion rather than as
+    an opaque str.index error.
+    """
     start = TRANSPORT_ADAPTER.index('  function applyVisibleViewportHeight()')
-    end = TRANSPORT_ADAPTER.index("window.addEventListener('resize', applyVisibleViewportHeight)", start)
+    last = "visualViewport.addEventListener('resize', applyVisibleViewportHeight);"
+    assert last in TRANSPORT_ADAPTER[start:], 'the visualViewport resize hook is gone'
+    end = TRANSPORT_ADAPTER.index('\n', TRANSPORT_ADAPTER.index(last, start)) + 1
     return TRANSPORT_ADAPTER[start:end]
 
 
@@ -574,11 +585,16 @@ def test_bar_height_is_declared_once_and_referenced_everywhere():
     visible area all subtract or reserve it. A second literal would let the bar
     change and leave one of them stale, which is the same class of drift that put
     the composer below the fold in the first place.
+
+    Each consumer is pinned at its own site rather than by scanning the adapter
+    for the number: a substring sweep would fire on any unrelated pixel value
+    that happens to end in the same digits.
     """
-    height = bar_height()
-    assert f'height:${{BAR_HEIGHT_PX}}px' in TRANSPORT_ADAPTER, 'the bar must size itself from the constant'
-    assert f'calc(100dvh - ${{BAR_HEIGHT_PX}}px)' in TRANSPORT_ADAPTER, 'the app box fallback must read it too'
-    assert f'{height}px' not in TRANSPORT_ADAPTER, f'{height}px must never be written out by hand'
+    declarations = BAR_HEIGHT_RE.findall(TRANSPORT_ADAPTER)
+    assert len(declarations) == 1, f'BAR_HEIGHT_PX must be declared once, found {len(declarations)}'
+    assert 'height:${BAR_HEIGHT_PX}px' in TRANSPORT_ADAPTER, 'the bar must size itself from the constant'
+    assert 'calc(100dvh - ${BAR_HEIGHT_PX}px)' in TRANSPORT_ADAPTER, 'the app box fallback must read it too'
+    assert '- BAR_HEIGHT_PX;' in visible_height_region(), 'the script must subtract the constant, not its own literal'
 
 
 def test_app_root_height_reserves_the_mesh_bar():
@@ -596,6 +612,27 @@ def test_app_root_height_reserves_the_mesh_bar():
         r'height:calc\(100dvh - \$\{BAR_HEIGHT_PX\}px\)', match.group(1)), match.group(1)
 
 
+def test_app_box_height_wiring_registers_every_trigger():
+    """Each trigger that can change the visible height must be wired.
+
+    The four registrations are what make the box follow a keyboard, a rotation
+    and a late-injected script. Nothing else in the suite observes them, so a
+    deletion here would only ever show up on a device.
+    """
+    for registration in (
+        "document.addEventListener('DOMContentLoaded', applyVisibleViewportHeight",
+        "window.addEventListener('resize', applyVisibleViewportHeight)",
+        "window.addEventListener('orientationchange', applyVisibleViewportHeight)",
+        "window.visualViewport.addEventListener('resize', applyVisibleViewportHeight)",
+    ):
+        found = TRANSPORT_ADAPTER.count(registration)
+        assert found == 1, f'expected exactly one {registration}, found {found}'
+    # The adapter can also be injected after parsing, so it must measure at once
+    # rather than only waiting for an event that has already gone by.
+    assert 'else applyVisibleViewportHeight();' in visible_height_region(), \
+        'a document that is already parsed must be measured without waiting for DOMContentLoaded'
+
+
 def test_app_box_height_follows_the_visible_viewport_not_dvh():
     """The app box must be sized from what is visible, not from a viewport unit.
 
@@ -604,26 +641,71 @@ def test_app_box_height_follows_the_visible_viewport_not_dvh():
     the IME open. So a dvh-derived height cannot be repaired by a constant
     correction. visualViewport.height is the measure that already matches what
     the user can see, and it has to account for the bar as well.
+
+    The wiring is driven for real here: the adapter text runs against stub DOM
+    objects that record listeners, and each trigger is dispatched. Calling the
+    function by hand would pass no matter which listeners were registered.
     """
     bar = bar_height()
-    script = r'''
+    prel = '''
 const assert=require('node:assert/strict');
-const BAR_HEIGHT_PX = ''' + str(bar) + r''';
-const root={style:{}};
-global.document={getElementById:id=>(id==='root'?root:id==='ocm-mesh-bar'?{}:null)};
-global.window={innerHeight:900,visualViewport:{height:640}};
-''' + visible_height_fn() + f'''
-applyVisibleViewportHeight();
-assert.equal(root.style.height,'{640 - bar}px','an IME-shrunk visible viewport shortens the box by the bar height');
-window.visualViewport.height=900;
-applyVisibleViewportHeight();
-assert.equal(root.style.height,'{900 - bar}px','the box grows back when the keyboard closes');
-window.visualViewport=null;
-applyVisibleViewportHeight();
-assert.equal(root.style.height,'{900 - bar}px','innerHeight stands in where visualViewport is absent');
-document.getElementById=()=>null;
-applyVisibleViewportHeight();
-assert.equal(root.style.height,'{900 - bar}px','a not-yet-mounted app root is left alone');
+const vm=require('node:vm');
+const BAR_HEIGHT_PX=__BAR__;
+
+// Evaluate the adapter text with a stub DOM that records every registration,
+// because the point of the test is which events reach the function.
+function boot(readyState, vvHeight){
+  const docL={}, winL={}, vpL={};
+  const add=(map,name,fn)=>{(map[name]||(map[name]=[])).push(fn);};
+  const root={style:{}};
+  const document={
+    readyState,
+    getElementById:id=>(id==='root'?root:id==='ocm-mesh-bar'?{}:null),
+    addEventListener:(name,fn)=>add(docL,name,fn)};
+  const window={
+    innerHeight:900,
+    visualViewport:{height:vvHeight,addEventListener:(name,fn)=>add(vpL,name,fn)},
+    addEventListener:(name,fn)=>add(winL,name,fn)};
+  vm.runInContext(__REGION__, vm.createContext({document, window, BAR_HEIGHT_PX}));
+  return {root, docL, winL, vpL, window, document};
+}
+
+const loading=boot('loading',640);
+assert.equal(loading.root.style.height,undefined,'nothing is measured before the DOM is ready');
+loading.docL.DOMContentLoaded[0]();
+assert.equal(loading.root.style.height,'__A__px','the DOMContentLoaded hook applies the height');
+
+const ready=boot('complete',640);
+assert.equal(ready.root.style.height,'__A__px','an already-parsed document is measured at once');
+assert.equal(ready.docL.DOMContentLoaded,undefined,'no listener is armed once the event has fired');
+
+ready.window.visualViewport.height=500;
+ready.vpL.resize[0]();
+assert.equal(ready.root.style.height,'__B__px','an IME shrinking the visible viewport shrinks the box');
+
+ready.window.visualViewport.height=700;
+ready.winL.resize[0]();
+assert.equal(ready.root.style.height,'__C__px','a window resize re-measures');
+ready.winL.orientationchange[0]();
+assert.equal(ready.root.style.height,'__C__px','a rotation re-measures as well');
+
+const noVisual=boot('complete',640);
+delete noVisual.window.visualViewport;
+noVisual.winL.resize[0]();
+assert.equal(noVisual.root.style.height,'__D__px','innerHeight stands in where visualViewport is absent');
+
+const bare=boot('complete',640);
+bare.document.getElementById=()=>null;
+bare.root.style.height='123px';
+bare.winL.resize[0]();
+assert.equal(bare.root.style.height,'123px','a not-yet-mounted app root is left alone');
 '''
+    script = (prel
+              .replace('__BAR__', str(bar))
+              .replace('__REGION__', json.dumps(visible_height_region()))
+              .replace('__A__', str(640 - bar))
+              .replace('__B__', str(500 - bar))
+              .replace('__C__', str(700 - bar))
+              .replace('__D__', str(900 - bar)))
     result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr

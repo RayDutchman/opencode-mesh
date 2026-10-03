@@ -95,8 +95,16 @@ def pwa_service_worker_source(version: str) -> bytes:
 
     It registers no fetch handler and never touches CacheStorage: Mesh keeps
     the existing HTTP cache behaviour, and whatever the previous worker left
-    behind stays untouched and unused. The embedded version keeps the bytes
-    changing on every release so browsers run the update check.
+    behind stays untouched and unused.
+
+    The version is embedded so that bumping src.__version__ changes the served
+    bytes, which is what makes a browser run the byte comparison and install the
+    new worker. That only happens when the version is bumped, and this project's
+    release practice does not bump it every time it deploys: scripts/upgrade.sh
+    gates on the gateway revision, so several releases can ship under one
+    version. A release that edits this function therefore has to bump
+    src/__version__ in the same commit, or already-installed clients keep the old
+    worker with no server-side symptom.
     """
     return ('// OpenCode Mesh gateway service worker, version ' + version + '\n'
             '// There is no fetch handler on purpose: this worker only replaces the\n'
@@ -129,10 +137,15 @@ class _PwaLinkScanner(HTMLParser):
 
     def __init__(self, text: str) -> None:
         super().__init__(convert_charrefs=False)
-        self._text = text
         # getpos reports a line and a column, so the line starts are needed to
-        # turn that into an offset into the text.
-        self._line_starts = [0] + [index + 1 for index, character in enumerate(text) if character == '\n']
+        # turn that into an offset into the text. Every proxied document pays for
+        # this scan, so it walks with find rather than one Python step per byte.
+        line_starts = [0]
+        index = text.find('\n')
+        while index != -1:
+            line_starts.append(index + 1)
+            index = text.find('\n', index + 1)
+        self._line_starts = line_starts
         self.removed: list[tuple[int, int]] = []
         # Offset of the </head> tag itself: the block goes in front of it.
         self.head_start: int | None = None

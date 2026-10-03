@@ -245,6 +245,11 @@ Gateway 只对符合条件的 OpenCode HTML 页面注入 `src/static_adapter.py`
 | `WebSocket` | 通过 P2P 或 Relay 桥接文本、二进制和 subprotocol |
 | `URL` | 仅在同源 Mesh Server 基址与绝对 `/api/...` 路径组合时保留设备前缀，其他情况沿用原生解析 |
 | `XMLHttpRequest` / `EventSource` | 保留原生实现，不再提供自定义模拟类 |
+| `visualViewport` | 决定注入 `#root` 的内联高度（见下）；缺失时退回 `innerHeight` |
+
+状态栏高度由 `static_adapter.py` 的 `BAR_HEIGHT_PX` 单独定义，状态条自身样式、`#root` 的样式兜底和高度脚本三处全部引用它，不得另行写死数值。
+
+`#root` 的高度由脚本按「可见高度 − 状态条高度」写入内联样式，并在 `DOMContentLoaded`、`resize`、`orientationchange` 和 `visualViewport.resize` 时重算。**高度只能来自用户真正看得见的那块，不能用 `vh`/`dvh`/`svh`/`lvh` 推算**：视口单位量的是布局视口，装成 WebAPK 或打开输入法时它都会大于可见区域，而上游 `body{overflow:hidden}` 会让多出来的那段既看不见也滚不到，底部输入框因此被裁掉一半。样式表里的 `calc(100dvh - …)` 只是脚本执行前的兜底，脚本一跑就以内联样式为准。
 
 V2 SDK 的 SSE 使用 fetch 流。Mesh 转发流式响应状态、头和数据，由 SDK 处理事件解析及业务重连，不另造 EventSource 语义。
 
@@ -314,7 +319,7 @@ PWA 由 Gateway 单独提供，不随所服务的设备变化，也不依赖任�
 
 manifest 的 `id` 与同源的旧原生应用（`id` 为 `/`）分开：浏览器按「源 + id」识别已安装应用，复用 `/` 会把两次安装合并成一个启动器条目，名称与图标随最后一次写入而变。`id` 只是身份标识，不要求可导航；`start_url` 与 `scope` 保持 `/`，应用仍从网关根打开。
 
-Service Worker 脚本只有 `install`（`skipWaiting`）与 `activate`（`clients.claim`）两个监听器，没有 `fetch` 处理函数，也不读写 CacheStorage。它与上游 `/sw.js` 同 URL、同根 scope，因此注册即接管；旧 Workbox precache 不再被使用，但 Mesh 不枚举、不删除任何 CacheStorage 条目。脚本内嵌 `src.__version__`，保证每次发布字节都变化，浏览器才会执行更新检查。图标由上游 v2.0.18 `favicon-v3.svg` 派生，来源、工具版本与哈希记录在 `src/assets/pwa/README.md`；缺少图标文件时 Gateway 启动即报错。
+Service Worker 脚本只有 `install`（`skipWaiting`）与 `activate`（`clients.claim`）两个监听器，没有 `fetch` 处理函数，也不读写 CacheStorage。它与上游 `/sw.js` 同 URL、同根 scope，因此注册即接管；旧 Workbox precache 不再被使用，但 Mesh 不枚举、不删除任何 CacheStorage 条目。脚本内嵌 `src.__version__` 作为首行注释，浏览器比较字节后才决定是否安装新 worker。递增 `src.__version__` 会改变这些字节；注意 `scripts/upgrade.sh` 按 revision 而非版本号放行部署，同一版本下可发多次，因此改动该脚本必须同提交递增版本号，规则见 [maintenance.md §5](./maintenance.md#发布前必查service-worker-的字节契约)。图标由上游 v2.0.18 `favicon-v3.svg` 派生，来源、工具版本与哈希记录在 `src/assets/pwa/README.md`；缺少图标文件时 Gateway 启动即报错。
 
 HTML 改写（`rewrite_device_html`）先做 PWA 规范化：删除所有 `rel="manifest"`、`rel="icon"`、`rel="apple-touch-icon"` 链接，再在 `</head>` 前插入唯一一组网关链接，其中 manifest 带 `crossorigin="use-credentials"`——manifest 走 Basic Auth，缺少该属性时浏览器不会随请求发送凭据。`og:image` 等设备语义属性不改指。规范化是幂等的，缺标签或没有 `</head>` 的片段都只追加、不报错。恢复页（`OFFLINE_PAGE`）带同一组链接并内联注册 `/sw.js`，继续保持 `no-store`。
 

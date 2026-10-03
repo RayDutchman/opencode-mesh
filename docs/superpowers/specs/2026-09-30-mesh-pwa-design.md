@@ -111,7 +111,7 @@ self.addEventListener('activate', (event) => {
 ```
 
 - 无 `fetch`、无 `caches`、无 `importScripts`、无 `respondWith`。**不枚举、不删除任何缓存**，也不碰 `localStorage`/IndexedDB。
-- 内嵌 `src.__version__` 注释行，保证每次发布字节变化，更新检查必然成功。
+- 内嵌 `src.__version__` 注释行，浏览器比较字节后执行更新检查。**该契约依赖版本号递增**：部署按 revision 放行，同版本可多次部署，故改动 `pwa_service_worker_source()` 必须同提交递增 `src/__init__.py`。
 - `skipWaiting()` + `clients.claim()`：上游 `registerType: "prompt"` 且未开 `skipWaiting`/`clientsClaim`，不主动接管则旧 worker 会一直控制已打开页面直到所有客户端关闭。新 worker 无 `fetch` 处理，接管在功能上中性（不经 SW 缓存），且 `controllerchange` 不会自动重载页面。
 - **保证边界**：无 `fetch` 处理只保证请求不经 SW 缓存返回；请求仍遵循既有 HTTP 缓存语义（HTML `no-store`、`/_mesh/ui/2/**` 命名空间资源、API/SSE/WS 各自的既有策略），不额外承诺"必然到达 network"。
 
@@ -218,7 +218,7 @@ manifest 文档：
 1. `/sw.js` 返回 Mesh 脚本：含版本行、有 `install`/`activate`、**无** `fetch` 监听、无 `caches` 引用；提取后 `node --check` 通过。
 2. 源码级与脚本级断言：Mesh 代码与 SW 脚本都不存在 CacheStorage 读写删路径。
 3. 四条 PWA 路径不产生设备请求；无设备注册时仍返回 200。
-4. manifest 字段断言：`id`/`start_url`/`scope` 为 `/`、`display: standalone`、含 192/512 图标、`purpose` 合法、`start_url` 无 query。
+4. manifest 字段断言：`id` 为 `/_mesh/pwa`、`start_url`/`scope` 为 `/`、`display: standalone`、含 192/512 图标、`purpose` 合法、`start_url` 无 query。
 5. 图标字节存在、`Content-Type: image/png`、尺寸与 SHA-256 与记录一致。
 6. HTML 规范化：既有 manifest 链接被替换为 credentialed 网关链接；缺失时插入；重复时去重；`/_mesh/` 路径不被二次改写；`rel="icon"`/`apple-touch-icon` 指向网关图标；**manifest 链接缺失不得抛错**。**2026-09-30 评审补充**：还须覆盖 `data-rel`/`x-rel`/`aria-rel` 不被误判、属性值内引号 `>` 时整标签删除无残渣、`<script>`/`<style>`/HTML 注释内的同文本不被改写、`rel` token 列表与大小写、截断文档不抛错，以及整条 `rewrite_device_html` 管线的字节级幂等。
 7. 恢复页含 manifest 链接与 `/sw.js` 注册，仍为 `no-store`；manifest 与 `/sw.js` 无凭据访问为 401。**（2026-09-30 用户批准的边界调整后：两个图标路径的匿名 GET/HEAD 为 200，未认证写为 401、认证写为 405，六个变体路径仍 401，页面与 API 仍 401；`id` 固定为 `/_mesh/pwa` 且跨请求稳定、不随 manifest 路径或设备变化。）**

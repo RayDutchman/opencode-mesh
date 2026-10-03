@@ -10,7 +10,7 @@
 - **使用前提（无法从服务端改善）**：安装要求手机网络能访问 Google 的 WebAPK 铸造服务。提前告知使用者即可。
 - **站点侧无需为 WebAPK 改动**：Chrome 安装时不重取 manifest，沿用渲染器已解析的那份，所以 manifest 处于认证墙后无碍；图标匿名例外在失败与成功两次里都生效。此前的身份隔离与匿名图标两项调整本就正确，只是被这个外部条件掩盖了一整轮。
 - **排查没有留下任何需要撤销的东西**：全程未部署诊断代码，也未放宽认证边界。
-- 验证：用户手机（小米 17 Pro Max、最新版 Chrome）打开代理后安装成功。启动器名称与图标已确认稳定显示为 **OpenCode Mesh**（manifest 里的 `short_name`「Mesh」不被 WebAPK 采用，标签取 `name`，属正常行为）。仍未确认：standalone 冷启动、网关不可达时的离线表现。
+- 验证：用户的 Android 手机（最新版 Chrome）打开代理后安装成功。启动器名称与图标已确认稳定显示为 **OpenCode Mesh**（manifest 里的 `short_name`「Mesh」不被 WebAPK 采用，标签取 `name`，属正常行为）。仍未确认：standalone 冷启动、网关不可达时的离线表现。
 - 可复用的教训：这类「无报错、服务端无痕」的失败，先查外部依赖的可达性，比在客户端日志里挖更快。
 
 ### 装成应用后输入框底部被裁掉（2026-10-03，已修复并真机验证）
@@ -20,7 +20,7 @@
 - **为什么不能靠固定补偿量修：** 真机读数显示 `100dvh` 与实际可见高度会不一致（键盘一开就差一截），偏差量本身是变量，任何常数都修不准。
 - **站点无法改善的一项：底部系统导航栏颜色（已结案）。** 装好后窗口高度等于系统可用高度、四个安全区 inset 全为 0，说明网页视口并未延伸到导航条下面——那一块由系统单独绘制成黑色，不受 `<meta name="theme-color">` 或 manifest 的 `theme_color`/`background_color` 控制（两者已写为 `#fafafa`）。对照：Chrome 自身应用的导航栏取页面背景色，因此会跟随主题。不要为此改 manifest。
 - **未查清的一项：** 纯 CSS 版本（`calc(100dvh - 36px - env(safe-area-inset-bottom,0px))`）在真机上没有生效（读数等于 `100dvh` 原值）。原因未定位，不作推断；改为脚本后该声明不再承担正确性。排查期间的临时读数代码已删除。
-- 验证：426 passed / 1 skipped；线上 revision 与本地 HEAD 一致、service active、21/21 项线上复核通过；真机确认输入框与发送键在键盘开、关两种状态下均完整可用，且 Chrome 浏览器内无回归。
+- 验证：428 passed / 1 skipped；线上 revision 与本地 HEAD 一致、service active、21/21 项线上复核通过；真机确认输入框与发送键在键盘开、关两种状态下均完整可用，且 Chrome 浏览器内无回归。
 - **不要写死只对某一台设备成立的数值。** 状态条高度 `BAR_HEIGHT_PX` 是 Mesh 自己 CSS 定的设计常量，状态条自身、app 兜底规则、可见高度脚本三处全部引用它；窗口相关的高度一律运行时量取。
 - 可复用的教训：页面高度要用「用户真正看得见的那块」倒推。视口单位量的是布局视口，两者不等时按单位算出来的底部必然被裁掉。
 
@@ -68,7 +68,7 @@
 - 结论：第一版门禁**范围不足**，是实现缺陷而非部署失败。`window.fetch` 里既有的直通判定 `virtualDeviceId(url.pathname) !== state.manifest?.device_id` 会在「请求设备 ≠ 页面设备」时直接 `return nativeFetch(...)`，而门禁排在其后，因此永不执行。用户的页面同时订阅多台设备（页面自己是一台，另一台是已注册 Server 的事件流），这是上游 OpenCode 的正常用法；只有页面自己的设备被覆盖。
 - 修正（本轮）：门禁移到直通判定之前，改为按显式 `/_mesh/device/<id>` 前缀逐台判断，不再要求等于 `state.manifest.device_id`；导航请求按上文例外放行。跨源、`/_mesh/` 非 device 路径、`/server/...` 的排除逻辑因此从「直通判定提供」改为「门禁自身提供」，不再依赖拦截位置。
 - 验证：全量 pytest **400 passed, 1 skipped**（基线 397 + 3；`tests/test_v2_offline_gate.py` 14 项）。RED 阶段 4 项失败，分别是：他机离线设备仍返回 200（两处）、导航被本地拒绝（两处）；其余 10 项既有测试全通过，说明新期望不与既有行为冲突。反向变异全部如期失败：删除 Accept 排除（两项导航测试）、把门禁移回直通判定之后（3 项他机断言）、删除门禁内的同源检查（跨源）、删除 `requestDeviceId` 的 `/_mesh/`+`/server/` 守卫（控制面）、Accept 只读 `init.headers`（`Request` 输入的导航测试）。
-- 第二轮部署与**线上浏览器端到端验证**（2026-10-02，提交 `f45a964`，主 agent 独立执行）：仅部署 VPS Gateway，远端 revision 与 `.mesh-revision` 一致、服务 active、线上 HTML 含新门禁代码。随后用隔离 Chromium（独立 profile，浏览器原生 Basic Auth）直接访问线上 `https://oc.252327.xyz:8443/`：页面自身设备为 `787a…`，快照中 ehang `61f39bb15b396e6c` 为 `online === false`；令页面执行 `fetch('/_mesh/device/61f39bb15b396e6c/api/event', {headers:{accept:'text/event-stream'}})` 得到**本地 503、`content-type: application/json`、正文与 `Gateway.offline_response` 一致，且该请求未产生任何网络请求**；同一离线设备的 HTML 导航（`accept: text/html`）返回 **200 `text/html`** 并确实发往服务器，即恢复页未被本地拒绝。两者合起来证明「他机离线设备被本地拦截」与「导航例外」在真实浏览器中成立。脚本 `/tmp/opencode/livegate/check.py`，未纳入仓库。
+- 第二轮部署与**线上浏览器端到端验证**（2026-10-02，提交 `f45a964`，主 agent 独立执行）：仅部署 VPS Gateway，远端 revision 与 `.mesh-revision` 一致、服务 active、线上 HTML 含新门禁代码。随后用隔离 Chromium（独立 profile，浏览器原生 Basic Auth）直接访问线上 `https://mesh.example.com/`：页面自身设备为 `device-a`，快照中 Device B（`device-b`）为 `online === false`；令页面执行 `fetch('/_mesh/device/device-b/api/event', {headers:{accept:'text/event-stream'}})` 得到**本地 503、`content-type: application/json`、正文与 `Gateway.offline_response` 一致，且该请求未产生任何网络请求**；同一离线设备的 HTML 导航（`accept: text/html`）返回 **200 `text/html`** 并确实发往服务器，即恢复页未被本地拒绝。两者合起来证明「他机离线设备被本地拦截」与「导航例外」在真实浏览器中成立。脚本 `/tmp/opencode/livegate/check.py`，未纳入仓库。
 - **未验证**：用户浏览器中已加载的旧适配器仍会继续发出该噪声，**必须刷新页面**才换上新适配器；「刷新后 VPS 上该设备的 `/api/event` 是否归零」尚待日志核对。另外仅验证了该 JSON/HTML 两例，未穷举其他方法与其他端点。
 
 ### 网关访问日志降噪（2026-10-01，已实现并部署 `1c56330`，主机侧限额另行处理）
@@ -207,6 +207,14 @@ UI 或传输行为变更应按受影响范围检查：
 只在 `src/` 与 `tests/` 内的改动（例如访问日志配置）随 `upgrade.sh` 正常生效，因为升级只替换 `src`、`scripts`、`pyproject.toml`。`config/gateway.json` 不被升级覆盖，改配置后重启对应实例即可。systemd unit 里的改动**不会**随升级生效——`upgrade.sh` 从不重写 unit，只能重装或手工编辑。日志量本身不是部署问题：journald 上限由 `[Journal]` 的 `SystemMaxUse` 控制，属于主机配置，仓库不代改。
 
 服务 `active` 只是进程存活，交付还需核对 `.mesh-revision`、设备在线状态及受影响链路。若维护会话运行于被管理的 OpenCode 服务内，重启它可能中断执行，操作前核实进程依赖。
+
+### 发布前必查：Service Worker 的字节契约
+
+`src/frontend.py` 的 `pwa_service_worker_source()` 把 `src.__version__` 内嵌进 `/sw.js` 的首行注释，浏览器靠比较字节来判断要不要装新 worker。**因此：改动该函数的同一个提交必须递增 `src/__init__.py` 的 `__version__`。**
+
+原因是本项目的发版方式：`upgrade.sh` 卡的是 `.mesh-revision`，不是版本号，所以一次版本号下可以发多次部署。漏掉递增的后果是已装的 WebAPK 继续用旧 worker，**服务端没有任何报错**。这不是理论风险，`maintenance.md` 里多次「版本仍为 0.3.2」的记录就是这种情况。
+
+同时注意：改 `__version__` 会改变 `/sw.js` 字节，这是有意的；反过来，仅仅部署新 revision 而不动该函数，字节不变、worker 也不变，属于正常情况。
 
 ## 6. 文档脱敏与更新规则
 
