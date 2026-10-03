@@ -104,7 +104,11 @@ TRANSPORT_ADAPTER = r"""
   #ocm-mesh-bar .ocm-dot[data-kind="relay"]{background:#3b82f6}
   #ocm-mesh-bar .ocm-dot[data-health="unknown"]{background:var(--ocm-device-unknown,rgba(127,127,127,.65))}
   #ocm-mesh-bar .ocm-dot[data-health="unavailable"],#ocm-mesh-bar .ocm-dot[data-health="offline"]{background:var(--icon-critical-base,var(--ocm-device-offline,#fc533a))}
-  #root{height:calc(100dvh - 36px)}
+  /* #root carries the app's own h-dvh, so Mesh has to state the app box height
+     itself. Subtract this bar and the bottom safe-area inset: an installed
+     WebAPK draws under the system navigation bar, and body{overflow:hidden}
+     turns the excess into content that can never be scrolled back into view. */
+  #root{height:calc(100dvh - 36px - env(safe-area-inset-bottom,0px))}
   `;
 
   function ensureBarStyle() {
@@ -1551,6 +1555,57 @@ TRANSPORT_ADAPTER = r"""
   let relayTick = 0;
   setInterval(() => { reconnectForDevice(); renderBar(); if (++relayTick % 5 === 0) measureRelayRtt(); }, 2000);
   setTimeout(measureRelayRtt, 1500);
+  // TEMPORARY DIAGNOSTIC (2026-10-03) -- delete once the standalone bottom-clip
+  // numbers have been read off a real device. Reports the viewport units, the
+  // safe-area insets and the app root box, because the compensation above is
+  // spec-correct but its effect on this phone is not yet measured. Fixed
+  // positioning and pointer-events:none keep it out of the layout it reports.
+  function tempLayoutReadout() {
+    const bar = document.getElementById('ocm-mesh-bar');
+    if (!bar || !document.body) return;
+    const insetProbe = document.createElement('div');
+    insetProbe.style.cssText = 'position:absolute;visibility:hidden;box-sizing:content-box;'
+      + 'padding-top:env(safe-area-inset-top,0px);padding-right:env(safe-area-inset-right,0px);'
+      + 'padding-bottom:env(safe-area-inset-bottom,0px);padding-left:env(safe-area-inset-left,0px);';
+    document.body.appendChild(insetProbe);
+    const insets = getComputedStyle(insetProbe);
+    const insetText = [insets.paddingTop, insets.paddingRight, insets.paddingBottom, insets.paddingLeft].join('/');
+    insetProbe.remove();
+    const unit = (value) => {
+      const probe = document.createElement('div');
+      probe.style.cssText = 'position:absolute;visibility:hidden;height:' + value;
+      document.body.appendChild(probe);
+      const measured = Math.round(probe.getBoundingClientRect().height);
+      probe.remove();
+      return measured;
+    };
+    let box = document.getElementById('ocm-temp-layout');
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'ocm-temp-layout';
+      box.style.cssText = 'position:fixed;left:0;z-index:2147483647;pointer-events:none;'
+        + 'top:' + Math.round(bar.getBoundingClientRect().bottom) + 'px;'
+        + 'background:rgba(0,0,0,.85);color:#fff;font:10px/1.35 monospace;'
+        + 'padding:2px 4px;white-space:pre;';
+      document.body.appendChild(box);
+    }
+    const root = document.getElementById('root');
+    const rootRect = root ? root.getBoundingClientRect() : null;
+    const visual = window.visualViewport;
+    box.textContent = [
+      'inner ' + window.innerHeight + '  vv ' + (visual ? Math.round(visual.height) : '-') + '  scale ' + (visual ? visual.scale : '-'),
+      'vh ' + unit('100vh') + '  dvh ' + unit('100dvh') + '  svh ' + unit('100svh') + '  lvh ' + unit('100lvh'),
+      'safe t/r/b/l ' + insetText,
+      'screen ' + window.screen.height + '  avail ' + window.screen.availHeight,
+      'root ' + (rootRect ? Math.round(rootRect.top) + '..' + Math.round(rootRect.bottom) + ' h' + Math.round(rootRect.height) : '-')
+        + '  css ' + (root ? getComputedStyle(root).height : '-'),
+      'standalone ' + (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches),
+    ].join('\n');
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', tempLayoutReadout, { once: true });
+  else tempLayoutReadout();
+  window.addEventListener('resize', tempLayoutReadout);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', tempLayoutReadout);
   // The native entry module waits for discovery to finish before starting; a
   // root handoff additionally holds the transport itself until its target is
   // confirmed, so no old selected device can receive a manifest or bare API.

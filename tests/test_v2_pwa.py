@@ -18,6 +18,8 @@ import time
 import zlib
 from pathlib import Path
 
+from src.static_adapter import TRANSPORT_ADAPTER
+
 import httpx
 import pytest
 
@@ -546,3 +548,23 @@ def test_recovery_page_carries_manifest_link_and_registration():
     # The page script the Node tests extract must stay the first plain <script> block.
     assert OFFLINE_PAGE.index('<script>') < OFFLINE_PAGE.index("serviceWorker.register")
     assert re.search(r"id=\"ocm-pwa-registration\"", OFFLINE_PAGE)
+
+
+# ---------- installed window layout ----------
+
+def test_app_root_height_subtracts_bar_and_bottom_safe_area():
+    """Mesh owns the app box height, so it owns every deduction from the viewport.
+
+    The app declares its own h-dvh, so Mesh overrides it and states the box
+    explicitly. Two things sit between the viewport and the composer: Mesh's own
+    36px bar, and -- only in an installed WebAPK -- the system navigation bar the
+    window draws under. Missing either one leaves the composer below the fold,
+    and body{overflow:hidden} makes that unreachable rather than scrollable.
+    env() resolves to 0 wherever there is no inset, so this stays a no-op in a
+    desktop window or a browser tab.
+    """
+    match = re.search(r'#root\{([^}]*)\}', TRANSPORT_ADAPTER)
+    assert match, 'the adapter must state the app root height itself'
+    assert re.fullmatch(
+        r'height:calc\(100dvh - 36px - env\(safe-area-inset-bottom,0px\)\)',
+        match.group(1)), match.group(1)
