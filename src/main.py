@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, asyncio, base64, contextlib, hmac, json, os, platform, random, re, secrets, socket, time
+import argparse, asyncio, base64, contextlib, hmac, json, logging, os, platform, random, re, secrets, socket, time
 from collections import OrderedDict
 import anyio
 from pathlib import Path
@@ -397,6 +397,85 @@ class StreamState:
         self.signal.set()
 
 
+# Uvicorn's logging switches are all-or-nothing: access_log=False empties every
+# access handler, and log_level moves uvicorn.error/access/asgi together, so
+# neither can keep failures while dropping successful request lines. The filter
+# below is attached to the uvicorn.access handlers only, leaving the error
+# channel (startup, shutdown, "Exception in ASGI application") untouched.
+ACCESS_LOG_LEVELS = ("critical", "error", "warning", "info", "debug", "trace")
+DEFAULT_LOG_LEVEL = "info"
+
+
+class AccessStatusFilter(logging.Filter):
+    """Keep uvicorn access records whose HTTP status is at least min_status.
+
+    The status is read from the record args, which uvicorn's AccessFormatter
+    unpacks as (client_addr, method, full_path, http_version, status_code).
+    Records without a trailing integer -- notably the WebSocket "[accepted]"
+    line, which carries no status -- are kept rather than dropped.
+    """
+
+    def __init__(self, min_status: int):
+        super().__init__()
+        self.min_status = int(min_status)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args if isinstance(record.args, tuple) else ()
+        try:
+            return int(args[-1]) >= self.min_status
+        except (IndexError, TypeError, ValueError):
+            return True
+
+
+def install_access_log_filter(min_status: int) -> int:
+    """Attach the status filter to every uvicorn access handler; return how many were patched."""
+    status_filter = AccessStatusFilter(min_status)
+    patched = 0
+    for handler in logging.getLogger("uvicorn.access").handlers:
+        if not any(isinstance(f, AccessStatusFilter) for f in handler.filters):
+            handler.addFilter(status_filter)
+            patched += 1
+    return patched
+
+
+def access_log_status_min(cfg: dict[str, Any]) -> int | None:
+    """Minimum status to record, or None to keep logging every access line.
+
+    The key is absent by default so an existing configuration keeps its current
+    full access log; 400 is the useful value for a quiet success path.
+    """
+    raw = cfg.get("access_log_status_min")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def resolve_log_level(cfg: dict[str, Any]) -> str:
+    """Return a level uvicorn accepts; anything else falls back to info instead of raising."""
+    raw = cfg.get("log_level", DEFAULT_LOG_LEVEL)
+    if not isinstance(raw, str):
+        return DEFAULT_LOG_LEVEL
+    level = raw.strip().lower()
+    return level if level in ACCESS_LOG_LEVELS else DEFAULT_LOG_LEVEL
+
+
+def gateway_server_options(cfg: dict[str, Any]) -> dict[str, Any]:
+    """uvicorn.run arguments for the Gateway, derived from the shared configuration."""
+    return {"host": cfg.get("listen_host", "127.0.0.1"),
+            "port": int(cfg.get("listen_port", 8090)),
+            "log_level": resolve_log_level(cfg),
+            "access_log": bool(cfg.get("access_log", True)),
+            "timeout_graceful_shutdown": 5,
+            # ws_max_size must cover the application request limit (base64 expansion
+            # + JSON overhead); otherwise the default 16MiB would disconnect large
+            # responses before the application limit applies.
+            "ws_max_size": ws_frame_limit(cfg)}
+
+
 class Gateway:
     def __init__(self, cfg: dict[str, Any]):
         self.cfg = cfg
@@ -426,7 +505,13 @@ class Gateway:
 
     @contextlib.asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        """Close active streams and browser bridges when the Gateway stops."""
+        """Install the configured access log filter, then close streams and bridges on stop."""
+        # uvicorn configures its handlers before the lifespan starts, so they are
+        # already in place here. access_log=False leaves no access handler to
+        # filter, and a missing threshold keeps the full access log.
+        min_status = access_log_status_min(self.cfg)
+        if min_status is not None:
+            install_access_log_filter(min_status)
         try:
             yield
         finally:
@@ -2055,10 +2140,7 @@ def main():
     if args.mode == "gateway":
         if args.instance is not None:
             parser.error("--instance is only supported in agent mode")
-        # ws_max_size must cover the application request limit (base64 expansion + JSON overhead);
-        # otherwise the default 16MiB would disconnect large responses before the application limit applies.
-        uvicorn.run(Gateway(cfg).app, host=cfg.get("listen_host", "127.0.0.1"), port=int(cfg.get("listen_port", 8090)),
-                    log_level="info", timeout_graceful_shutdown=5, ws_max_size=ws_frame_limit(cfg))
+        uvicorn.run(Gateway(cfg).app, **gateway_server_options(cfg))
     else:
         try:
             cfg = resolve_agent_config(args.config, cfg, args.instance)

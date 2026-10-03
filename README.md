@@ -173,7 +173,9 @@ sudo journalctl -u opencode-mesh-gateway.service -f
 ## 配置参考
 
 - `agents.json`：同机所有 Agent 的统一人工配置，参见 [`config/agents.example.json`](config/agents.example.json)。顶层配置 Gateway 与加入密钥，`agents` 中按实例名填写各自上游、显示名和可选认证；实例字段覆盖同名公共字段。
-- `gateway.json`：`auth.username` / `auth.password`（浏览器登录）、`enroll_token`（加入密钥）、`default_device`。
+- `gateway.json`：`auth.username` / `auth.password`（浏览器登录）、`enroll_token`（加入密钥）、`default_device`，以及可选日志项 `log_level`（默认 `info`）、`access_log`（默认 `true`）、`access_log_status_min`（默认未设置）。
+
+日志项说明：`access_log` 设为 `false` 会关闭全部访问日志，包含错误响应；只想压掉成功请求的噪音时，设 `access_log_status_min` 为 `400`，错误与 5xx 仍会记录，4xx 以下的请求不记录。浏览器设备状态刷新、连接探测和离线页轮询都是 200 响应，是长期运行网关上访问日志的主要来源。启动、关闭和未捕获异常日志（`Exception in ASGI application`）以及 Mesh 自身的代理与 P2P 日志始终保留。修改后重启对应服务生效。`log_level` 只接受 `critical`、`error`、`warning`、`info`、`debug`、`trace`，填写其他值会回退为 `info`。若日志量仍然偏大，可同时限制 journald 保留上限，例如在 `[Journal]` 中设置 `SystemMaxUse=200M`。
 - `agent.json`：`gateway_url`、`enroll_token`、`opencode_url`、可选的 `device_name`（注册显示名，省略时使用主机名）、`opencode_basic_auth`、`p2p_loopback_candidate`（默认 true，让同机/宿主机浏览器通过 `127.0.0.1` 建立 P2P 直连）。
 
 `enroll_token` 属于 Gateway，同一 Gateway 上的所有 Agent 共用同一个值。`device_id` 与 `agent_token` 由系统自动生成/签发，无需手工配置。

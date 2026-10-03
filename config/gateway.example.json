@@ -4,5 +4,8 @@
   "state_file": "./data/gateway-state.json",
   "enroll_token": "CHANGE_ME_LONG_RANDOM",
   "default_device": "",
-  "auth": {"username": "CHANGE_ME", "password": "CHANGE_ME"}
+  "auth": {"username": "CHANGE_ME", "password": "CHANGE_ME"},
+  "log_level": "info",
+  "access_log": true,
+  "access_log_status_min": 400
 }

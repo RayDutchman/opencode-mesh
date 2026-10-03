@@ -67,8 +67,13 @@ TRANSPORT_ADAPTER = r"""
   // Do not let bootstrap's pre-existing selection start traffic before discovery
   // and the V2 probe have accepted that requested device.
   const rootHandoffDevice = location.pathname === '/' ? new URLSearchParams(location.search).get('mesh_device') : null;
+  // Only a recent `/_mesh/devices` snapshot may refuse requests locally. The
+  // poll runs every 5s, so this tolerates three missed polls (background timer
+  // throttling, a stalled tab) before an offline verdict stops being trusted.
+  const DEVICE_SNAPSHOT_TTL_MS = 15000;
+  const OFFLINE_BODY_ERROR = 'Specified device offline or not found';
 
-  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), incoming: new Map(), incomingBytes: 0, incomingTombstones: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, networkTimer: null, lastNetworkAttempt: null, lastAttemptTime: null, activeController: null, isInitialAttempt: false, devices: [], defaultDevice: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null, p2pSendTail: Promise.resolve(), probing: false, probe: null, transportStarted: false, handoffPending: !!rootHandoffDevice };
+  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), incoming: new Map(), incomingBytes: 0, incomingTombstones: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, networkTimer: null, lastNetworkAttempt: null, lastAttemptTime: null, activeController: null, isInitialAttempt: false, devices: [], defaultDevice: null, deviceSnapshotAt: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null, p2pSendTail: Promise.resolve(), probing: false, probe: null, transportStarted: false, handoffPending: !!rootHandoffDevice };
 
   const BAR_CSS = `
   #ocm-mesh-bar{display:flex;align-items:center;gap:8px;height:36px;padding:0 10px;font-size:13px;line-height:20px;flex:0 0 auto;border-bottom:1px solid var(--v2-border-border-base);background:var(--v2-background-bg-layer-01);color:var(--v2-text-text-muted);-webkit-user-select:none;user-select:none}
@@ -294,7 +299,12 @@ TRANSPORT_ADAPTER = r"""
     });
   }
 
+  // Only a completed discovery makes the local device snapshot authoritative,
+  // and its timestamp bounds how long that verdict may refuse requests.
   function setDeviceStatusUnknown() {
+    // Without a completed discovery the snapshot proves nothing, so it can no
+    // longer refuse requests; keeping it for display is a separate concern.
+    state.deviceSnapshotAt = null;
     state.devices = state.devices.map(device => ({ ...device, upstream_health: 'unknown', available: false }));
     renderBar();
   }
@@ -325,6 +335,7 @@ TRANSPORT_ADAPTER = r"""
         const payload = await Promise.race([response.json(), deadlineExpired]);
         if (deviceStatus.request !== request) return;
         state.devices = Array.isArray(payload.devices) ? payload.devices : [];
+        state.deviceSnapshotAt = Date.now();
         renderBar();
       } catch (error) {
         if (deviceStatus.request === request) setDeviceStatusUnknown();
@@ -506,6 +517,59 @@ TRANSPORT_ADAPTER = r"""
     if (input instanceof Request) return [new Request(url.href, init ? new Request(input, init) : input), undefined];
     return [url.href, init];
   };
+  // Resolve the device a request would actually reach, using exactly the
+  // attribution scopeNativeRequest applies: an explicit device prefix wins, a
+  // bare path binds to the current default device, and Mesh control endpoints
+  // and native server routes carry no device of their own here.
+  const requestDeviceId = url => {
+    const explicit = virtualDeviceId(url.pathname);
+    if (explicit) return explicit;
+    if (url.pathname.startsWith('/_mesh/') || url.pathname.startsWith('/server/')) return null;
+    return state.defaultDevice || null;
+  };
+  // A navigation is not a retry loop. The Gateway answers Accept: text/html with
+  // its offline recovery page (Gateway.wants_html uses the same test), so the
+  // local refusal must stay out of the way and let the request travel. Accept
+  // reaches fetch through init.headers, through a Request input, or through
+  // both; init.headers wins in the platform, and an Accept that cannot be read
+  // here is treated as a navigation, because forwarding costs one request while
+  // refusing would replace the recovery page with raw JSON.
+  const acceptsHtml = (input, init) => {
+    const sources = [init && init.headers, typeof input === 'string' || input instanceof URL ? null : input && input.headers];
+    for (const headers of sources) {
+      if (!headers) continue;
+      try {
+        const accept = new Headers(headers).get('accept');
+        if (accept) return accept.includes('text/html');
+      } catch (_) {
+        return true;
+      }
+    }
+    return false;
+  };
+  // Last-resort local refusal for a device the recent snapshot marks offline.
+  // The Gateway answers 503 immediately for that device anyway, so this only
+  // keeps an upstream retry loop off the network (an offline device previously
+  // drew about 3000 requests per hour). It covers every explicit device target,
+  // not just the page own device: a V2 page subscribes several registered
+  // Servers at once and each offline one keeps its own retry loop alive. It is
+  // deliberately narrow: a foreign origin, a navigation, no snapshot, a stale
+  // one, a failed one, an absent or ambiguous device, or an online device all
+  // fall through to the normal transport. Every method is answered, because the
+  // server refuses all of them; nothing is sent, so a request that is refused
+  // here is known not to have been emitted anywhere.
+  const offlineDeviceRefusal = (url, input, init) => {
+    if (url.origin !== location.origin) return null;
+    if (acceptsHtml(input, init)) return null;
+    if (state.deviceSnapshotAt == null) return null;
+    if (Date.now() - state.deviceSnapshotAt > DEVICE_SNAPSHOT_TTL_MS) return null;
+    const deviceId = requestDeviceId(url);
+    if (!deviceId) return null;
+    const device = state.devices.find(item => item.device_id === deviceId);
+    if (!device || device.online !== false) return null;
+    return new Response(JSON.stringify({ error: OFFLINE_BODY_ERROR, device_id: deviceId }),
+      { status: 503, headers: { 'content-type': 'application/json' } });
+  };
   const readJson = (key, fallback) => { try { return JSON.parse(localStorage.getItem(key) || 'null') ?? fallback; } catch (_) { return fallback; } };
   const headersObject = headers => {
     const result = {};
@@ -529,6 +593,7 @@ TRANSPORT_ADAPTER = r"""
       if (!response.ok) throw new Error('Mesh device discovery failed: ' + response.status);
       const payload = await response.json();
        state.devices = Array.isArray(payload.devices) ? payload.devices : [];
+       state.deviceSnapshotAt = Date.now();
        state.defaultDevice = payload.default_device || null;
        renderBar();
       const unsupported = new Set();
@@ -1507,6 +1572,11 @@ TRANSPORT_ADAPTER = r"""
       return window.fetch(input, init);
     }
     const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href);
+    // The offline refusal is asked before the passthrough below, because a
+    // foreign-device request never reaches it: a V2 page subscribes several
+    // registered Servers, and each offline one keeps its own retry loop alive.
+    const offlineRefusal = offlineDeviceRefusal(url, input, init);
+    if (offlineRefusal) return offlineRefusal;
     if (url.origin !== location.origin || (url.pathname.startsWith('/_mesh/') && !url.pathname.startsWith('/_mesh/device/')) || (virtualDeviceId(url.pathname) && virtualDeviceId(url.pathname) !== state.manifest?.device_id)) return nativeFetch(input, init);
     // While a foreground probe verifies the old open channel, new requests go
     // to Relay; P2P is only restored after a matching pong.

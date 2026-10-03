@@ -241,7 +241,7 @@ Gateway 只对符合条件的 OpenCode HTML 页面注入 `src/static_adapter.py`
 
 | 浏览器 API | 适配行为 |
 |---|---|
-| `fetch` | 优先走 P2P，不可用时使用原生请求走 Relay |
+| `fetch` | 优先走 P2P，不可用时使用原生请求走 Relay；新鲜设备快照标记离线的目标设备在本地直接得到与 Gateway 一致的 503（见 6.6，导航请求除外） |
 | `WebSocket` | 通过 P2P 或 Relay 桥接文本、二进制和 subprotocol |
 | `URL` | 仅在同源 Mesh Server 基址与绝对 `/api/...` 路径组合时保留设备前缀，其他情况沿用原生解析 |
 | `XMLHttpRequest` / `EventSource` | 保留原生实现，不再提供自定义模拟类 |
@@ -262,6 +262,8 @@ Mesh 生成的协议/上游错误均声明 JSON 类型。流式首帧前失败�
 4. 跨源外部 Server 保持原地址，交给原生传输，不进入 Mesh P2P。
 
 例如，同时访问 A 的旧会话和 B 的会话列表时，两条请求各自保留 A/B 的明确地址；不能因为首页刚选了 B，就把 A 的请求也发到 B。页面和选中 Server 用于选择当前 P2P 连接及显示状态，不覆盖请求中已有的 Server 身份。
+
+6.6 的离线本地拒绝复用同一套归属判据，不另立一套「这个 URL 属于哪台设备」的解释；区别只在于它对显式设备前缀不再要求等于当前页面设备。
 
 ### 6.3 原生 Server 列表与设备切换
 
@@ -321,6 +323,27 @@ HTML 改写（`rewrite_device_html`）先做 PWA 规范化：删除所有 `rel="
 静态资源缓存不在 Service Worker 职责内：既有 `/_mesh/ui/2/{device_id}/...` 命名空间与 HTTP 缓存行为不变，导航与业务请求不经 Service Worker、不被重放。
 
 `start_url` 不带 `?mesh_device=`，冷启动后由原生应用恢复 `opencode.pwa.last-route` 决定最终设备。已发请求结果未知时失败即失败，不改投其他设备。网关不可达时没有离线壳，浏览器显示自身离线错误页；网关可达但设备不可用时走既有恢复页。
+
+### 6.6 离线设备的本地拒绝
+
+Gateway 对 `online === false` 的设备本来就立即回答 503，不等待控制连接。但上游 OpenCode V2 SDK 不接受这个结论：`/api/event` 按固定约 1.2s 节奏重试（实测 VPS 上单个离线设备约 3018 次/小时），适配层此前照原样转发，这部分噪声全部落在网关和链路上。
+
+因此 `window.fetch` 在任何传输选择**之前**先复现这个服务端应答——位置在 6.1 的直通判定之前，因为那条判定会把「显式指向其他设备」的请求直接交给 `nativeFetch`，而页面同时订阅多台设备正是 V2 的正常用法。四项条件全部成立才拒绝：
+
+1. 请求是同源。跨源请求与 Mesh 无关，保持原地址交给原生传输。
+2. 归属设备由与 6.2、`scopeNativeRequest` 相同的判据解析：显式 `/_mesh/device/{id}` 前缀优先（**不要求等于页面自己的设备**），裸路径绑定 `state.defaultDevice`；`/_mesh/` 非 device 路径（`/_mesh/devices`、`/_mesh/ui/`、`/_mesh/offers/`）和 `/server/...` 不解析设备。
+3. 最近一次成功的 `/_mesh/devices` 快照仍在 15s 新鲜预算内。轮询每 5s 一次，该预算容忍三次漏轮（后台标签页定时器节流、页面卡顿）。发现失败、10s 内未返回或快照过期都使快照作废：把一台可达设备误判为离线的代价高于多发一次请求。
+4. 快照确实列出了该设备，且 `online === false`。设备缺项、缺 `online` 字段都按「未知」处理，不按离线处理。
+
+**导航请求是唯一的例外**：接受头含 `text/html` 的请求一律放行，交给 Gateway 返回离线恢复页（判据与 `Gateway.wants_html` 相同）。在浏览器里打开离线设备会带这个头，若本地拒绝，用户看到的就是裸 JSON 而不是恢复页。接受头可能来自 `init.headers` 或 `Request` 输入，两者都读；读不出来时按导航处理，因为多发一次请求只是浪费，而错误拒绝会顶掉恢复页。
+
+命中的请求在浏览器内得到与 Gateway 语义一致的应答：状态 503、`content-type: application/json`、正文 `{"error":"Specified device offline or not found","device_id":"<id>"}`；之后既不调用 `nativeFetch` 也不走 P2P。方法和请求体一概不论——服务端对任何方法都这样回答，本地只是复现该应答，不在此另立一条「哪些请求可以走」的策略。因为一个字节都没有发出，被拒绝的请求确定没有在任何通道上发出，与「已发 mutation 结果未知不重放」的约束不冲突。
+
+在线判定仍由 5s `/_mesh/devices` 轮询决定，恢复延迟与现状相同（≤5s）；发现、重连、设备切换和 Gateway 路由均未改变。已知边界：
+
+- `window.WebSocket` 不在该判据内，WebSocket 的拒绝规则仍在 Gateway 侧。
+- Mesh 自身的 RTT 探测和 `/api/info` 健康探测直接使用 `nativeFetch`，不经过该判据；它们各有 10s/5s 固定节奏。
+- 只有显式设备路径和裸路径会命中；`/server/...`、控制面和跨源请求永远走既有路径。
 
 ## 7. 消息分片与可靠性边界
 
@@ -445,6 +468,8 @@ opencode-mesh/
 - P2P 信令、消息收发和生命周期清理。
 - HTML 注入入口和 uvicorn 启动参数。
 
+`uvicorn.run()` 的参数由 `gateway_server_options()` 从同一份配置推导，避免在入口硬编码：`log_level` 经 `resolve_log_level()` 校验（只接受 uvicorn 的 `critical/error/warning/info/debug/trace`，非法值回退 `info`，因为 uvicorn 自身按 `LOG_LEVELS[level]` 索引未知值会抛 `KeyError`）；`access_log` 直接透传；`ws_max_size` 由 `ws_frame_limit()` 覆盖应用层上限。访问日志的噪声控制见 §10.6。
+
 这是当前项目最大的单体文件，职责按 `Gateway`、`Agent` 和公共辅助函数分区。
 
 #### `src/frontend.py`
@@ -470,6 +495,7 @@ P2P 和分片基础设施：
 - P2P/Relay 请求选择。
 - fetch、WebSocket 适配及受限的 URL 基址保留。
 - 原生 Server 列表的 V2 设备补充和请求设备归属。
+- 新鲜设备快照标记离线时，在浏览器内复现 Gateway 的 503 应答；覆盖任意显式设备目标，导航请求除外（6.6）。
 - 浏览器侧分片信封发送和接收。
 - fetch 响应流桥接、取消和传输状态栏。
 - 网络事件提示驱动的重连（防抖/冷却）、generation 守卫和 40s 总时限。
@@ -477,7 +503,7 @@ P2P 和分片基础设施：
 
 ### 10.2 配置与部署文件
 
-- `config/gateway.example.json`：Gateway 配置模板，包括监听地址、认证、注册密钥和状态文件。
+- `config/gateway.example.json`：Gateway 配置模板，包括监听地址、认证、注册密钥、状态文件和可选日志项 `log_level`、`access_log`、`access_log_status_min`。
 - `config/agents.example.json`：Agent 统一配置模板，包括公共 Gateway 地址、加入密钥及各实例上游；身份文件由程序维护。
 - Gateway 的 HTTPS 入口由部署环境的反向代理提供，配置要求见 README，不在仓库另放代理模板。
 - systemd 单元由安装脚本生成，不另维护重复模板。
@@ -508,6 +534,22 @@ P2P 和分片基础设施：
 - `tests/test_v2_reconnect_network.py`：在 Node 中运行真实适配器、用可控假时钟模拟网络事件，覆盖重连提示、防抖冷却、任意未打开阶段的取消重建（初始 ICE、重试 ICE、等待打开）、旧协商链的污染防护、hint 启动的重试不继承首轮 fetch 等待、kick 失效静默死亡通道的 pending、40s 总时限（含停滞的 createOffer）和前后台/bfcache 恢复行为。
 - `tests/test_v2_offline_page.py`：在 Node 中运行真实离线页脚本（脚本化 fetch + DOM shim + 假时钟），并直接驱动 ASGI websocket 通道验证浏览器切入点，覆盖统一在线判据（列表/路由/P2P/ws gate，隔离 `state_file`）、目标设备名称安全显示、在线设备切换入口、仅目标恢复时 reload、无目标不自动改投、轮询失败的状态未知与恢复、永不返回轮询的 10 秒 abort 与迟到响应丢弃。
 - `tests/test_v2_foreground_health.py`：在 Node 中运行真实适配器、用可控假时钟驱动 visibilitychange/pageshow 恢复，覆盖旧 open P2P 通道 3s 探针验活、探针/周期 pong 匹配顺序、迟到 pong 与迟到探针超时不影响新连接、验证期 fetch/WS 走 Relay、周期 ping 不覆盖探针槽位、重复恢复不延长时限、探针期间再次隐藏不误淘汰、初始可见不触发探针与 mutation 不重放。
+- `tests/test_v2_offline_gate.py`：在 Node 中运行真实适配器、用脚本化 `/_mesh/devices` 与假时钟驱动设备快照，覆盖新鲜快照标记 `online === false` 时本地复现 Gateway 的 503（正文与 `Gateway.offline_response` 逐字节比对）且不经 `nativeFetch`/P2P、显式指向他机的离线设备同样被拒绝、在线后自动恢复、任何方法都被应答而什么都不会发出、快照过期/发现失败或永不返回时失效作废、设备缺项或缺 `online` 字段不拒绝、`Accept: text/html` 的导航请求（`init.headers` 与 `Request` 两种传法）不被拒绝，以及控制面、跨源、`/server/...` 请求保持原路径。
+- `tests/test_gateway_logging.py`：网关日志配置回归，覆盖状态码过滤器对 2xx/101 拒绝与 4xx/5xx 放行、无状态码记录（WebSocket `[accepted]`）保留、过滤器只装到 `uvicorn.access` 而不碰 `uvicorn.error`、缺省配置不改变原有全量访问日志、重复 lifespan 不叠加过滤器，以及配置键到 `uvicorn.run` 实际参数的映射和 `log_level` 合法值与回退。
+
+### 10.6 访问日志降噪
+
+浏览器适配层的设备状态刷新（5 秒 `/_mesh/devices`）、RTT 探测和离线页轮询都是 200 响应，在长期运行的网关上会占访问日志绝大多数行。uvicorn 自带的两个开关都无法只保留错误：`access_log=False` 会清空访问通道的全部 handler，而 `log_level` 同时调整 `uvicorn.error`、`uvicorn.access` 和 `uvicorn.asgi`（`uvicorn/config.py`），连启动行一起压掉。
+
+因此 Mesh 在 `Gateway.lifespan` 里向 `uvicorn.access` 的 handler 装 `AccessStatusFilter`，只按状态码丢弃记录。状态码取自 `record.args` 末位——uvicorn 的 `AccessFormatter` 把它解包为 `(client_addr, method, full_path, http_version, status_code)`；WebSocket 接受行只有两个参数、不含状态码，遇到无法解析的记录一律保留，宁可多留也不静默丢错。装在 lifespan 而不是替换 uvicorn 的 `LOGGING_CONFIG`，是为了不误伤 `uvicorn.error`（启动、关闭、`Exception in ASGI application`）。项目自身 `proxy request`/`proxy response`/p2p/agent 行是 `print()` 到 stdout，与 uvicorn 日志系统无关，任何配置下都保留。
+
+| 配置 | 默认 | 作用 |
+|---|---|---|
+| `log_level` | `info` | 校验后传给 `uvicorn.run`；非法值回退 `info` |
+| `access_log` | `true` | 透传给 uvicorn；`false` 时连错误访问行也没有 |
+| `access_log_status_min` | 未设置 | 省略即保持全量访问日志；`400` 只保留错误响应 |
+
+未设置 `access_log_status_min` 是默认值，因此升级不改变任何现有部署的日志形态；降噪需用户显式配置。已知的未验证项见 `docs/maintenance.md`。
 
 ## 11. 启动和请求示例
 
@@ -571,6 +613,14 @@ P2P 和 Relay 切换可能发生在请求已经部分发送之后。对带副作
 - 后台重试不占用业务请求等待时间：只有页面 bootstrap 的首轮协商允许 fetch 等 1.2s，hint 重建或退避启动的新尝试（即使取代了首轮）一律走 Relay。
 
 这样保证 hint 带来的收益（更早恢复 P2P）有上界，不会因事件风暴放大协商次数、产生并发协商或延迟业务请求。
+
+### 12.5 为什么离线设备的请求在浏览器本地作答
+
+服务端对离线设备已经是快速失败（503），本地复现不改变业务结果，只是不再把注定失败的请求送上网。替代方案（让请求照旧转发、依赖 SDK 自己放弃）已被实测否定：SDK 的重试节奏固定，噪声随在线页面数量线性增长，且这部分请求全部经过网关和公网链路。
+
+代价是本地多了一份「设备是否离线」的判断，因此判据必须比 Gateway 更保守：只认新鲜快照里的显式 `online === false`，其余情况一律放行。设备恢复仍由既有 5s 轮询发现，不引入第二套状态机。
+
+覆盖范围跟着代价走：页面同时订阅多台设备是 V2 的正常用法，每台离线设备都有自己独立的重试循环，因此门禁按显式设备前缀逐台判断，而不是只看页面自己的设备。代价是本地判断必须在传输选择之前介入，并且要为导航请求让路（否则浏览器里打开离线设备会显示裸 JSON 而不是恢复页）。
 
 ## 13. 阅读和修改建议
 
