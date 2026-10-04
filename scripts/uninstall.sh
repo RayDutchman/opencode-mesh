@@ -92,15 +92,23 @@ for _ in $(seq 1 100); do [[ -e "$LOCK_READY" ]] && break; kill -0 "$LOCK_GUARDI
 rm -f "$LOCK_READY"
 
 # A shared supervisor unit holds every configured instance, including the default one.
-# Only ExecStart counts: a mention in a comment must not turn a legacy unit into a shared one.
+# Only ExecStart counts; legacy recognition is retained solely for safe uninstallation.
 shared_agent_unit_installed() {
   [ "$MODE" = agent ] && [ -f "$UNIT_DIR/opencode-mesh-agent.service" ] &&
     python3 - "$UNIT_DIR/opencode-mesh-agent.service" <<'PY'
-import shlex, sys
+import pathlib, shlex, sys
 for line in open(sys.argv[1]):
     if not line.startswith("ExecStart="):
         continue
-    if "--all-instances" in shlex.split(line.split("=", 1)[1].strip())[1:]:
+    args = shlex.split(line.split("=", 1)[1].strip())[1:]
+    # Recognize the former unified flag for removal of an old installation too.
+    if "--all-instances" in args:
+        sys.exit(0)
+    if any(arg.split("=", 1)[0] in {"--instance", "--agent-instance"} for arg in args):
+        continue
+    mode = args[args.index("--mode") + 1:][:1] if "--mode" in args else []
+    config = args[args.index("--config") + 1:][:1] if "--config" in args else []
+    if mode == ["agent"] and config and pathlib.Path(config[0]).name == "agents.json":
         sys.exit(0)
 sys.exit(1)
 PY

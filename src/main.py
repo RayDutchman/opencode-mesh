@@ -2164,16 +2164,16 @@ def supervise_agent_instances(path: str | Path) -> list[str]:
     cfg = load_json(path)
     agents = cfg.get("agents") if isinstance(cfg, dict) else None
     if not isinstance(agents, dict) or not agents:
-        raise ValueError("--all-instances requires a shared configuration with at least one agent")
+        raise ValueError("Agent mode requires an agents mapping with at least one instance")
     for name in agents:
         resolve_agent_config(path, cfg, name)
     return list(agents)
 
 
 def agent_command(path: str | Path, name: str) -> list[str]:
-    """One child per instance, started through the ordinary single-instance Agent entry point."""
+    """Start a private worker for one instance; the public Agent entry always supervises all."""
     return [sys.executable, "-m", "src.main", "--mode", "agent",
-            "--config", str(Path(path).resolve()), "--instance", name]
+            "--config", str(Path(path).resolve()), "--agent-instance", name]
 
 
 async def _sleep_unless_stopped(stop: asyncio.Event, delay: float) -> bool:
@@ -2278,14 +2278,11 @@ def supervise_agents(path: str | Path):
 
 
 def build_parser():
-    """Command line surface shared by the Gateway, a single Agent and the shared Agent supervisor."""
+    """Expose the Gateway and unified Agent service, keeping worker selection internal."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--mode", choices=["gateway", "agent"], required=True)
-    selection = parser.add_mutually_exclusive_group()
-    selection.add_argument("--instance", help="Select an agent from the shared configuration")
-    selection.add_argument("--all-instances", action="store_true",
-                           help="Supervise every agent of the shared configuration")
+    parser.add_argument("--agent-instance", help=argparse.SUPPRESS)
     return parser
 
 
@@ -2294,13 +2291,11 @@ def main():
     args = parser.parse_args()
     cfg = load_json(args.config)
     if args.mode == "gateway":
-        if args.instance is not None:
-            parser.error("--instance is only supported in agent mode")
-        if args.all_instances:
-            parser.error("--all-instances is only supported in agent mode")
+        if args.agent_instance is not None:
+            parser.error("Worker selection is only supported in agent mode")
         uvicorn.run(Gateway(cfg).app, **gateway_server_options(cfg))
     else:
-        if args.all_instances:
+        if args.agent_instance is None:
             try:
                 supervised = supervise_agents(args.config)
             except ValueError as exc:
@@ -2308,7 +2303,7 @@ def main():
             asyncio.run(supervised)
             return
         try:
-            cfg = resolve_agent_config(args.config, cfg, args.instance)
+            cfg = resolve_agent_config(args.config, cfg, args.agent_instance)
         except ValueError as exc:
             parser.error(str(exc))
         agent = Agent(cfg)

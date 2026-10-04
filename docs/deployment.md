@@ -22,26 +22,38 @@
 安装器默认获取 `main`。需固定发布版本时，在首次安装中指定 tag，例如：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | \
-  MESH_VERSION=v0.3.3 bash -s -- agent
+# 替换为所需的 Git tag 或 commit，脚本与源码使用同一版本
+export MESH_VERSION='replace-with-tag-or-commit'
+curl -fsSL "https://raw.githubusercontent.com/RayDutchman/opencode-mesh/${MESH_VERSION}/scripts/install.sh" | bash -s -- agent
 ```
 
-tag 是不可变快照，可能不包含当前 `main` 的新功能；统一服务托管功能晚于 `v0.3.3` 标签。已有安装不通过重跑安装器升级，使用下文 `upgrade.sh`。
+tag 是不可变快照，可能不包含当前 `main` 的新功能；`v0.3.3` 仍使用旧的独立服务模式。本文描述当前主分支的统一服务模式，升级旧版本前先看[迁移步骤](#从旧服务迁移)。已有安装不通过重跑安装器升级，使用下文 `upgrade.sh`。
 
 ### 非交互安装
 
-自动化可预先导出环境变量，再执行安装器：
+`export` 的意思是：在当前终端设置一个变量，让随后启动的安装脚本也能读取它。下面是两台机器各自执行的完整示例，先替换占位值：
 
 ```bash
-# Gateway：另需设置 MESH_USERNAME、MESH_PASSWORD；MESH_ENROLL_TOKEN 可选。
+# 在公网服务器执行
+export MESH_USERNAME='your-login-name'
+export MESH_PASSWORD='replace-with-your-login-password'
+export MESH_LISTEN_PORT='18081'
+export MESH_ENROLL_TOKEN='replace-with-your-enrollment-token'
 curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | bash -s -- gateway
+```
 
-# Agent：需设置 MESH_GATEWAY_URL、MESH_ENROLL_TOKEN、OPENCODE_URL。
-# 上游启用认证时，再设置 OPENCODE_USERNAME、OPENCODE_PASSWORD。
+```bash
+# 在 OpenCode 设备执行
+export MESH_GATEWAY_URL='https://mesh.example.com'
+export MESH_ENROLL_TOKEN='replace-with-the-same-enrollment-token'
+export OPENCODE_URL='http://127.0.0.1:4096'
+# 上游启用认证时填写；未启用时留空
+export OPENCODE_USERNAME=''
+export OPENCODE_PASSWORD=''
 curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | bash -s -- agent
 ```
 
-变量须由调用环境导出。`MESH_DEVICE_NAME` 设置注册显示名，`MESH_LISTEN_PORT` 设置 Gateway 端口，`MESH_PUBLIC_URL` 用于安装提示中的公网地址。安装器不会把加入密钥拼进输出的可执行命令。
+有控制终端时，脚本仍会交互提问，以上变量作为预填值；无人值守、无控制终端时直接使用这些值。`MESH_DEVICE_NAME` 设置注册显示名，`MESH_PUBLIC_URL` 用于安装提示中的公网地址。Gateway 不提供 `MESH_ENROLL_TOKEN` 时自动生成并打印；示例自选了 `18081`，反向代理的上游端口也应改为 `18081`。
 
 ## 配置与日志
 
@@ -50,7 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 - `agents.json` 顶层字段是公共默认值，`agents.<实例名>` 内同名字段覆盖默认值。每个实例可独立设置 `gateway_url`、`enroll_token`、`opencode_url` 和 `opencode_basic_auth`。
 - `enroll_token` 属于 Gateway，用于加入；`device_id` 和 `agent_token` 自动生成、保存，不手工填写。
 - `device_name` 只影响显示名，不是身份。默认实例状态为 `data/agent-state.json`，具名实例为 `data/agent-state-<name>.json`；统一配置不接受 `state_file`。
-- `listen_host`、`listen_port` 仅属于 Gateway；Agent 连接 `opencode_url`，不监听该端口。旧 `agent.json` 入口仍兼容。
+- `listen_host`、`listen_port` 仅属于 Gateway；Agent 连接 `opencode_url`，不监听该端口。旧 `agent.json` 须按下文迁移为 `agents.json`。
 - `p2p_loopback_candidate` 默认 true，可让同机或宿主机浏览器尝试通过 loopback 建立 P2P。
 
 普通配置修改后重启对应服务，不需要 `daemon-reload`：
@@ -67,29 +79,30 @@ sudo systemctl status opencode-mesh-gateway.service
 sudo journalctl -u opencode-mesh-gateway.service -f
 ```
 
-独立具名实例将服务名换为 `opencode-mesh-agent@second.service`。只有修改 unit 文件时才先执行相同范围的 `daemon-reload`，再 restart。
+所有实例都由 `opencode-mesh-agent.service` 管理，修改任一实例后重启这个服务。只有修改 unit 文件时才先执行相同范围的 `daemon-reload`，再 restart。
 
 Gateway 可设 `access_log_status_min: 400` 只保留 4xx/5xx 访问日志；`access_log: false` 关闭整个访问日志通道。二者均不关闭启动、异常和 Mesh 代理日志。`log_level` 接受 `critical/error/warning/info/debug/trace`，默认及非法值回退均为 `info`。
 
 ## 多实例与统一服务
 
-以下本地脚本命令均在安装目录执行。默认模式下，每个实例一个独立服务：
+**一个安装目录只有一个 Agent 服务**：`opencode-mesh-agent.service` 管理 `agents.json` 中的全部实例，不需要额外的模式开关。以下命令在安装目录执行，向配置中添加具名实例：
 
 ```bash
 bash scripts/install.sh agent second
-systemctl --user status opencode-mesh-agent@second.service
+systemctl --user status opencode-mesh-agent.service
 ```
 
 省略实例名表示 `default`；不要显式传 `agent default`。已有实例不能重复安装或被覆盖，修改配置后重启即可。新增实例不会升级共享代码。
 
-### 新安装：一个服务管理全部实例
+### 实例配置与重启
 
 ```bash
-MESH_ALL_INSTANCES=1 bash scripts/install.sh agent
-MESH_ALL_INSTANCES=1 bash scripts/install.sh agent second
+.venv/bin/python -m src.main --mode agent --config config/agents.json
 ```
 
-从 GitHub 首次安装也可在管道右侧使用 `MESH_ALL_INSTANCES=1 bash -s -- agent`。统一服务名为 `opencode-mesh-agent.service`，入口使用 `--all-instances`，逐实例创建独立子进程。单个子进程异常退出按自身退避重启；启动时配置表校验失败则整个服务无法启动。
+上面是统一服务的前台运行入口，仅用于手动运行；已由 systemd 托管时不要再启动第二份。它逐实例创建独立子进程，单个子进程异常退出按自身退避重启；启动时配置表校验失败则整个服务无法启动。
+
+[配置示例](../config/agents.example.json) 同时展示两种写法：`default` 继承顶层 `gateway_url` / `enroll_token`，`second` 在实例内填写自己的地址和密钥，覆盖公共值。其他实例仍使用顶层默认值；`opencode_url` 等字段同样允许按实例覆盖。
 
 日常新增实例可直接编辑 `config/agents.json`，然后重启：
 
@@ -97,17 +110,17 @@ MESH_ALL_INSTANCES=1 bash scripts/install.sh agent second
 systemctl --user restart opencode-mesh-agent.service
 ```
 
-**没有热加载**，重启会重建全部实例。独立服务模式则仅重启修改的实例。`MESH_INSTALL_ONLY=1` 只写配置和 unit，不启用、不启动；目标服务已运行时会拒绝用此模式添加配置。
+**没有热加载**，重启会重建全部实例。`MESH_INSTALL_ONLY=1` 只写配置和 unit，不启用、不启动；目标服务已运行时会拒绝用此模式添加配置。
 
 ### 从旧服务迁移
 
-统一服务与旧独立服务不能同时管理同一身份。**不要用卸载脚本迁移**，它会注销设备并删除配置项。
+当前版本移除了公开的 `--instance`、`--all-instances` 和 `MESH_ALL_INSTANCES` 选项。已有 unit 若带旧参数，必须在升级时修改；`upgrade.sh` 不会重写 unit。统一服务与旧独立服务不能同时管理同一身份。**不要用卸载脚本迁移**，它会注销设备并删除配置项。
 
-1. 先升级代码，确保入口支持 `--all-instances`。备份配置、整个 `data/`、默认与所有具名 Agent unit，记录 enabled/active 状态。
-2. 若仍使用 `agent.json`，将其有效配置放入 `agents.json` 的 `agents.default`，不带 `state_file`；确认原身份文件与新派生路径一致，不生成新身份。
-3. 停止全部旧 Agent。disable 旧 `@` 单元，将其文件移出 systemd 加载目录至备份位置；仅 disable 不移走仍会触发共存检查。
-4. 保持工作目录、实例名与身份路径，把默认 unit 的入口改为 `--mode agent --config <绝对路径>/config/agents.json --all-instances`；执行 `daemon-reload`，启用并启动默认 unit。
-5. 核对服务状态、子实例集合、设备身份和 Gateway 在线状态。回滚时先停止统一服务，再恢复配置与全部旧 unit，reload 后恢复各自原先的 enabled/active 状态。
+1. 备份配置、整个 `data/`、默认与所有具名 Agent unit，记录旧运行提交和 enabled/active 状态。
+2. **先停止全部旧 Agent，再运行 `upgrade.sh` 升级代码**；脚本会保持原本停止的服务停止，避免用旧参数启动新入口失败并触发回滚。Gateway 若与 Agent 共目录，升级仍按其原运行状态处理。
+3. 若仍使用 `agent.json`，将有效配置放入 `agents.json` 的 `agents.default`，不带 `state_file`；确认原身份文件与新派生路径一致。已使用顶层默认值/实例覆盖的 `agents.json` 不需要改写。
+4. disable 旧 `@` 单元，将其文件移出 systemd 加载目录至备份处。保持工作目录、实例名与身份路径，将默认 unit 的入口设为 `--mode agent --config <绝对路径>/config/agents.json`，删除旧的 `--all-instances` 或 `--instance NAME` 参数；执行 `daemon-reload`，按原 enabled/active 状态恢复统一服务。
+5. 核对服务状态、子实例集合、设备身份和 Gateway 在线状态。回滚时先停止统一服务，恢复旧代码版本、配置与全部旧 unit，reload 后恢复各自原先的 enabled/active 状态。
 
 用户级 unit 通常位于 `~/.config/systemd/user`，系统级位于 `/etc/systemd/system`。Mesh Agent 与 OpenCode 后台是独立服务，迁移不需要改动 OpenCode 的端口或进程。
 
@@ -134,7 +147,7 @@ bash scripts/upgrade.sh local /home/user/.local/share/opencode-mesh agent user H
 
 安装目录本身若是 Git 工作区，必须 clean 且 HEAD 等于部署 ref。升级会按 scope 与实际目录收集相关服务，只恢复升级前正在运行的服务；失败时尝试回滚源码、依赖和运行状态。依赖环境并非完整快照。成功后 `.mesh-revision` 记录部署 commit；失败恢复资料按脚本提示保留。
 
-升级后同时检查服务 active、设备列表在线健康及业务请求。仅 `active` 不代表 Agent 已连接 Gateway。涉及协议演进时先升级 Agent，再升级 Gateway；已打开的网页需刷新以加载新适配器。
+升级后同时检查服务 active、设备列表在线健康及业务请求。仅 `active` 不代表 Agent 已连接 Gateway。旧服务首次升级到无模式开关版本时，必须先完成上文迁移步骤；之后可照常升级。涉及协议演进时先升级 Agent，再升级 Gateway；已打开的网页需刷新以加载新适配器。
 
 ## 卸载
 

@@ -108,34 +108,41 @@ def test_per_instance_gateway_override_preserves_shared_config(tmp_path):
     assert json.dumps(cfg) == original
 
 
-def test_cli_recognises_all_instances_on_its_own(tmp_path):
-    """--all-instances is a real flag, not a typo: asking for every instance is parseable on its own."""
+def test_cli_defaults_to_supervising_all_instances(tmp_path, monkeypatch):
+    """The public Agent command launches the supervisor rather than selecting default."""
+    from src.main import main
+    path = write_shared_config(tmp_path, {"agents": {"default": {}, "beta": {}}})
+    captured = []
+
+    async def capture(config_path, instances):
+        captured.append((config_path, instances))
+
+    monkeypatch.setattr("src.main._supervise_until_stopped", capture)
+    monkeypatch.setattr(sys, "argv", ["src.main", "--mode", "agent", "--config", str(path)])
+    main()
+    assert captured == [(str(path), ["default", "beta"])]
+
+
+def test_worker_selection_is_not_a_public_cli_option():
     from src.main import build_parser
-    args = build_parser().parse_args(
-        ["--mode", "agent", "--config", str(tmp_path / "agents.json"), "--all-instances"])
-    assert args.all_instances is True
-    assert args.instance is None
+    help_text = build_parser().format_help()
+    assert "--agent-instance" not in help_text
+    assert "--all-instances" not in help_text
+    assert "--instance" not in help_text
 
 
-def test_cli_rejects_all_instances_next_to_a_named_instance(tmp_path):
-    """Every instance and one named instance contradict each other, so the combination is refused."""
+@pytest.mark.parametrize("obsolete", [["--instance", "default"], ["--all-instances"]])
+def test_cli_rejects_removed_service_options(tmp_path, obsolete):
+    """Old service units need explicit migration, not a silently changed meaning."""
     from src.main import build_parser
     with pytest.raises(SystemExit) as excinfo:
         build_parser().parse_args(
             ["--mode", "agent", "--config", str(tmp_path / "agents.json"),
-             "--instance", "default", "--all-instances"])
+             *obsolete])
     assert excinfo.value.code == 2
 
 
-def test_cli_accepts_all_instances_in_gateway_mode(tmp_path):
-    """Gateway mode parses the flag too, so its refusal below is a decision and not an unknown option."""
-    from src.main import build_parser
-    args = build_parser().parse_args(
-        ["--mode", "gateway", "--config", str(tmp_path / "gateway.json"), "--all-instances"])
-    assert args.all_instances is True
-
-
-def test_all_instances_is_rejected_in_gateway_mode(tmp_path, monkeypatch):
+def test_internal_worker_is_rejected_in_gateway_mode(tmp_path, monkeypatch):
     """The Gateway serves devices and never supervises Agents, so the flag is refused there."""
     from src.main import main
     path = write_shared_config(tmp_path, {
@@ -143,11 +150,11 @@ def test_all_instances_is_rejected_in_gateway_mode(tmp_path, monkeypatch):
         "agents": {"default": {"opencode_url": "http://127.0.0.1:4096"}}})
 
     def refuse(*args, **kwargs):
-        raise AssertionError("the Gateway server must not start for --all-instances")
+        raise AssertionError("the Gateway must not accept an Agent worker selector")
 
     monkeypatch.setattr("src.main.uvicorn.run", refuse)
     monkeypatch.setattr(sys, "argv", ["src.main", "--mode", "gateway",
-                                       "--config", str(path), "--all-instances"])
+                                       "--config", str(path), "--agent-instance", "default"])
     with pytest.raises(SystemExit) as excinfo:
         main()
     assert excinfo.value.code == 2

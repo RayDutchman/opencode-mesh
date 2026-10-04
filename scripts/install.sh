@@ -133,10 +133,8 @@ if [ "$MODE" != "agent" ] && [ "$MODE" != "gateway" ]; then
 fi
 
 SERVICE_NAME="opencode-mesh-${MODE}"
-SUPERVISE_ALL="${MESH_ALL_INSTANCES:-0}"
-[[ "$SUPERVISE_ALL" == 0 || "$SUPERVISE_ALL" == 1 ]] || { err "MESH_ALL_INSTANCES must be 0 or 1"; exit 2; }
-if [[ "$SUPERVISE_ALL" == 1 && "$MODE" != agent ]]; then
-  err "MESH_ALL_INSTANCES=1 supervises agents; it does not apply to the gateway mode"; exit 2
+if [[ -n "${MESH_ALL_INSTANCES+x}" ]]; then
+  err "MESH_ALL_INSTANCES was removed; agent installations always use one shared service"; exit 2
 fi
 if [ "$(id -u)" -eq 0 ]; then SC_CMD="systemctl"; else SC_CMD="systemctl --user"; fi
 
@@ -153,17 +151,20 @@ PY
   [[ -n "$wd" && "$(realpath "$wd")" == "$(realpath "$INSTALL_DIR")" ]]
 }
 
-# True only when ExecStart really passes the shared-supervisor flag as its own argument.
-# The whole file is never scanned: a mention in a comment or an unrelated option value
-# must not turn a legacy per-instance unit into a "shared" one.
+# Only reuse the current unified entry point; older units require explicit migration.
 unit_supervises_all_instances() {
   python3 - "$1" <<'PY'
-import shlex, sys
+import pathlib, shlex, sys
 for line in open(sys.argv[1]):
     if not line.startswith("ExecStart="):
         continue
     value = line.split("=", 1)[1].strip()
-    if "--all-instances" in shlex.split(value)[1:]:
+    args = shlex.split(value)[1:]
+    if any(arg.split("=", 1)[0] in {"--instance", "--agent-instance", "--all-instances"} for arg in args):
+        continue
+    mode = args[args.index("--mode") + 1:][:1] if "--mode" in args else []
+    config = args[args.index("--config") + 1:][:1] if "--config" in args else []
+    if mode == ["agent"] and config and pathlib.Path(config[0]).name == "agents.json":
         sys.exit(0)
 sys.exit(1)
 PY
@@ -176,23 +177,17 @@ if [[ $# == 2 && ( -z "$INSTANCE" || "$INSTANCE" == default ) ]]; then
 fi
 [[ "$INSTANCE" =~ ^[A-Za-z0-9_-]+$ ]] || { err "invalid instance name"; exit 2; }
 [[ "$MODE" == agent || "$INSTANCE" == default ]] || { err "instances require agent mode"; exit 2; }
-if [[ "$INSTANCE" != default && "$SUPERVISE_ALL" != 1 ]]; then
-  SERVICE_NAME="opencode-mesh-agent@${INSTANCE}"
-fi
-if [[ "$MODE" == agent && "$SUPERVISE_ALL" == 1 ]]; then
+if [[ "$MODE" == agent ]]; then
   # One unit supervises the whole mapping, so a leftover per-instance unit would manage it twice.
   for unit in "$UNIT_DIR"/opencode-mesh-agent@*.service; do
     [[ -f "$unit" && "$unit" != *'@.service' ]] || continue
-    err "legacy per-instance service $(basename "$unit") exists; migrate it manually as described in README.md (keep its config and identity), do not uninstall it"; exit 1
+    err "legacy per-instance service $(basename "$unit") exists; migrate it as described in docs/deployment.md (keep its config and identity), do not uninstall it"; exit 1
   done
   if [ -f "$UNIT_DIR/opencode-mesh-agent.service" ]; then
     unit_supervises_all_instances "$UNIT_DIR/opencode-mesh-agent.service" \
-      || { err "opencode-mesh-agent.service still supervises a single instance; migrate it manually as described in README.md (keep its config and identity)"; exit 1; }
+      || { err "legacy Agent service entry; migrate it as described in docs/deployment.md (keep its config and identity)"; exit 1; }
     unit_belongs_here "$UNIT_DIR/opencode-mesh-agent.service" || { err "the existing opencode-mesh-agent.service belongs to another directory; remove it before installing here"; exit 1; }
   fi
-elif [[ "$MODE" == agent && -f "$UNIT_DIR/opencode-mesh-agent.service" ]] &&
-   unit_supervises_all_instances "$UNIT_DIR/opencode-mesh-agent.service"; then
-  err "the shared agent service already supervises every instance; add it with MESH_ALL_INSTANCES=1"; exit 1
 elif [[ -e "$UNIT_DIR/${SERVICE_NAME}.service" ]]; then
   err "service already installed; edit configuration or use upgrade.sh"; exit 1
 fi
@@ -260,6 +255,10 @@ chmod 600 "$INSTALL_DIR"/data/*.json 2>/dev/null || true
 
 info "configuring ${MODE} ..."
 if [ "$MODE" = "agent" ]; then
+  # Existing shared code is reused, so reject an old CLI before writing new configuration.
+  (cd "$INSTALL_DIR" && "$INSTALL_DIR/.venv/bin/python" -c \
+    'from src.main import build_parser; build_parser().parse_args(["--mode", "agent", "--config", "config/agents.json", "--agent-instance", "default"])') \
+    || { err "installed code predates the unified Agent entry; upgrade it before adding instances"; exit 1; }
   GATEWAY_URL="$(ask "Gateway public URL (required)" "${MESH_GATEWAY_URL:-}")"
   require_value "Gateway URL" "$GATEWAY_URL"
   ALLOW_INSECURE=""
@@ -315,11 +314,7 @@ with os.fdopen(fd, "w", encoding="utf-8") as f:
     f.write("\n")
 os.replace(temporary, path)
 PY
-  if [[ "$SUPERVISE_ALL" == 1 ]]; then
-    EXEC="\"$INSTALL_DIR/.venv/bin/python\" -m src.main --mode agent --config \"$CONFIG_FILE\" --all-instances"
-  else
-    EXEC="\"$INSTALL_DIR/.venv/bin/python\" -m src.main --mode agent --config \"$CONFIG_FILE\" --instance $INSTANCE"
-  fi
+  EXEC="\"$INSTALL_DIR/.venv/bin/python\" -m src.main --mode agent --config \"$CONFIG_FILE\""
 else
   LISTEN_PORT="$(ask "Listen port" "${MESH_LISTEN_PORT:-18080}")"
   case "$LISTEN_PORT" in
@@ -416,7 +411,7 @@ fi
 INSTALLED_VERSION="$(cd "$INSTALL_DIR" && "$INSTALL_DIR/.venv/bin/python" -c 'import src; print(src.__version__)')"
 info "install complete (OpenCode Mesh v${INSTALLED_VERSION})."
 
-if [ "$MODE" = agent ] && [[ "$SUPERVISE_ALL" == 1 ]]; then
+if [ "$MODE" = agent ]; then
   info "${SERVICE_NAME}.service supervises every instance configured in ${CONFIG_FILE}"
   info "after editing ${CONFIG_FILE}, reload it with: $SC_CMD restart ${SERVICE_NAME}.service"
 fi

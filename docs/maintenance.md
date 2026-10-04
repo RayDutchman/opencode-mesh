@@ -4,6 +4,14 @@
 
 ## 1. 先确认事实来源
 
+### 统一 Agent 服务成为唯一安装方式（2026-10-05）
+
+- 用户确认取消独立实例 service 安装选项，`--mode agent --config config/agents.json` 默认托管全部实例；移除公开的 `--instance`、`--all-instances` 和安装开关 `MESH_ALL_INSTANCES`。子进程选择只保留隐藏的内部 worker 参数，监督、退避与身份派生不变。旧单元的识别仅用于拒绝混装、升级发现及卸载清理。
+- 公共默认值与实例覆盖按用户澄清保留；`agents.example.json` 的 `default` 继承顶层值，`second` 明确覆盖 Gateway 地址与加入密钥。README 改为纯文本框线图并明确交互自选端口；部署手册提供完整 `export` 示例。
+- 旧 unit 带模式参数，升级时必须先停旧 Agent、升级代码，再修改 unit 和启动；单纯运行升级脚本不会重写 unit。迁移与回滚见 [deployment.md](deployment.md#从旧服务迁移)。以下旧记录中的 opt-in/独立服务说明仅代表当时版本。
+- 验证：全量 `python -m pytest -q -p no:cacheprovider -W error::DeprecationWarning -rs --tb=short` 为 **464 passed in 32.16s，无跳过**；覆盖默认监督入口、真实子进程回收、共享单元安装/卸载、旧参数拒绝与迁移守卫、Gateway 自选端口。脚本及 README/部署手册的 13 个 Shell 示例语法检查通过，44 个相对文档链接与配置 JSON 有效，`git diff --check` 通过；未在真实服务上迁移或做浏览器验收。
+- 本轮获准 commit/push，未获部署授权。运行代码与服务入口保持原状；本机主仓也是运行目录，因此仅推送远端 `main`，不把本次运行代码直接同步到本机主仓。
+
 ### 面向使用者的文档整理与 APK 退役（2026-10-05）
 
 - README 改为项目用途、基本架构、最小安装与访问流程；配置、多实例、升级、回滚和卸载移至 [deployment.md](deployment.md)。安装器参数按当前脚本核对，HTTPS 示例依据 Caddy 官方反向代理文档。
@@ -182,7 +190,7 @@
 
 ## 2. 维护范围与模块地图
 
-同机多实例使用 `config/agents.json` 和 `--instance`；内部身份文件由程序派生，不手工填写。运维脚本仅有 `install.sh`、`uninstall.sh`、`upgrade.sh`。旧配置仍可运行，调整为统一配置时核对有效配置和身份，区分 daemon-reload 与真正重启；仅安装实例必须 disabled/inactive 且尚无注册副作用。生命周期回归见 `test_agent_instances.py`、`test_instance_install.py`、`test_instance_release.py`，认证边界见 `test_auth_boundaries.py`；统一 unit 的进程监督回归见 `test_agent_supervisor.py`（真实短命子进程，不用生产专用环境变量或接口）。代码是否已发布以 Git 和部署 revision 为准。
+同机多实例使用 `config/agents.json` 和一个统一 Agent 服务；内部身份文件由程序派生，不手工填写。运维脚本仅有 `install.sh`、`uninstall.sh`、`upgrade.sh`。旧配置与旧服务入口按部署手册迁移，核对有效配置和身份，区分 daemon-reload 与真正重启；仅安装服务必须 disabled/inactive 且尚无注册副作用。生命周期回归见 `test_agent_instances.py`、`test_instance_install.py`、`test_instance_release.py`，认证边界见 `test_auth_boundaries.py`；统一 unit 的进程监督回归见 `test_agent_supervisor.py`（真实短命子进程，不用生产专用环境变量或接口）。代码是否已发布以 Git 和部署 revision 为准。
 
 当前维护 OpenCode V2；最近发布验收使用上游 **2.0.6**。这不是对所有未来 V2 版本的兼容承诺。产品版本从源码读取，不在交接入口重复维护。
 

@@ -15,27 +15,28 @@
 - **出门继续工作**：从手机访问留在家中或办公室的 OpenCode。
 - **多机统一入口**：在同一个网页中选择设备，使用它自己的项目、会话和终端。
 - **减少中继流量**：网络允许时，当前设备的业务数据通过 WebRTC 直达 Agent；无法直连时使用 Gateway 中继。
-- **同机多实例**：一台机器上的多套 OpenCode 可以分别接入，也可用一个服务统一管理 Agent 实例。
+- **同机多实例**：一台机器上的多套 OpenCode 可以分别接入，由一个服务统一管理全部 Agent 实例。
 
 Mesh 提供访问和传输能力；OpenCode 仍负责运行任务、管理项目与会话。它不会把不同机器的文件或会话同步到一起。
 
 ## 基本架构
 
-```mermaid
-flowchart LR
-    B[手机 / 电脑浏览器]
-    G[公网 Gateway]
-    A[设备 A · Mesh Agent]
-    C[设备 B · Mesh Agent]
-    O1[OpenCode V2]
-    O2[OpenCode V2]
-    B <-->|HTTPS：页面、认证、信令及 Relay| G
-    A <-->|Agent 主动建立 WSS 连接| G
-    C <-->|Agent 主动建立 WSS 连接| G
-    B <-.->|WebRTC：当前设备业务直连| A
-    A <--> O1
-    C <--> O2
+```text
++---------+    HTTPS/WSS    +---------+
+| Browser | <------------> | Gateway |
++----+----+                +----+----+
+     |                         |
+     | WebRTC (P2P)            | WSS (Relay)
+     |                         |
+     +----------+--------------+
+                |
+                v
+       +-------------------+
+       | Agent -> OpenCode |
+       +-------------------+
 ```
+
+每台设备各有 Agent → OpenCode 这一组；Agent 主动向 Gateway 建立 WSS 连接。页面、认证和信令经 Gateway，业务数据优先直连，无法直连则中继。
 
 | 组件 | 放在哪里 | 做什么 |
 |---|---|---|
@@ -61,9 +62,9 @@ flowchart LR
 curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scripts/install.sh | bash -s -- gateway
 ```
 
-按提示设置浏览器登录用户名、密码；监听端口保持默认 `18080`。`enroll_token` 留空会自动生成，**保存它，供设备加入时使用**。
+安装脚本是**交互式的**：按提示填写浏览器登录用户名、密码和监听端口。端口可自行输入，也可直接回车使用默认 `18080`。`enroll_token` 留空会自动生成，**保存它，供设备加入时使用**。
 
-Gateway 默认监听 `127.0.0.1:18080`，接着配置 HTTPS 入口。若已安装并运行 [Caddy](https://caddyserver.com/docs/install)，将以下站点块加入它的 Caddyfile，把域名换成自己的：
+Gateway 监听本机 `127.0.0.1` 的所选端口，接着配置 HTTPS 入口。若已安装并运行 [Caddy](https://caddyserver.com/docs/install)，将以下站点块加入它的 Caddyfile，把域名换成自己的；**若安装时选了其他端口，下面的 `18080` 也要对应修改**：
 
 ```caddyfile
 mesh.example.com {

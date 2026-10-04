@@ -169,13 +169,13 @@ def test_supervisor_refuses_a_shared_identity_path(tmp_path):
         supervise_agent_instances(path)
 
 
-def test_child_command_targets_the_documented_agent_cli(tmp_path):
+def test_child_command_targets_the_internal_worker_cli(tmp_path):
     """Each child is the ordinary single-instance Agent, so it keeps its own identity and retries."""
     from src.main import agent_command
     config = tmp_path / "config" / "agents.json"
     assert agent_command(config, "beta") == [
         sys.executable, "-m", "src.main", "--mode", "agent",
-        "--config", str(config.resolve()), "--instance", "beta"]
+        "--config", str(config.resolve()), "--agent-instance", "beta"]
 
 
 def test_supervisor_starts_every_instance(tmp_path, monkeypatch):
@@ -468,7 +468,7 @@ def descendant_pids(config_path):
             cmdline = (entry / "cmdline").read_bytes()
         except OSError:
             continue
-        if needle in cmdline and b"--instance" in cmdline:
+        if needle in cmdline and b"--agent-instance" in cmdline:
             found.append(int(entry.name))
     return found
 
@@ -476,7 +476,7 @@ def descendant_pids(config_path):
 def start_real_supervisor(config_path):
     return subprocess.Popen(
         [sys.executable, "-m", "src.main", "--mode", "agent",
-         "--config", str(config_path), "--all-instances"],
+         "--config", str(config_path)],
         cwd=str(REPO), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         start_new_session=True)
 

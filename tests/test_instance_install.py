@@ -3,7 +3,7 @@
 Contract (docs/superpowers/specs/2026-09-23-multi-agent-design.md, confirmed with the user):
 - All agents share the manual config/agents.json: top-level common fields + per-instance agents mapping.
 - Config does not write state_file; identity is derived by the program from the install root and instance name (default agent-state.json, named agent-state-<name>.json).
-- Default service opencode-mesh-agent.service (--instance default), named opencode-mesh-agent@<name>.service.
+- Every new instance uses opencode-mesh-agent.service; legacy units are only recognized for cleanup.
 - Install only merges the given instance keys, keeping other instances and unknown top-level fields; existing shared code is not overwritten; MESH_INSTALL_ONLY=1 does not enable/start.
 - Legacy single-agent configs (agent.json / agent.local.json / agent-*.json) are explicitly rejected, never silently overwritten.
 - Single-instance uninstall removes only that instance's config keys and standalone unit, keeping shared directories, other instances and auto identity state.
@@ -327,9 +327,11 @@ def test_install_named_keeps_shared_code_and_merges_config(tmp_path):
     # config must not write the identity path
     assert "state_file" not in agents and "state_file" not in agents["agents"]["beta"]
 
-    unit = unit_dir(tmp_path) / "opencode-mesh-agent@beta.service"
+    unit = unit_dir(tmp_path) / "opencode-mesh-agent.service"
     assert unit.exists()
-    assert "--config" in unit.read_text() and "--instance beta" in unit.read_text()
+    assert "--config" in unit.read_text() and "--instance" not in unit.read_text()
+    assert "--all-instances" not in unit.read_text()
+    assert not (unit_dir(tmp_path) / "opencode-mesh-agent@beta.service").exists()
 
     # shared code must not be overwritten
     assert (inst / "src" / "SENTINEL").read_text() == "keep-me\n"
@@ -403,6 +405,18 @@ def test_install_rejects_bad_instance_names(tmp_path, args):
     result = run_script("install.sh", args, env)
     assert result.returncode != 0
     assert not (inst / "config" / "agents.json").exists()
+
+
+def test_gateway_install_uses_the_selected_port(tmp_path):
+    fakebin, logs = make_fakebin(tmp_path)
+    source = make_source(tmp_path)
+    inst = tmp_path / "gateway"
+    env = base_env(tmp_path, fakebin, logs, MESH_SOURCE_DIR=str(source),
+                   MESH_INSTALL_DIR=str(inst), MESH_INSTALL_ONLY="1",
+                   MESH_LISTEN_PORT="18443", MESH_USERNAME="test", MESH_PASSWORD="test-password")
+    result = run_script("install.sh", ["gateway"], env)
+    assert result.returncode == 0, result.stderr
+    assert read_json(inst / "config/gateway.json")["listen_port"] == 18443
 
 
 def test_install_gateway_rejects_instance(tmp_path):
@@ -644,7 +658,7 @@ def seed_supervisor_unit(tmp_path, install_dir):
     (d / "opencode-mesh-agent.service").write_text(
         f"[Unit]\n[Service]\nWorkingDirectory={install_dir}\n"
         f"ExecStart={install_dir}/.venv/bin/python -m src.main --mode agent "
-        f"--config {install_dir}/config/agents.json --all-instances\n"
+        f"--config {install_dir}/config/agents.json\n"
     )
 
 
@@ -689,12 +703,11 @@ def make_supervisor_install_state(tmp_path):
 def supervisor_install_env(tmp_path, fakebin, logs, source, inst, **extra):
     return base_env(tmp_path, fakebin, logs, **agent_env(
         MESH_SOURCE_DIR=str(source), MESH_INSTALL_DIR=str(inst),
-        MESH_INSTALL_ONLY="1", FAKE_REAL_INSTALL_OWNER="1",
-        MESH_ALL_INSTANCES="1", **extra))
+        MESH_INSTALL_ONLY="1", FAKE_REAL_INSTALL_OWNER="1", **extra))
 
 
 def test_unified_install_puts_every_instance_under_the_shared_unit(tmp_path):
-    """Opting in replaces one unit per instance with a single supervisor unit for the whole mapping."""
+    """Every installation uses one supervisor unit for the whole mapping without an opt-in."""
     fakebin, logs, inst, source = make_supervisor_install_state(tmp_path)
 
     result = run_script("install.sh", ["agent", "win"],
@@ -702,7 +715,8 @@ def test_unified_install_puts_every_instance_under_the_shared_unit(tmp_path):
 
     assert result.returncode == 0, result.stderr
     exec_start = unit_exec_start(tmp_path, "opencode-mesh-agent")
-    assert "--all-instances" in exec_start
+    assert "--mode agent" in exec_start
+    assert "--all-instances" not in exec_start
     assert "--instance" not in exec_start
     assert not (unit_dir(tmp_path) / "opencode-mesh-agent@win.service").exists()
     assert set(read_json(inst / "config" / "agents.json")["agents"]) == {"default", "win"}
@@ -791,7 +805,8 @@ def test_unified_install_of_the_default_instance_omits_the_name(tmp_path):
     accepted = run_script("install.sh", ["agent"], env)
     assert accepted.returncode == 0, accepted.stderr
     assert set(read_json(inst / "config" / "agents.json")["agents"]) == {"default"}
-    assert "--all-instances" in unit_exec_start(tmp_path, "opencode-mesh-agent")
+    assert "--all-instances" not in unit_exec_start(tmp_path, "opencode-mesh-agent")
+    assert "--mode agent" in unit_exec_start(tmp_path, "opencode-mesh-agent")
 
 
 def test_unified_install_is_refused_while_a_legacy_instance_unit_exists(tmp_path):
@@ -806,8 +821,26 @@ def test_unified_install_is_refused_while_a_legacy_instance_unit_exists(tmp_path
     assert "legacy" in result.stderr.lower()
 
 
-def test_legacy_install_is_refused_while_the_shared_unit_exists(tmp_path):
-    """Adding a per-instance unit next to the shared one would supervise the mapping twice."""
+@pytest.mark.parametrize("old_selector", ["--instance default", "--all-instances"])
+def test_install_requires_migration_of_an_old_default_unit(tmp_path, old_selector):
+    fakebin, logs, inst, source = make_supervisor_install_state(tmp_path)
+    seed_supervisor_unit(tmp_path, inst)
+    unit = unit_dir(tmp_path) / "opencode-mesh-agent.service"
+    unit.write_text(unit.read_text().rstrip() + " " + old_selector + "\n")
+    before_unit = unit.read_bytes()
+    config = inst / "config/agents.json"
+    before_config = config.read_bytes()
+    result = run_script("install.sh", ["agent", "win"],
+                         supervisor_install_env(tmp_path, fakebin, logs, source, inst))
+    assert result.returncode != 0
+    assert "migrate" in result.stderr
+    assert unit.read_bytes() == before_unit
+    assert config.read_bytes() == before_config
+    assert not lifecycle_events(logs)
+
+
+def test_plain_install_reuses_the_shared_unit(tmp_path):
+    """No environment switch is needed to add an instance to the existing service."""
     fakebin, logs, inst, source = make_supervisor_install_state(tmp_path)
     seed_supervisor_unit(tmp_path, inst)
 
@@ -816,38 +849,37 @@ def test_legacy_install_is_refused_while_the_shared_unit_exists(tmp_path):
             MESH_SOURCE_DIR=str(source), MESH_INSTALL_DIR=str(inst),
             MESH_INSTALL_ONLY="1", FAKE_REAL_INSTALL_OWNER="1")))
 
-    assert result.returncode != 0
-    assert "shared" in result.stderr.lower() or "all-instances" in result.stderr.lower()
+    assert result.returncode == 0, result.stderr
+    assert set(read_json(inst / "config/agents.json")["agents"]) == {"default", "win"}
+    assert not (unit_dir(tmp_path) / "opencode-mesh-agent@win.service").exists()
 
 
-def test_unified_install_is_refused_for_the_gateway_mode(tmp_path):
-    """The Gateway serves devices; it never supervises Agents, so the opt-in does not apply to it."""
+@pytest.mark.parametrize("mode", ["agent", "gateway"])
+@pytest.mark.parametrize("value", ["0", "1"])
+def test_removed_service_mode_switch_is_rejected(tmp_path, mode, value):
+    """An obsolete mode switch must not silently select a different service layout."""
     fakebin, logs = make_fakebin(tmp_path)
     source = make_source(tmp_path)
     inst = tmp_path / "gw"
 
-    result = run_script("install.sh", ["gateway"], base_env(
+    result = run_script("install.sh", [mode], base_env(
         tmp_path, fakebin, logs, MESH_SOURCE_DIR=str(source), MESH_INSTALL_DIR=str(inst),
-        MESH_INSTALL_ONLY="1", FAKE_REAL_INSTALL_OWNER="1", MESH_ALL_INSTANCES="1",
+        MESH_INSTALL_ONLY="1", FAKE_REAL_INSTALL_OWNER="1", MESH_ALL_INSTANCES=value,
         MESH_LISTEN_PORT="18080", MESH_USERNAME="admin", MESH_PASSWORD="pw"))
 
     assert result.returncode != 0
-    assert "agent" in result.stderr.lower()
+    assert "removed" in result.stderr.lower()
 
 
-@pytest.mark.parametrize("unified", [False, True])
-def test_install_pins_an_instance_gateway_that_differs_from_the_shared_one(tmp_path, unified):
-    """Both install modes may give an instance its own Gateway; the others keep the shared value."""
+def test_install_pins_an_instance_gateway_that_differs_from_the_shared_one(tmp_path):
+    """Instance overrides never change the shared defaults used by the other instances."""
     fakebin, logs, inst, source = make_supervisor_install_state(tmp_path)
     config = read_json(inst / "config" / "agents.json")
     config["agents"]["alpha"] = {"opencode_url": "http://127.0.0.1:4097"}
     (inst / "config" / "agents.json").write_text(json.dumps(config))
     env = supervisor_install_env(tmp_path, fakebin, logs, source, inst,
-                                MESH_GATEWAY_URL="https://other.example.com") if unified else base_env(
-        tmp_path, fakebin, logs, **agent_env(
-            MESH_SOURCE_DIR=str(source), MESH_INSTALL_DIR=str(inst),
-            MESH_INSTALL_ONLY="1", FAKE_REAL_INSTALL_OWNER="1",
-            MESH_GATEWAY_URL="https://other.example.com"))
+                                 MESH_GATEWAY_URL="https://other.example.com",
+                                 MESH_ENROLL_TOKEN="other-token")
 
     result = run_script("install.sh", ["agent", "win"], env)
 
@@ -856,6 +888,8 @@ def test_install_pins_an_instance_gateway_that_differs_from_the_shared_one(tmp_p
     assert merged["gateway_url"] == "https://mesh.example.com"
     assert merged["agents"]["win"]["gateway_url"] == "https://other.example.com"
     assert "gateway_url" not in merged["agents"]["alpha"]
+    assert merged["agents"]["win"]["enroll_token"] == "other-token"
+    assert merged["enroll_token"] == "enroll-token"
 
 
 def test_uninstall_stops_the_shared_unit_before_deregistering_the_default_instance(tmp_path):
