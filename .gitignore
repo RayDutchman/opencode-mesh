@@ -30,8 +30,6 @@ dist/
 .mesh-revision
 .mesh-backups/
 
-# Android build artifacts and private signing identities
-*.apk
-*.apk.idsig
+# Private signing identities
 *.jks
 *.keystore

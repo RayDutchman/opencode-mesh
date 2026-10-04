@@ -1,14 +1,14 @@
 # OpenCode Mesh 原理与架构
 
-本文描述 **OpenCode Mesh 0.2.1** 的架构，当前以 **OpenCode V2.0.6** 为验证版本；部署与验收状态见[稳定性实施记录](./superpowers/plans/2026-09-23-v2-stabilization.md)。V1 稳定基线见根目录 README；当前开发线不再维护 V1 前端兼容。
+本文描述 OpenCode Mesh 当前的组件和传输边界，维护目标为 **OpenCode V2**。具体部署版本、已知限制及验收证据见 [maintenance.md](maintenance.md)；不再维护 V1 前端兼容。
 
 本文是架构总览，不替代具体协议和部署手册：
 
 - 当前维护范围、已知限制与交接方法见 [maintenance.md](maintenance.md)。本文及协议描述当前行为，历史 plans/specs 仅作有日期和版本的证据。
 - 传输消息、分片信封和错误语义见 [`protocol.md`](./protocol.md)。
 - V2 设计边界见 [`V2 最小传输适配设计`](./superpowers/specs/2026-09-23-v2-minimal-transport-design.md)，实测结果与限制见 [`执行与验收记录`](./superpowers/plans/2026-09-23-v2-minimal-transport.md)。
-- [`opencode-web-capability-matrix.md`](./opencode-web-capability-matrix.md) 和路由目录保留历史资料，不代表当前 V2 的完整验收范围。
-- 安装、卸载和配置操作见根目录 [`README.md`](../README.md)。
+- 按传输类型组织的验收要求见 [protocol.md 的验收矩阵](protocol.md#验收矩阵)，上游接口以所连接版本的 `/openapi.json` 为准。
+- 首次安装见 [`README.md`](../README.md)，配置、升级、卸载及服务迁移见 [deployment.md](deployment.md)。
 
 ## 1. 项目目标
 
@@ -65,7 +65,7 @@ Gateway 由 FastAPI/uvicorn 托管；Agent 是 asyncio 常驻进程。Agent 不�
 
 同一 VPS 可以同时运行 Gateway 和一套 OpenCode，但两者仍是独立角色：另起一个 Agent，将 `opencode_url` 指向该 VPS 的本地 OpenCode，例如 `http://127.0.0.1:4096`（按实际监听端口配置），再注册到 Gateway。浏览器以该 Agent 的明确 `device_id` 访问，不将 Gateway 的 origin 当作此 OpenCode 的身份，也不为 VPS 增加特殊业务路由。
 
-同机 Agent 共用一份 `config/agents.json`，以 `agents` 映射和 `--instance` 选择上游。设备身份与 Agent token 由程序分别保存到内部 `data/agent-state.json` 或 `data/agent-state-<name>.json`，统一人工配置不填写 `state_file`。旧单实例配置仍兼容，可用迁移工具保身份转入统一配置。设备显示名用于辨认，不用于判断身份。Gateway 浏览器认证与本地 OpenCode 认证分别配置。
+同机 Agent 共用一份 `config/agents.json`，以 `agents` 映射和 `--instance` 选择上游。设备身份与 Agent token 由程序分别保存到内部 `data/agent-state.json` 或 `data/agent-state-<name>.json`，统一人工配置不填写 `state_file`。旧单实例配置仍兼容，转入统一配置时按[部署手册](deployment.md#从旧服务迁移)保留原身份。设备显示名用于辨认，不用于判断身份。Gateway 浏览器认证与本地 OpenCode 认证分别配置。
 
 具名实例默认使用独立 systemd 单元，共享源码和虚拟环境。新增实例不升级共享代码；发布脚本按同一 scope 和实际工作目录收集关联服务，升级及回滚恢复原先运行的集合。单实例卸载保留共享目录和身份；完整卸载须明确选择 `all`。
 
@@ -451,8 +451,8 @@ opencode-mesh/
 ├── docs/
 │   ├── architecture.md
 │   ├── protocol.md
-│   ├── opencode-web-capability-matrix.md
-│   └── opencode-web-route-catalog.json
+│   ├── deployment.md
+│   └── maintenance.md
 └── tests/
     ├── test_mesh_reliability.py
     ├── test_v2_transport.py
@@ -536,9 +536,9 @@ P2P 和分片基础设施：
 ### 10.5 文档与测试
 
 - `docs/architecture.md`：本文，解释系统原理和组件关系。
-- `docs/protocol.md`：控制消息和 P2P 分片协议规格。
-- `docs/opencode-web-capability-matrix.md`：历史 OpenCode Web 路径能力和验收矩阵。
-- `docs/opencode-web-route-catalog.json`：历史机器可读路由目录。
+- `docs/protocol.md`：控制消息、P2P 分片协议及传输验收矩阵。
+- `docs/deployment.md`：配置、多实例管理、升级、回滚和卸载。
+- `docs/maintenance.md`：维护入口、验证记录和已知限制。
 - `tests/test_mesh_reliability.py`：可靠性回归测试。
 - `tests/test_v2_transport.py`：V2 请求透明性和浏览器适配行为测试。
 - `tests/test_review_protocol_limits.py`：Agent 分片装配的活动容量、有限完成墓碑、TTL、预算释放和近期重放拒绝回归。

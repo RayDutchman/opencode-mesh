@@ -80,6 +80,57 @@ P2P 上所有浏览器请求、响应 body、流数据和 WebSocket 控制/数�
 
 所有 close、cancel、disconnect 和 timeout 路径必须幂等，不能留下 pending future、流队列、P2P peer、WebSocket bridge 或分片装配状态。已 answer 的 P2P peer 不因正常闲置被 watchdog 关闭；watchdog 只限制 answer 后尚未打开 DataChannel 的会话。
 
-## 验收
+## 验收矩阵
 
-当前验收方法和覆盖边界见 [maintenance.md](maintenance.md)，旧能力矩阵仅作历史参考。受影响的变更应验证 HTTP、SSE、WebSocket、PTY、取消、P2P、Relay、设备切换及对应故障恢复，不将计划中的验收项当作已经通过的证据。
+以下是验收要求，不是已经通过的声明；实际证据与未验证项见 [maintenance.md](maintenance.md)。上游路径、参数及事件格式以被测 OpenCode V2 的 `/openapi.json` 和实际客户端为准，不使用旧版本路由快照推断兼容范围。
+
+### 业务覆盖
+
+| 类别 | 传输 | 核对内容 |
+|---|---|---|
+| 页面、静态资源与文件 | HTTP / 原始字节 | 设备归属、资源完整性、MIME、下载与缓存响应 |
+| 项目、会话、模型和配置 | HTTP | 方法、参数、状态码、错误及结果归属 |
+| 权限、问题与任务状态 | HTTP + SSE | 操作后状态收敛，刷新后仍一致 |
+| 全局与会话事件 | SSE | 心跳、顺序、空闲、取消和业务重连 |
+| 终端 | HTTP + WebSocket | 创建、输入、输出、resize、重连和关闭 |
+| 工具、Agent、MCP 等上游能力 | 按上游接口 | 请求透明转发，原生 UI 的结果与错误完整 |
+
+### HTTP 字段与认证边界
+
+逐项比较 method、path、query、请求体字节、`x-opencode-directory`、`x-opencode-workspace`、`Content-Type`、`Accept`、`Range`、`If-None-Match`、状态码、MIME 与响应字节。还应检查 `Content-Length`、`Content-Encoding`、`WWW-Authenticate` 和 `Set-Cookie` 的实际处理，不能把它们一概当作需要原样透传的字段：
+
+- Gateway 的 `Authorization`、Cookie 和代理链路头不得进入设备；上游认证由该实例配置提供。验收只记录认证是否正确，不记录凭据值。
+- 重新分帧时剥离旧长度、编码和逐跳头，由 HTTP 库生成与实际字节一致的头；上游 `Set-Cookie` 按隔离策略过滤。
+- AbortSignal 应释放对应请求和传输资源。结果未知的已发 `POST`、`PUT`、`PATCH`、`DELETE` 不因切换路径盲目重放。
+
+### SSE
+
+| 场景 | 必须核对的语义 |
+|---|---|
+| 首帧 | HTTP 状态与响应头先于数据，已发连接事件不丢失 |
+| 心跳与空闲 | 保留原始心跳字节，代理不缓冲整个流；不能仅因空闲返回 502 |
+| 顺序与重放 | 保留事件顺序及上游提供的 ID；转发客户端实际携带的重放参数或头 |
+| 取消 | 关闭对应上游订阅，清理队列、任务和 pending 状态 |
+| 断线与 Gateway 重启 | 验证原生 SDK 的恢复和最终状态；不由 Mesh 另造 EventSource 重连规则，不重复提交写请求 |
+
+### WebSocket / PTY
+
+- 文本帧、二进制帧、历史输出、控制帧和实时输出保持内容与顺序，协商的 subprotocol、关闭码及原因保持一致。
+- 若被测版本使用 ticket、cursor 等机制，核对一次性 ticket 不被自动重放，游标参数和控制帧不被改写；具体格式以该版本为准。
+- 每个 bridge 串行发送；拥塞和队列溢出显式报错并清理，不静默丢帧。
+
+### 停止任务与最终状态
+
+**取消 HTTP 订阅不等于停止 OpenCode 任务。** 验证用户点击“停止”时，应沿原设备检查实际业务 interrupt/abort 请求，而不是仅观察 fetch 抛出 AbortError：
+
+```text
+浏览器发出停止操作 → Mesh 接收 → 原设备 Agent 转发
+→ OpenCode 停止任务 → 发布最终状态 → Mesh 转发事件
+→ 页面显示停止结果 → 刷新后状态仍一致
+```
+
+### 网络场景与诊断
+
+至少区分同机/局域网 P2P、跨网络 P2P、Gateway Relay 三种场景；前两者是同一 P2P 机制的不同网络环境，不是第三套协议。Relay 要覆盖 HTTP、SSE、WebSocket 和 PTY。页面、静态资源与信令仍可经过 Gateway，不能以业务 P2P 成功宣称所有流量直连。
+
+切换时记录设备归属、实际传输、失败原因、RTT、建链时间及是否重试。浏览器可通过 `window.__ocmTransport.pc?.getStats()` 核对选中的 candidate pair；证据须脱敏。发生中断时同时核对在途请求没有改投其他设备，未知结果的写请求没有被自动重发。
