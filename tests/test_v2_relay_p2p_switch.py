@@ -33,6 +33,8 @@ The facts we verify against the actual shared adapter are:
 
 import subprocess
 
+import pytest
+
 from test_v2_reconnect_network import ADAPTER_JS
 from test_v2_reconnect_network import FINISHER
 from test_v2_reconnect_network import HARNESS_WITH_CONN_JS
@@ -140,6 +142,49 @@ def run_switch(harness, preamble, body, timeout=20):
     script = harness + '\n' + HARNESS_EXTENSION_JS + '\n' + preamble + '\n' + ADAPTER_JS + '\n' + body
     result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=timeout)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_abort_during_send_backpressure_never_emits_cancelled_request(stream):
+    """Cancellation during drain must prevent a late send without poisoning the queue."""
+    preamble = "global.MANIFEST_BEHAVIOR = 'defer';"
+    body = FINISHER + r"""
+  const s = window.__ocmTransport;
+  const settle = async () => { for (let i = 0; i < 10; i++) await tick(); };
+  await settle();
+  global.MANIFEST_BEHAVIOR = 'ok';
+  fireOnline(); advance(300); await settle();
+  lastChannel().forceOpen(); await settle();
+  const channel = s.channel;
+  assert.equal(channel.readyState, 'open');
+  channel.bufferedAmount = 1 << 30;
+  const controller = new AbortController();
+  const path = '/api/session/ses_test/cancelled';
+  const outcome = window.fetch('https://mesh.test' + path, {
+    signal: controller.signal, headers: {accept: __ACCEPT__},
+  }).then(() => 'resolved', error => error.name);
+  await settle();
+  assert.equal(s.pending.size, 1);
+  assert.equal(requestOn(channel, path), null, 'request is parked before its first frame');
+  advance(100); await settle(); controller.abort(); await settle();
+  assert.equal(await outcome, 'AbortError');
+  assert.equal(s.pending.size, 0);
+  channel.bufferedAmount = 0;
+  advance(200); await settle();
+  assert.equal(requestOn(channel, path), null, 'cancelled request must never be sent after drain');
+  assert.equal(sentMessages(channel, 'cancel').length, 1, 'the cancellation notification still reaches the Agent');
+  assert.equal(channel.sent.length, 1, 'no request fragments leak alongside the cancellation frame');
+  assert.equal(channel.readyState, 'open', 'cancellation does not tear down the shared channel');
+  const nextPath = '/api/session/ses_test/next';
+  const next = window.fetch('https://mesh.test' + nextPath);
+  await settle();
+  const sent = requestOn(channel, nextPath);
+  assert.ok(sent, 'a subsequent request passes through the released queue');
+  deliver(channel, {type:'response', id:sent.id, status:200, headers:{}, body:encB.encode('ok')});
+  assert.equal(await (await next).text(), 'ok');
+  assert.equal(s.pending.size, 0);
+""".replace('__ACCEPT__', "'text/event-stream'" if stream else "'application/json'") + FINISHER_TAIL
+    run_switch(HARNESS_WITH_CONN_JS, preamble, body)
 
 
 def test_relay_pending_during_p2p_open_completes_on_original_channel():

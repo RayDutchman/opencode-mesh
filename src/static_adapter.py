@@ -1304,7 +1304,7 @@ TRANSPORT_ADAPTER = r"""
   }
   window.addEventListener('popstate', reconnectForDevice);
 
-  async function send(message, channel = state.channel) {
+  async function send(message, channel = state.channel, signal) {
     // Callers fix the channel before async reads; a device switch must not retarget the request.
     if (!channel || channel.readyState !== 'open') throw new Error('p2p channel unavailable');
     const messageId = ['ws_data', 'ws_close'].includes(message.type) ? makeId() : String(message.id || makeId());
@@ -1315,6 +1315,7 @@ TRANSPORT_ADAPTER = r"""
       const envelope = { message_id: messageId, sequence, data: b64(chunk), final: offset + CHUNK_SIZE >= payload.length };
       const deadline = Date.now() + SEND_TIMEOUT_MS;
       while (channel.bufferedAmount > 1024 * 1024) {
+        signal?.throwIfAborted();
         if (channel.readyState !== 'open') throw new Error('p2p channel unavailable');
         if (Date.now() >= deadline) {
           // Close a stalled channel to trigger reconnect and Relay fallback.
@@ -1323,6 +1324,8 @@ TRANSPORT_ADAPTER = r"""
         }
         await new Promise(resolve => setTimeout(resolve, 10));
       }
+      // Cancellation can arrive while drain is pending, including on the last wait.
+      signal?.throwIfAborted();
       channel.send(JSON.stringify(envelope));
     }
   }
@@ -1454,7 +1457,7 @@ TRANSPORT_ADAPTER = r"""
       try {
         const [meta] = await Promise.all([first, orderedP2PSend(async () => {
           request.signal.throwIfAborted();
-          await send({ type: 'stream_request', id, method: request.method, path, query, headers, body: b64(sizeProbe) }, channel);
+          await send({ type: 'stream_request', id, method: request.method, path, query, headers, body: b64(sizeProbe) }, channel, request.signal);
         })]);
         return new Response(stream, { status: meta.status, headers: meta.headers });
       }
@@ -1466,7 +1469,7 @@ TRANSPORT_ADAPTER = r"""
       state.pending.set(id, entry);
       orderedP2PSend(async () => {
         request.signal.throwIfAborted();
-        await send({ type: 'request', id, method: request.method, path, query, headers, body: b64(sizeProbe) }, channel);
+        await send({ type: 'request', id, method: request.method, path, query, headers, body: b64(sizeProbe) }, channel, request.signal);
       }).catch(error => rejectEntry(id, error));
       if (request.signal) request.signal.addEventListener('abort', () => { rejectEntry(id, new DOMException('Aborted', 'AbortError')); }, { once: true });
     });

@@ -141,6 +141,7 @@ function makeChannel() {
     send: f => c.sent.push(f),
     forceOpen() { c.readyState = 'open'; if (c.onopen) c.onopen(); },
     forceClose() { c.readyState = 'closed'; if (c.onclose) c.onclose(); },
+    close() { c.forceClose(); },
     forceError() { c.readyState = 'closed'; if (c.onerror) c.onerror(); },
     forceSilentClose() { c.readyState = 'closed'; },
   };
