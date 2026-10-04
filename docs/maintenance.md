@@ -135,15 +135,16 @@
 - 运行提交 `1c31e102dd35a4722171e593ac056c022b8309e7` 已推送并仅部署本机两个 Agent 与 VPS Gateway，服务 active、revision 核对通过。线上 HTML 与恢复页已包含新选择逻辑，旧设备 unknown 的 `/api/info` 仍为 200/V2。未部署远程 Agent/PVE、未重打包 APK；实际浏览器点击验收留待用户。
 - 回归验证：基线适配器会拒绝可用旧 Agent 的 unknown handoff，新实现通过；全套 pytest **356 passed, 1 skipped**（Android API-35 工具链缺失）。覆盖缺字段/过期 unknown 灰色可选、V2 验证成功进入、失败保持目标以及恢复页不自动刷新未知设备。评审发现自动默认选择也需验证 unknown 目标，已用红绿测试补齐；验证失败继续原目标重试，不改投其他设备。
 
-### 统一 Agent unit 托管全部实例（2026-10-04，已实现；**未部署、未迁移**）
+### 统一 Agent unit 托管全部实例（2026-10-04，已部署并完成服务迁移）
 
 - 目标：一个 `opencode-mesh-agent.service` 托管 `config/agents.json` 全部实例，逐实例独立退避重启；默认的每实例一个单元方式保持不变，用 `MESH_ALL_INSTANCES=1` 显式开启。
 - 实现：`src/main.py` 新增 `--all-instances`（与 `--instance` 互斥、仅 agent 模式）、`supervise_agent_instances()` 启动前全表校验、`supervisor_backoff_delay()` 与 `run_agent_supervisor()`；子进程仍是普通 `--instance` Agent，通信、身份派生、网络重连未改。`scripts/install.sh` 增加 opt-in 分支、双向共存守卫、`MESH_INSTALL_ONLY` active 守卫与 unit 归属/形态校验；`scripts/uninstall.sh` 共享 unit 删除走「记录运行态 → stop → 注销 → 原子改配置 → 恢复原状态」，最后一个实例才 disable/remove。判定共享 unit 一律只读 `ExecStart` 行并要求 `--all-instances` 是独立参数，不再 grep 整个文件（注释或 `--opt=--all-instances` 不算）。
 - 两套退避刻意分开：监督退避 1、2、4…上限 30 秒、连续运行 60 秒后复位；网络重连退避仍带 jitter、服从 `Retry-After`、上限 60 秒。
 - 文档：`README.md` 增「一个服务托管全部实例（可选，opt-in）」含迁移五步；`docs/architecture.md` 记录该形态的职责边界；`config/agents.example.json` 增 per-instance `gateway_url`/`enroll_token` 覆盖示例。
-- **本轮未部署、未迁移。** 没有创建或改动任何真实 systemd unit，没有重启运行中的 Mesh Agent 服务，没有向真实 Gateway 注册设备，没有 commit/push。代码只在本 worktree。
+- **部署与迁移**：用户授权提交、推送、全机部署及统一服务迁移。功能提交 `ac307b2` 与主分支既有文档提交合并为 `9dcbfc87be9d3a4dc4165556625ad508e3f08257`，已推送 `main` 和功能分支。该提交经 `upgrade.sh` 部署至 Gateway 及三个 Agent 安装目录；WSL 的三个实例归入一个 user service，远程 user service 和 root 安装的 system service 各托管一个实例。后两者由旧 `agent.json` 迁移至 `agents.json` 的 `default` 项，身份文件路径不变，旧配置保留。
+- **现场核验**：三个统一服务均 active/enabled，子进程实例集合分别为 3、1、1；所有原有 `device_id` 与 `agent_token` 对照私有备份未变。四个安装目录的 revision 一致，`src/main.py` SHA-256 一致；Gateway active，迁移后发现的五个设备均 online/healthy/available，逐设备 Relay `/api/info` 均 200 JSON。旧具名单元已停用并移出加载目录，配置、身份、旧单元及原运行状态保存在各安装目录 `data/.agent-migration-20261004/`（仅本地私有备份）。版本仍为 0.3.3，未移动发布标签；后续文档记录提交不改变部署代码。
 - 最终验证：使用项目虚拟环境执行 `python -m pytest -q -p no:cacheprovider -W error::DeprecationWarning -rs --tb=short` → **487 passed, 1 skipped in 32.54s**（缺 API-35 `android.jar`）；`bash -n scripts/install.sh scripts/uninstall.sh scripts/upgrade.sh` 与 `git diff --check` 通过。进程监督测试使用隔离子进程，安装生命周期测试使用隔离的 systemd 替身。
-- 未验证：真实 systemd unit、浏览器、真实 Gateway 注册的全链路均未验收，单元测试通过不等于浏览器全链路通过。迁移步骤尚未在真机演练。
+- 未验证：本轮未做浏览器端到端、P2P 故障注入或长时间驻留验收；真实服务与 Relay API 核验不等于这些场景通过。
 - 迁移边界：**不能用 `uninstall.sh` 迁移**（它会注销设备、改写配置、删最后一个实例的单元）。按 README 备份配置、身份、默认及具名单元并记录运行状态；停止全部旧 Agent，停用并移出旧 `@` 单元但保留备份，沿原配置和身份路径把默认入口改成 `--all-instances`，再重载并启动、核验设备在线。回滚先停统一服务，再恢复全部单元及原运行状态，避免重复管理身份。已配置实例不要重跑安装器。前置条件是安装代码已含新 CLI 入口。Mesh Agent 与本机 OpenCode 后台相互独立，迁移不涉及 OpenCode 侧 unit、端口或进程。
 - 已知限制：共享 unit 下任一实例配置非法会导致整个 unit 启动失败，失败面无法缩回单实例；退避复位的跨实例边界（设计上按实例独立）未验证。
 
