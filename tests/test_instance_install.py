@@ -33,8 +33,36 @@ if [ "${1:-}" = "-un" ]; then echo testuser; exit 0; fi
 exec /usr/bin/id "$@"
 """
 
+# systemctl and curl share one ordered event log so a test can assert that a
+# service was stopped before its device was deregistered. FAKE_ACTIVE_UNITS lists
+# the units reported active (default: none, because MESH_INSTALL_ONLY never starts
+# anything); FAKE_STOP_FAIL_UNITS makes `stop` fail for those units.
 FAKE_SYSTEMCTL = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "${FAKE_SYSTEMCTL_LOG:?}"
+[[ -z "${FAKE_EVENTS:-}" ]] || printf 'systemctl %s\\n' "$*" >> "$FAKE_EVENTS"
+in_list() {
+  local needle="$1" item found=0
+  shift
+  for item in "$@"; do
+    [[ "$item" == "$needle" ]] && found=1
+  done
+  [[ "$found" == 1 ]]
+}
+# The scripts call `systemctl --user <verb>` through an unquoted SC_CMD, so the verb is
+# not necessarily the first argument.
+verb=""
+for arg in "$@"; do
+  case "$arg" in is-active|stop|disable|restart|start|enable) verb="$arg"; break ;; esac
+done
+if [[ "$verb" == "is-active" ]]; then
+  IFS=',' read -r -a _list <<< "${FAKE_ACTIVE_UNITS:-}"
+  if in_list "${*: -1}" "${_list[@]}"; then printf 'active\\n'; exit 0; fi
+  printf 'inactive\\n'; exit 3
+fi
+if [[ "$verb" == "stop" ]]; then
+  IFS=',' read -r -a _list <<< "${FAKE_STOP_FAIL_UNITS:-}"
+  if in_list "${*: -1}" "${_list[@]}"; then printf 'Job failed\\n' >&2; exit 1; fi
+fi
 exit 0
 """
 
@@ -43,8 +71,31 @@ printf '%s\\n' "$*" >> "${FAKE_LOGINCTL_LOG:?}"
 exit 0
 """
 
+# The real Gateway refuses to deregister a device whose Agent websocket is still
+# open (409 in src/main.py). Reproduce it: an agent counts as connected while its
+# unit reports active and no stop has been issued yet.
 FAKE_CURL = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "${FAKE_CURL_LOG:?}"
+[[ -z "${FAKE_EVENTS:-}" ]] || printf 'curl %s\\n' "$*" >> "$FAKE_EVENTS"
+if [[ "$*" == *"/_mesh/deregister/"* ]]; then
+  stopped=0
+  if [[ -n "${FAKE_EVENTS:-}" && -f "$FAKE_EVENTS" ]]; then
+    while read -r line; do
+      case "$line" in *" stop opencode-mesh-agent"*) stopped=1 ;; esac
+    done < "$FAKE_EVENTS"
+  fi
+  connected=0
+  IFS=',' read -r -a _units <<< "${FAKE_ACTIVE_UNITS:-}"
+  for _unit in "${_units[@]}"; do
+    case "$_unit" in
+      opencode-mesh-agent.service|opencode-mesh-agent@*.service) connected=1 ;;
+    esac
+  done
+  if [[ "$stopped" != 1 && "$connected" == 1 ]]; then
+    [[ -z "${FAKE_EVENTS:-}" ]] || printf 'deregister-conflict %s\\n' "$*" >> "$FAKE_EVENTS"
+    exit 22
+  fi
+fi
 exit 0
 """
 
@@ -136,6 +187,7 @@ def make_fakebin(tmp_path):
         "curl": tmp_path / "curl.log",
         "ssh": tmp_path / "ssh.log",
         "pip": tmp_path / "pip.log",
+        "events": tmp_path / "events.log",
     }
     tools = {
         "id": FAKE_ID,
@@ -172,6 +224,7 @@ def base_env(tmp_path, fakebin, logs, **extra):
     env["FAKE_CURL_LOG"] = str(logs["curl"])
     env["FAKE_SSH_LOG"] = str(logs["ssh"])
     env["FAKE_PIP_LOG"] = str(logs["pip"])
+    env["FAKE_EVENTS"] = str(logs["events"])
     env["HOME"] = str(tmp_path / "home")
     env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg")
     env.update(extra)
@@ -580,3 +633,348 @@ def test_uninstall_rejects_bad_instance_args(tmp_path):
     assert run_script("uninstall.sh", ["agent", ""], env).returncode != 0
     assert run_script("uninstall.sh", ["agent", "default"], env).returncode != 0
     assert run_script("uninstall.sh", ["agent", "a/b"], env).returncode != 0
+
+
+# ------------------------------------------------- one shared supervisor unit
+
+
+def seed_supervisor_unit(tmp_path, install_dir):
+    d = unit_dir(tmp_path)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "opencode-mesh-agent.service").write_text(
+        f"[Unit]\n[Service]\nWorkingDirectory={install_dir}\n"
+        f"ExecStart={install_dir}/.venv/bin/python -m src.main --mode agent "
+        f"--config {install_dir}/config/agents.json --all-instances\n"
+    )
+
+
+def unit_exec_start(tmp_path, name):
+    unit = unit_dir(tmp_path) / f"{name}.service"
+    if not unit.exists():
+        return ""
+    for line in unit.read_text().splitlines():
+        if line.startswith("ExecStart="):
+            return line.split("=", 1)[1]
+    return ""
+
+
+def lifecycle_events(logs):
+    """systemctl and curl calls in the order the mock commands observed them."""
+    if not logs["events"].exists():
+        return []
+    return logs["events"].read_text().splitlines()
+
+
+def event_position(events, needle):
+    for position, line in enumerate(events):
+        if needle in line:
+            return position
+    return -1
+
+
+def make_supervisor_install_state(tmp_path):
+    fakebin, logs = make_fakebin(tmp_path)
+    source = make_source(tmp_path)
+    inst = tmp_path / "inst"
+    seed_shared_code(inst)
+    (inst / "config").mkdir(exist_ok=True)
+    (inst / "config" / "agents.json").write_text(json.dumps({
+        "gateway_url": "https://mesh.example.com",
+        "enroll_token": "enroll-token",
+        "agents": {"default": {"opencode_url": "http://127.0.0.1:4096"}},
+    }))
+    return fakebin, logs, inst, source
+
+
+def supervisor_install_env(tmp_path, fakebin, logs, source, inst, **extra):
+    return base_env(tmp_path, fakebin, logs, **agent_env(
+        MESH_SOURCE_DIR=str(source), MESH_INSTALL_DIR=str(inst),
+        MESH_INSTALL_ONLY="1", FAKE_REAL_INSTALL_OWNER="1",
+        MESH_ALL_INSTANCES="1", **extra))
+
+
+def test_unified_install_puts_every_instance_under_the_shared_unit(tmp_path):
+    """Opting in replaces one unit per instance with a single supervisor unit for the whole mapping."""
+    fakebin, logs, inst, source = make_supervisor_install_state(tmp_path)
+
+    result = run_script("install.sh", ["agent", "win"],
+                        supervisor_install_env(tmp_path, fakebin, logs, source, inst))
+
+    assert result.returncode == 0, result.stderr
+    exec_start = unit_exec_start(tmp_path, "opencode-mesh-agent")
+    assert "--all-instances" in exec_start
+    assert "--instance" not in exec_start
+    assert not (unit_dir(tmp_path) / "opencode-mesh-agent@win.service").exists()
+    assert set(read_json(inst / "config" / "agents.json")["agents"]) == {"default", "win"}
+
+
+def test_unified_install_refuses_to_overwrite_a_configured_instance(tmp_path):
+    """Re-running the installer over an existing instance name must not silently replace its values."""
+    fakebin, logs, inst, source = make_supervisor_install_state(tmp_path)
+    config = read_json(inst / "config" / "agents.json")
+    config["agents"]["win"] = {"opencode_url": "http://127.0.0.1:4099"}
+    (inst / "config" / "agents.json").write_text(json.dumps(config))
+
+    result = run_script("install.sh", ["agent", "win"],
+                        supervisor_install_env(tmp_path, fakebin, logs, source, inst))
+
+    assert result.returncode != 0
+    assert "already configured" in result.stderr
+    assert read_json(inst / "config" / "agents.json")["agents"]["win"]["opencode_url"] \
+        == "http://127.0.0.1:4099"
+
+
+def test_a_second_unified_install_adds_an_instance_instead_of_refusing(tmp_path):
+    """The shared unit already exists, so a later run must extend the mapping rather than bail out."""
+    fakebin, logs, inst, source = make_supervisor_install_state(tmp_path)
+    env = supervisor_install_env(tmp_path, fakebin, logs, source, inst)
+    assert run_script("install.sh", ["agent", "win"], env).returncode == 0
+
+    result = run_script("install.sh", ["agent", "beta"], env)
+
+    assert result.returncode == 0, result.stderr
+    assert set(read_json(inst / "config" / "agents.json")["agents"]) == {"default", "win", "beta"}
+
+
+def test_install_only_refuses_to_change_a_running_service(tmp_path):
+    """The supervisor read its instance set at start-up, so a config edit under INSTALL_ONLY would only
+    take effect at an unrelated restart and register a device nobody asked for."""
+    fakebin, logs, inst, source = make_supervisor_install_state(tmp_path)
+    env = supervisor_install_env(tmp_path, fakebin, logs, source, inst)
+    assert run_script("install.sh", ["agent", "win"], env).returncode == 0
+    unit = unit_dir(tmp_path) / "opencode-mesh-agent.service"
+    config = inst / "config" / "agents.json"
+    unit_before, config_before = unit.read_bytes(), config.read_bytes()
+
+    blocked = run_script("install.sh", ["agent", "beta"],
+                         supervisor_install_env(tmp_path, fakebin, logs, source, inst,
+                                                FAKE_ACTIVE_UNITS="opencode-mesh-agent.service"))
+
+    assert blocked.returncode != 0
+    assert "running" in blocked.stderr
+    assert unit.read_bytes() == unit_before
+    assert config.read_bytes() == config_before
+
+
+def test_unified_install_reuses_the_shared_unit_only_when_it_owns_this_directory(tmp_path):
+    """Rewriting a unit from another install root would hand this mapping to a foreign service."""
+    fakebin, logs, inst, source = make_supervisor_install_state(tmp_path)
+    seed_supervisor_unit(tmp_path, Path("/elsewhere/opencode-mesh"))
+    before = (inst / "config" / "agents.json").read_bytes()
+
+    result = run_script("install.sh", ["agent", "win"],
+                        supervisor_install_env(tmp_path, fakebin, logs, source, inst))
+
+    assert result.returncode != 0
+    assert "another directory" in result.stderr
+    assert (inst / "config" / "agents.json").read_bytes() == before
+
+
+def test_unified_install_of_the_default_instance_omits_the_name(tmp_path):
+    """`agent default` stays a usage error; the default instance is configured by leaving the name off."""
+    fakebin, logs = make_fakebin(tmp_path)
+    source = make_source(tmp_path)
+    inst = tmp_path / "inst"
+    seed_shared_code(inst)
+    (inst / "config").mkdir(exist_ok=True)
+    (inst / "config" / "agents.json").write_text(json.dumps({
+        "gateway_url": "https://mesh.example.com",
+        "enroll_token": "enroll-token",
+        "agents": {},
+    }))
+    env = supervisor_install_env(tmp_path, fakebin, logs, source, inst)
+
+    rejected = run_script("install.sh", ["agent", "default"], env)
+    assert rejected.returncode != 0
+    assert "default" in rejected.stderr
+
+    accepted = run_script("install.sh", ["agent"], env)
+    assert accepted.returncode == 0, accepted.stderr
+    assert set(read_json(inst / "config" / "agents.json")["agents"]) == {"default"}
+    assert "--all-instances" in unit_exec_start(tmp_path, "opencode-mesh-agent")
+
+
+def test_unified_install_is_refused_while_a_legacy_instance_unit_exists(tmp_path):
+    """Two units managing the same mapping would fight over the same identities, so one must go first."""
+    fakebin, logs, inst, source = make_supervisor_install_state(tmp_path)
+    seed_unit(tmp_path, "opencode-mesh-agent@win", inst)
+
+    result = run_script("install.sh", ["agent", "win"],
+                        supervisor_install_env(tmp_path, fakebin, logs, source, inst))
+
+    assert result.returncode != 0
+    assert "legacy" in result.stderr.lower()
+
+
+def test_legacy_install_is_refused_while_the_shared_unit_exists(tmp_path):
+    """Adding a per-instance unit next to the shared one would supervise the mapping twice."""
+    fakebin, logs, inst, source = make_supervisor_install_state(tmp_path)
+    seed_supervisor_unit(tmp_path, inst)
+
+    result = run_script("install.sh", ["agent", "win"], base_env(
+        tmp_path, fakebin, logs, **agent_env(
+            MESH_SOURCE_DIR=str(source), MESH_INSTALL_DIR=str(inst),
+            MESH_INSTALL_ONLY="1", FAKE_REAL_INSTALL_OWNER="1")))
+
+    assert result.returncode != 0
+    assert "shared" in result.stderr.lower() or "all-instances" in result.stderr.lower()
+
+
+def test_unified_install_is_refused_for_the_gateway_mode(tmp_path):
+    """The Gateway serves devices; it never supervises Agents, so the opt-in does not apply to it."""
+    fakebin, logs = make_fakebin(tmp_path)
+    source = make_source(tmp_path)
+    inst = tmp_path / "gw"
+
+    result = run_script("install.sh", ["gateway"], base_env(
+        tmp_path, fakebin, logs, MESH_SOURCE_DIR=str(source), MESH_INSTALL_DIR=str(inst),
+        MESH_INSTALL_ONLY="1", FAKE_REAL_INSTALL_OWNER="1", MESH_ALL_INSTANCES="1",
+        MESH_LISTEN_PORT="18080", MESH_USERNAME="admin", MESH_PASSWORD="pw"))
+
+    assert result.returncode != 0
+    assert "agent" in result.stderr.lower()
+
+
+@pytest.mark.parametrize("unified", [False, True])
+def test_install_pins_an_instance_gateway_that_differs_from_the_shared_one(tmp_path, unified):
+    """Both install modes may give an instance its own Gateway; the others keep the shared value."""
+    fakebin, logs, inst, source = make_supervisor_install_state(tmp_path)
+    config = read_json(inst / "config" / "agents.json")
+    config["agents"]["alpha"] = {"opencode_url": "http://127.0.0.1:4097"}
+    (inst / "config" / "agents.json").write_text(json.dumps(config))
+    env = supervisor_install_env(tmp_path, fakebin, logs, source, inst,
+                                MESH_GATEWAY_URL="https://other.example.com") if unified else base_env(
+        tmp_path, fakebin, logs, **agent_env(
+            MESH_SOURCE_DIR=str(source), MESH_INSTALL_DIR=str(inst),
+            MESH_INSTALL_ONLY="1", FAKE_REAL_INSTALL_OWNER="1",
+            MESH_GATEWAY_URL="https://other.example.com"))
+
+    result = run_script("install.sh", ["agent", "win"], env)
+
+    assert result.returncode == 0, result.stderr
+    merged = read_json(inst / "config" / "agents.json")
+    assert merged["gateway_url"] == "https://mesh.example.com"
+    assert merged["agents"]["win"]["gateway_url"] == "https://other.example.com"
+    assert "gateway_url" not in merged["agents"]["alpha"]
+
+
+def test_uninstall_stops_the_shared_unit_before_deregistering_the_default_instance(tmp_path):
+    """The Gateway refuses to drop a device whose Agent is still connected, so the unit stops first."""
+    fakebin, logs = make_fakebin(tmp_path)
+    inst = make_install_state(tmp_path, tmp_path / "u5")
+    seed_supervisor_unit(tmp_path, inst)
+
+    env = uninstall_env(tmp_path, fakebin, logs, inst, FAKE_ACTIVE_UNITS="opencode-mesh-agent.service")
+    result = run_script("uninstall.sh", ["agent"], env)
+    assert result.returncode == 0, result.stderr
+
+    events = lifecycle_events(logs)
+    stop = event_position(events, "stop opencode-mesh-agent.service")
+    deregister = event_position(events, "/_mesh/deregister/")
+    assert stop >= 0 and deregister >= 0, events
+    assert stop < deregister, events
+    assert not [line for line in events if line.startswith("deregister-conflict")], events
+    # the mapping shrank by one instance and the survivors keep running afterwards
+    assert set(read_json(inst / "config" / "agents.json")["agents"]) == {"win"}
+    assert (unit_dir(tmp_path) / "opencode-mesh-agent.service").exists()
+    assert event_position(events, "restart opencode-mesh-agent.service") > deregister, events
+    assert (inst / "data" / "agent-state.json").exists()
+
+
+def test_uninstall_stops_the_shared_unit_before_deregistering_a_named_instance(tmp_path):
+    """A named instance lives under the shared unit too, so that unit must be handled, not the @name one."""
+    fakebin, logs = make_fakebin(tmp_path)
+    inst = make_install_state(tmp_path, tmp_path / "u7")
+    seed_supervisor_unit(tmp_path, inst)
+
+    env = uninstall_env(tmp_path, fakebin, logs, inst, FAKE_ACTIVE_UNITS="opencode-mesh-agent.service")
+    result = run_script("uninstall.sh", ["agent", "win"], env)
+    assert result.returncode == 0, result.stderr
+
+    events = lifecycle_events(logs)
+    stop = event_position(events, "stop opencode-mesh-agent.service")
+    deregister = event_position(events, "/_mesh/deregister/")
+    assert stop >= 0 and deregister >= 0, events
+    assert stop < deregister, events
+    assert not [line for line in events if line.startswith("deregister-conflict")], events
+    assert set(read_json(inst / "config" / "agents.json")["agents"]) == {"default"}
+    assert (unit_dir(tmp_path) / "opencode-mesh-agent.service").exists()
+    assert (inst / "data" / "agent-state-win.json").exists()
+
+
+def test_uninstall_leaves_an_inactive_shared_unit_stopped(tmp_path):
+    """A service that was already stopped must stay stopped, and needs no stop before deregistering."""
+    fakebin, logs = make_fakebin(tmp_path)
+    inst = make_install_state(tmp_path, tmp_path / "u8")
+    seed_supervisor_unit(tmp_path, inst)
+
+    env = uninstall_env(tmp_path, fakebin, logs, inst)
+    result = run_script("uninstall.sh", ["agent"], env)
+    assert result.returncode == 0, result.stderr
+
+    events = lifecycle_events(logs)
+    assert not [line for line in events
+                if " stop " in line or " restart " in line or " disable " in line], events
+    assert event_position(events, "/_mesh/deregister/") >= 0, events
+    assert set(read_json(inst / "config" / "agents.json")["agents"]) == {"win"}
+    assert (unit_dir(tmp_path) / "opencode-mesh-agent.service").exists()
+
+
+def test_uninstall_aborts_before_deregistering_when_the_shared_unit_cannot_stop(tmp_path):
+    """If the Agent cannot be stopped the device stays connected, so no deregistration and no config edit."""
+    fakebin, logs = make_fakebin(tmp_path)
+    inst = make_install_state(tmp_path, tmp_path / "u9")
+    seed_supervisor_unit(tmp_path, inst)
+    before = (inst / "config" / "agents.json").read_bytes()
+
+    env = uninstall_env(tmp_path, fakebin, logs, inst,
+                        FAKE_ACTIVE_UNITS="opencode-mesh-agent.service",
+                        FAKE_STOP_FAIL_UNITS="opencode-mesh-agent.service")
+    result = run_script("uninstall.sh", ["agent"], env)
+
+    assert result.returncode != 0
+    assert (inst / "config" / "agents.json").read_bytes() == before
+    assert not [line for line in lifecycle_events(logs) if "/_mesh/deregister/" in line]
+    assert (unit_dir(tmp_path) / "opencode-mesh-agent.service").exists()
+
+
+def test_uninstall_refuses_a_shared_unit_owned_by_another_directory(tmp_path):
+    """The shared unit supervises every instance, so its ownership is checked before anything is touched."""
+    fakebin, logs = make_fakebin(tmp_path)
+    inst = make_install_state(tmp_path, tmp_path / "u10")
+    seed_supervisor_unit(tmp_path, Path("/elsewhere/opencode-mesh"))
+    before = (inst / "config" / "agents.json").read_bytes()
+
+    env = uninstall_env(tmp_path, fakebin, logs, inst, FAKE_ACTIVE_UNITS="opencode-mesh-agent.service")
+    result = run_script("uninstall.sh", ["agent", "win"], env)
+
+    assert result.returncode != 0
+    assert "another directory" in result.stderr
+    assert (inst / "config" / "agents.json").read_bytes() == before
+    assert not [line for line in lifecycle_events(logs) if "/_mesh/deregister/" in line]
+
+
+def test_uninstall_removes_the_shared_unit_with_the_last_instance(tmp_path):
+    """With nothing left to supervise, the unit is disabled and deleted as any other one."""
+    fakebin, logs = make_fakebin(tmp_path)
+    inst = tmp_path / "u6"
+    (inst / "config").mkdir(parents=True)
+    (inst / "config" / "agents.json").write_text(json.dumps({
+        "gateway_url": "https://mesh.example.com", "enroll_token": "e",
+        "agents": {"default": {"opencode_url": "http://127.0.0.1:4096"}}}))
+    (inst / "data").mkdir()
+    (inst / "data" / "agent-state.json").write_text(
+        json.dumps({"device_id": "dev-default", "agent_token": "tok"}))
+    seed_supervisor_unit(tmp_path, inst)
+
+    env = uninstall_env(tmp_path, fakebin, logs, inst, FAKE_ACTIVE_UNITS="opencode-mesh-agent.service")
+    result = run_script("uninstall.sh", ["agent"], env)
+
+    assert result.returncode == 0, result.stderr
+    assert not (unit_dir(tmp_path) / "opencode-mesh-agent.service").exists()
+    assert read_json(inst / "config" / "agents.json")["agents"] == {}
+    events = lifecycle_events(logs)
+    assert event_position(events, "disable opencode-mesh-agent.service") > 0, events
+    assert event_position(events, "/_mesh/deregister/") > \
+        event_position(events, "stop opencode-mesh-agent.service"), events
+    assert (inst / "data" / "agent-state.json").exists()

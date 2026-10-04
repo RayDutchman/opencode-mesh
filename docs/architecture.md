@@ -67,7 +67,9 @@ Gateway 由 FastAPI/uvicorn 托管；Agent 是 asyncio 常驻进程。Agent 不�
 
 同机 Agent 共用一份 `config/agents.json`，以 `agents` 映射和 `--instance` 选择上游。设备身份与 Agent token 由程序分别保存到内部 `data/agent-state.json` 或 `data/agent-state-<name>.json`，统一人工配置不填写 `state_file`。旧单实例配置仍兼容，可用迁移工具保身份转入统一配置。设备显示名用于辨认，不用于判断身份。Gateway 浏览器认证与本地 OpenCode 认证分别配置。
 
-具名实例使用独立 systemd 单元，共享源码和虚拟环境。新增实例不升级共享代码；发布脚本按同一 scope 和实际工作目录收集关联服务，升级及回滚恢复原先运行的集合。单实例卸载保留共享目录和身份；完整卸载须明确选择 `all`。
+具名实例默认使用独立 systemd 单元，共享源码和虚拟环境。新增实例不升级共享代码；发布脚本按同一 scope 和实际工作目录收集关联服务，升级及回滚恢复原先运行的集合。单实例卸载保留共享目录和身份；完整卸载须明确选择 `all`。
+
+另一种部署形态是单个 `opencode-mesh-agent.service` 托管整张 `agents` 映射（`ExecStart` 为 `--all-instances`，需显式 opt-in 安装）。父进程只负责确定实例集合、逐个创建并监督 `--instance` 子进程、转发停止信号并有界回收；通信实现、身份派生与网络重连仍全部由子进程内的 `Agent` 负责。选择子进程隔离而非单进程内多 Agent，是因为 `Agent.run()` 的 `SystemExit` 会跨实例扩散。监督退避（1、2、4…上限 30 秒、连续运行 60 秒后复位）与 Agent 的网络重连退避是两套独立策略，后者带 jitter 并服从 `Retry-After`。实例集合只在父进程启动时确定，没有热加载，增删实例通过重启服务应用。该形态下卸载一个实例需先停止共享 unit 以结束其 websocket（Gateway 拒绝注销仍在线的设备），再注销、原子改配置并恢复原先的运行态；共享 unit 保留到最后一个实例被删。
 
 ## 3. 两条传输路径
 

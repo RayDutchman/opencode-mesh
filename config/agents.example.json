@@ -9,6 +9,12 @@
     "second": {
       "device_name": "Device B",
       "opencode_url": "http://127.0.0.1:4097"
+    },
+    "offsite": {
+      "device_name": "Remote device",
+      "opencode_url": "http://127.0.0.1:4098",
+      "gateway_url": "https://mesh-b.example.com",
+      "enroll_token": "CHANGE_ME_OTHER_LONG_RANDOM"
     }
   }
 }

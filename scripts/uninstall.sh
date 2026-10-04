@@ -91,17 +91,52 @@ for _ in $(seq 1 100); do [[ -e "$LOCK_READY" ]] && break; kill -0 "$LOCK_GUARDI
 [[ -e "$LOCK_READY" ]] || { wait "$LOCK_GUARDIAN" 2>/dev/null || true; err "another Mesh lifecycle operation is using ${INSTALL_DIR}"; exit 1; }
 rm -f "$LOCK_READY"
 
-if [ "$MODE" = "all" ]; then
+# A shared supervisor unit holds every configured instance, including the default one.
+# Only ExecStart counts: a mention in a comment must not turn a legacy unit into a shared one.
+shared_agent_unit_installed() {
+  [ "$MODE" = agent ] && [ -f "$UNIT_DIR/opencode-mesh-agent.service" ] &&
+    python3 - "$UNIT_DIR/opencode-mesh-agent.service" <<'PY'
+import shlex, sys
+for line in open(sys.argv[1]):
+    if not line.startswith("ExecStart="):
+        continue
+    if "--all-instances" in shlex.split(line.split("=", 1)[1].strip())[1:]:
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+if [ "$MODE" = all ]; then
   SERVICES=("opencode-mesh-agent" "opencode-mesh-gateway")
   for unit in "$UNIT_DIR"/opencode-mesh-agent@*.service; do
     [[ -f "$unit" && "$unit" != *'@.service' ]] || continue
     SERVICES+=("$(basename "$unit" .service)")
   done
+elif shared_agent_unit_installed && [ "$INSTANCE" != default ]; then
+  # There is no per-instance unit to remove; the shared one owns this instance too.
+  SERVICES=("opencode-mesh-agent")
 else
   SERVICES=("opencode-mesh-${MODE}")
   [[ "$MODE" != agent || "$INSTANCE" == default ]] || SERVICES=("opencode-mesh-agent@$INSTANCE")
 fi
 
+# A shared supervisor unit outlives any single instance; only the last one may take it down.
+REMAINING_INSTANCES="$(python3 - "$INSTALL_DIR" "$MODE" "$INSTANCE" <<'PY'
+import json, sys
+from pathlib import Path
+root, mode, selected = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+path = root / "config" / "agents.json"
+names = list(json.loads(path.read_text()).get("agents", {})) if path.exists() else []
+if mode == "all":
+    names = []
+else:
+    names = [name for name in names if name != selected]
+print(len(names))
+PY
+)"
+
+SHARED_UNIT=""
+SHARED_WAS_ACTIVE=0
 for svc in "${SERVICES[@]}"; do
   if [ -f "${UNIT_DIR}/${svc}.service" ]; then
     wd=$(python3 - "${UNIT_DIR}/${svc}.service" <<'PY'
@@ -112,6 +147,21 @@ for line in open(sys.argv[1]):
 PY
 )
     [[ -n "$wd" && "$(realpath "$wd")" == "$(realpath "$INSTALL_DIR")" ]] || { err "service belongs to another directory"; exit 1; }
+    if [ "$MODE" != all ] && shared_agent_unit_installed && [ "$svc" = "opencode-mesh-agent" ] &&
+       [ "$REMAINING_INSTANCES" != 0 ]; then
+      # The Gateway refuses to drop a device whose Agent is still connected, so the shared
+      # unit has to stop first. Its previous state is restored after the configuration
+      # change, and a unit that was already stopped stays stopped.
+      SHARED_UNIT="$svc"
+      if $SC_CMD is-active --quiet "${svc}.service"; then
+        SHARED_WAS_ACTIVE=1
+        info "stopping ${svc} to close the Agent connection before deregistration ..."
+        $SC_CMD stop "${svc}.service" || { err "could not stop ${svc}; the instance stays registered"; exit 1; }
+      else
+        info "${svc} is not running; no Agent connection to close"
+      fi
+      continue
+    fi
     info "stopping and disabling ${svc} ..."
     $SC_CMD stop "${svc}.service"
     $SC_CMD disable "${svc}.service" 2>/dev/null || true
@@ -154,6 +204,12 @@ with os.fdopen(fd, "w") as handle:
     json.dump(cfg, handle, indent=2)
 os.replace(temporary, path)
 PY
+fi
+
+# The configuration no longer names the removed instance, so the shared unit can serve the rest.
+if [ -n "$SHARED_UNIT" ] && [ "$SHARED_WAS_ACTIVE" = 1 ]; then
+  info "restarting ${SHARED_UNIT} for the remaining instances ..."
+  $SC_CMD restart "${SHARED_UNIT}.service"
 fi
 
 # Single-instance uninstall keeps the shared source and identity so that other stopped instances are unaffected.

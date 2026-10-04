@@ -118,6 +118,49 @@ bash scripts/upgrade.sh local "$PWD" agent user HEAD
 
 只打包**已提交的代码**。正式发布先递增 `src.__version__`、更新 CHANGELOG、测试并创建新的 `vX.Y.Z` tag，再部署该 tag；不要移动旧发布 tag。回滚可指定旧 tag，开发工作区需先切换到相应提交。
 
+## 一个服务托管全部实例（可选，opt-in）
+
+默认行为不变：每个实例一个 systemd 单元。想改成「一个 `opencode-mesh-agent.service` 托管 `config/agents.json` 里的全部实例」，用显式环境变量开启：
+
+```bash
+# 省略实例名 = 配置 default 实例（`agent default` 会被拒绝）
+MESH_ALL_INSTANCES=1 bash scripts/install.sh agent
+MESH_ALL_INSTANCES=1 bash scripts/install.sh agent second
+```
+
+该模式下的实际形态：
+
+- `ExecStart` 是 `--all-instances`，父进程枚举实例集合，每个实例仍是独立的 `--instance` 子进程；单个实例崩溃只按自己的退避重启，不影响其他实例。
+- **没有热加载。** 实例集合在父进程启动时确定。改完 `config/agents.json` 必须重启整个服务才生效：
+
+```bash
+systemctl --user restart opencode-mesh-agent.service
+```
+
+- 新增实例的日常做法是**手工编辑 `config/agents.json` 加一条 `agents` 条目，然后重启**，不必重跑 `install.sh`。已有实例条目重跑安装会被拒绝（不允许覆盖），统一模式下重复安装只用于补全新实例。
+- 每个实例可单独覆盖 `gateway_url` / `enroll_token` / `opencode_url`；只有与公共值不同的实例才在自己的条目里写覆盖，公共值仍是其余实例的默认。见 [`config/agents.example.json`](config/agents.example.json)。
+- `MESH_INSTALL_ONLY=1` 只写配置与单元、不启用不启动；若目标单元当前正在运行会被拒绝，因为改配置不会热加载，注册要到下次重启才发生。
+
+### 与旧安装方式的共存与迁移
+
+统一 unit 与旧的每实例 unit 不能同时管理同一身份，两个方向都有守卫。**迁移不会自动发生，也不该用 `uninstall.sh` 做**——卸载会注销设备、改写配置、删掉最后一个实例的单元，正是要保住的东西。
+
+前置条件：**安装代码里必须已经带 `--all-instances` 入口**（先用 `upgrade.sh` 升级共享代码），否则新单元起不来。
+
+手工迁移步骤：
+
+以下以用户级服务为例；系统级使用 `sudo systemctl` 和 `/etc/systemd/system`。记录各单元原先的 enabled/active 状态，以便回滚时恢复。
+
+1. 备份 `config/agents.json`、整个 `data/`（设备身份），以及默认 `opencode-mesh-agent.service` 和每个旧 `opencode-mesh-agent@*.service` 单元文件。
+2. 停止默认 Agent 单元；对每个旧 `@` 单元执行 `systemctl --user stop` 和 `systemctl --user disable`，确认全部停止后再更换入口。
+3. 把旧 `@` 单元文件移出 systemd 加载目录（`~/.config/systemd/user`）到备份处，**保留文件本体**；只 disable 不移走的话 installer 仍会判定共存而拒绝。
+4. 沿用原 `config/agents.json` 与 `data/agent-state*.json`，把默认实例单元 `ExecStart` 里的 `--instance default` 手工改成 `--all-instances`，`systemctl --user daemon-reload` 后 restart。身份由实例名派生，改这一处不会换设备身份。
+5. 验证共享服务 active、子进程实例集合与配置一致、各设备在 Gateway 在线。若需回滚，先停止统一服务，再恢复默认单元和旧 `@` 单元备份，执行 `daemon-reload`，按记录恢复各单元原先的 enabled/active 状态；不能在统一服务仍运行时启动旧实例。
+
+注意区分：**Mesh Agent 与本机 OpenCode 后台是两件独立的事**。Mesh Agent 连 Gateway，不托管也不重启 OpenCode；迁移只影响 Mesh 侧的服务形态，不应动 OpenCode 的 unit、端口或进程。
+
+旧安装方式（每实例一个单元）继续可用，两种模式的配置字段含义一致。
+
 ## 卸载
 
 ```bash
@@ -166,7 +209,7 @@ sudo systemctl status opencode-mesh-gateway.service
 sudo journalctl -u opencode-mesh-gateway.service -f
 ```
 
-`config/agents.json` 是共享配置：若只修改一个实例（例如 `agents.default.device_name`），只重启该实例，不必重启同机其他 Agent。`device_name` 仅是注册显示名；重启会重新注册其显示信息，但不会改写程序管理的 `data/agent-state*.json` 身份、`device_id` 或 `agent_token`。只有修改 systemd unit 文件时才先执行对应 scope 的 `daemon-reload`，再重启服务：用户级用 `systemctl --user daemon-reload`，系统级用 `sudo systemctl daemon-reload`。
+`config/agents.json` 是共享配置：若只修改一个实例（例如 `agents.default.device_name`），只重启该实例，不必重启同机其他 Agent；统一 unit 下则重启该 unit 即可，它会逐实例重建子进程。`device_name` 仅是注册显示名；重启会重新注册其显示信息，但不会改写程序管理的 `data/agent-state*.json` 身份、`device_id` 或 `agent_token`。只有修改 systemd unit 文件时才先执行对应 scope 的 `daemon-reload`，再重启服务：用户级用 `systemctl --user daemon-reload`，系统级用 `sudo systemctl daemon-reload`。
 
 上游健康状态由 Agent 报告，需要升级 Agent 才能使用；旧 Mesh 未报告健康时显示灰色未知，但仍可手动尝试，浏览器会实际验证目标 `/api/info` 是否为 OpenCode V2 后才进入。健康设备正常连接；Agent 离线或明确报告 OpenCode 不可达、认证失败、异常时不可选。浏览器验收分两步：保留 Agent、停止并恢复 OpenCode，观察上游不可用与恢复；再停止并恢复对应 Mesh Agent，观察 Agent 离线与恢复。每步恢复正常后再进行下一步，设备身份无需重新创建。
 
@@ -180,11 +223,11 @@ sudo journalctl -u opencode-mesh-gateway.service -f
 
 `enroll_token` 属于 Gateway，同一 Gateway 上的所有 Agent 共用同一个值。`device_id` 与 `agent_token` 由系统自动生成/签发，无需手工配置。
 
-同机新增实例使用 `bash scripts/install.sh agent second`（或 `MESH_INSTANCE=second`）；设置 `MESH_INSTALL_ONLY=1` 时只写配置与单元，不启用、不启动。`MESH_DEVICE_NAME` 指定显示名。已有实例拒绝重复安装；更改配置后重启该实例即可，升级共享代码使用 `upgrade.sh`。
+同机新增实例使用 `bash scripts/install.sh agent second`（或 `MESH_INSTANCE=second`）；设置 `MESH_INSTALL_ONLY=1` 时只写配置与单元，不启用、不启动。`MESH_DEVICE_NAME` 指定显示名。已有实例拒绝重复安装；更改配置后重启该实例即可，升级共享代码使用 `upgrade.sh`。以上是默认的每实例一个单元方式；统一 unit 下新增实例见[「一个服务托管全部实例」](#一个服务托管全部实例可选opt-in)。
 
-加入密钥通过已导出的 `MESH_ENROLL_TOKEN` 提供。服务名称为 `opencode-mesh-agent@second.service`，默认实例仍为 `opencode-mesh-agent.service`。远端首次安装时在目标机器运行 `install.sh`，不另设远程安装脚本。`uninstall.sh agent second` 只移除对应服务和配置项，保留身份与共享目录；`all` 才进入整目录卸载流程。共享升级按同一 systemd scope、实际工作目录收集关联服务，仅恢复升级前运行的集合。
+加入密钥通过已导出的 `MESH_ENROLL_TOKEN` 提供。服务名称为 `opencode-mesh-agent@second.service`，默认实例仍为 `opencode-mesh-agent.service`。远端首次安装时在目标机器运行 `install.sh`，不另设远程安装脚本。`uninstall.sh agent second` 只移除对应服务和配置项，保留身份与共享目录；统一 unit 下删除一个实例同样是「停 unit → 注销设备 → 改配置 → 恢复原运行态」，共享 unit 保留，删掉最后一个实例才停用并删除单元；`all` 才进入整目录卸载流程。共享升级按同一 systemd scope、实际工作目录收集关联服务，仅恢复升级前运行的集合。
 
-统一配置通过 `--instance` 选择实例，例如：
+统一配置通过 `--instance` 选择单个实例，或用 `--all-instances` 托管全部（两者互斥，`--all-instances` 仅用于 agent 模式），例如：
 
 ```bash
 .venv/bin/python -m src.main --mode agent --config config/agents.json --instance second
@@ -192,7 +235,7 @@ sudo journalctl -u opencode-mesh-gateway.service -f
 
 此命令会实际启动并注册 Agent。程序不会监听 OpenCode 的上游端口，而是连接 `opencode_url`。统一配置不接受 `state_file`：默认实例身份自动保存于安装目录的 `data/agent-state.json`，其他实例为 `data/agent-state-<name>.json`。这些文件是程序内部身份存储，不需要手工填写，也不写回人工配置；备份时应连同配置保存。
 
-旧单实例配置仍可使用原命令运行。新增实例前如需调整为统一配置，应备份配置、保留原设备身份，并核对服务工作目录与内部状态路径；安装脚本不会自动覆盖旧配置。`config/agents.json` 已被 Git 忽略；示例文件不包含真实凭据。Agent 不使用 `listen_host`、`listen_port`，这两个字段仅属于 Gateway。
+旧单实例配置仍可使用原命令运行。新增实例前如需调整为统一配置，应备份配置、保留原设备身份，并核对服务工作目录与内部状态路径；安装脚本不会自动覆盖旧配置。改用统一 unit 托管的步骤见上文迁移小节。`config/agents.json` 已被 Git 忽略；示例文件不包含真实凭据。Agent 不使用 `listen_host`、`listen_port`，这两个字段仅属于 Gateway。
 
 `scripts/` 仅保留安装 `install.sh`、卸载 `uninstall.sh`、升级 `upgrade.sh` 三个入口；认证检查统一随 pytest 执行。有控制终端时直接 `bash scripts/upgrade.sh` 自动发现本机安装并确认，`bash scripts/uninstall.sh` 按提示选择卸载角色与实例；自动化仍可使用位置参数。安装具名实例使用 `bash scripts/install.sh agent NAME`，连接参数通过终端提示填写。
 

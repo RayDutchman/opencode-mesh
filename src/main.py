@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, asyncio, base64, contextlib, hmac, json, logging, os, platform, random, re, secrets, socket, time
+import argparse, asyncio, base64, contextlib, hmac, json, logging, os, platform, random, re, secrets, signal, socket, sys, time
 from collections import OrderedDict
 import anyio
 from pathlib import Path
@@ -2130,18 +2130,183 @@ def resolve_agent_config(path: str | Path, cfg: dict[str, Any], instance: str | 
     return result
 
 
-def main():
+SUPERVISOR_STOP_GRACE_SECONDS = 5.0
+SUPERVISOR_STOP_TIMEOUT_SECONDS = 30.0
+SUPERVISOR_STOP_CANCEL_SECONDS = 5.0
+# Two different backoffs, deliberately kept apart:
+# - supervisor_backoff_delay() paces restarts of a supervised child process. It is a plain
+#   1, 2, 4 ... ladder capped at 30 seconds, because the thing being retried is this
+#   process's own Agent and the delay only has to stay far enough apart to be useful.
+# - backoff_delay() paces an Agent's own network reconnects. It adds jitter so many devices
+#   do not retry in lockstep against the same Gateway, honours Retry-After, and caps at 60s.
+# Reusing the network backoff here would inject jitter into restart timing and put the
+# supervisor's ceiling at the wrong value.
+SUPERVISOR_BACKOFF_BASE_SECONDS = 1.0
+SUPERVISOR_BACKOFF_CAP_SECONDS = 30.0
+SUPERVISOR_BACKOFF_RESET_SECONDS = 60.0
+
+
+def supervisor_backoff_delay(attempt: int) -> float:
+    """Delay before restart number `attempt`; attempt starts at 1 and the ladder is capped."""
+    base, cap = SUPERVISOR_BACKOFF_BASE_SECONDS, SUPERVISOR_BACKOFF_CAP_SECONDS
+    # Cap the exponent before multiplying: an instance that keeps failing for days would
+    # otherwise overflow 2 ** exponent and take its own supervisor task down with it.
+    if base <= 0 or base >= cap:
+        return cap
+    exponent = max(0, int(attempt) - 1)
+    if exponent >= 64 or base * (2 ** exponent) >= cap:
+        return cap
+    return base * (2 ** exponent)
+
+
+def supervise_agent_instances(path: str | Path) -> list[str]:
+    """Validate every entry of the shared mapping before a single child process is created."""
+    cfg = load_json(path)
+    agents = cfg.get("agents") if isinstance(cfg, dict) else None
+    if not isinstance(agents, dict) or not agents:
+        raise ValueError("--all-instances requires a shared configuration with at least one agent")
+    for name in agents:
+        resolve_agent_config(path, cfg, name)
+    return list(agents)
+
+
+def agent_command(path: str | Path, name: str) -> list[str]:
+    """One child per instance, started through the ordinary single-instance Agent entry point."""
+    return [sys.executable, "-m", "src.main", "--mode", "agent",
+            "--config", str(Path(path).resolve()), "--instance", name]
+
+
+async def _sleep_unless_stopped(stop: asyncio.Event, delay: float) -> bool:
+    """Wait out a restart delay; report whether a stop request ended the wait instead."""
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(stop.wait(), delay)
+        return True
+    return False
+
+
+async def _terminate_child(child: Any) -> None:
+    """Stop one child within a bounded time, escalating to a kill so no Agent outlives the unit."""
+    if child.returncode is not None:
+        await child.wait()
+        return
+    with contextlib.suppress(ProcessLookupError):
+        child.terminate()
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(child.wait()), SUPERVISOR_STOP_GRACE_SECONDS)
+        return
+    with contextlib.suppress(ProcessLookupError):
+        child.kill()
+    await child.wait()
+
+
+async def _supervise_instance(path: str | Path, name: str, stop: asyncio.Event,
+                              children: dict[str, Any]) -> None:
+    """Keep one Agent alive for a single instance, backing off on its own without touching others."""
+    attempt = 0
+    while not stop.is_set():
+        started = time.monotonic()
+        try:
+            child = await asyncio.create_subprocess_exec(*agent_command(path, name))
+        except OSError as exc:
+            print(f"agent supervisor: instance {name} could not start: {exc}", flush=True)
+            attempt += 1
+            if await _sleep_unless_stopped(stop, supervisor_backoff_delay(attempt)):
+                return
+            continue
+        # A stop that arrived while this child was being created still has to reach it.
+        if stop.is_set():
+            await _terminate_child(child)
+            return
+        children[name] = child
+        attempt += 1
+        exited = asyncio.create_task(child.wait())
+        stopping = asyncio.create_task(stop.wait())
+        try:
+            await asyncio.wait({exited, stopping}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stopping.cancel()
+        if not exited.done() or stop.is_set():
+            await _terminate_child(child)
+            return
+        code = exited.result()
+        if children.get(name) is child:
+            del children[name]
+        if time.monotonic() - started >= SUPERVISOR_BACKOFF_RESET_SECONDS:
+            attempt = 1  # it held together long enough to count as healthy again
+        delay = supervisor_backoff_delay(attempt)
+        print(f"agent supervisor: instance {name} exited with code {code}; retry in {delay:.1f}s",
+              flush=True)
+        if await _sleep_unless_stopped(stop, delay):
+            return
+
+
+async def run_agent_supervisor(path: str | Path, instances: list[str], stop: asyncio.Event) -> None:
+    """Supervise every configured instance until a stop is requested, then reclaim all children."""
+    children: dict[str, Any] = {}
+    tasks = [asyncio.create_task(_supervise_instance(path, name, stop, children))
+             for name in instances]
+    try:
+        await stop.wait()
+    finally:
+        stop.set()
+        _, pending = await asyncio.wait(tasks, timeout=SUPERVISOR_STOP_TIMEOUT_SECONDS)
+        # The supervisor owns reclamation: an instance task must never be the only thing that
+        # ends a child. Terminating the survivors together costs one grace period instead of
+        # one per child, which keeps the whole stop inside systemd's default 90 second budget
+        # (30 here, at most 5 to escalate, 5 to reap the cancelled tasks).
+        survivors = [child for child in children.values() if child.returncode is None]
+        if survivors:
+            await asyncio.gather(*(_terminate_child(child) for child in survivors))
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending, timeout=SUPERVISOR_STOP_CANCEL_SECONDS)
+
+
+async def _supervise_until_stopped(path: str | Path, instances: list[str]) -> None:
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for number in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError, ValueError):
+            loop.add_signal_handler(number, stop.set)
+    await run_agent_supervisor(path, instances, stop)
+
+
+def supervise_agents(path: str | Path):
+    """Validate the shared configuration, then supervise every instance until stopped."""
+    return _supervise_until_stopped(path, supervise_agent_instances(path))
+
+
+def build_parser():
+    """Command line surface shared by the Gateway, a single Agent and the shared Agent supervisor."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--mode", choices=["gateway", "agent"], required=True)
-    parser.add_argument("--instance", help="Select an agent from the shared configuration")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--instance", help="Select an agent from the shared configuration")
+    selection.add_argument("--all-instances", action="store_true",
+                           help="Supervise every agent of the shared configuration")
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     cfg = load_json(args.config)
     if args.mode == "gateway":
         if args.instance is not None:
             parser.error("--instance is only supported in agent mode")
+        if args.all_instances:
+            parser.error("--all-instances is only supported in agent mode")
         uvicorn.run(Gateway(cfg).app, **gateway_server_options(cfg))
     else:
+        if args.all_instances:
+            try:
+                supervised = supervise_agents(args.config)
+            except ValueError as exc:
+                parser.error(str(exc))
+            asyncio.run(supervised)
+            return
         try:
             cfg = resolve_agent_config(args.config, cfg, args.instance)
         except ValueError as exc:

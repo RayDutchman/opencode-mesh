@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 
 import pytest
 
@@ -81,3 +82,72 @@ def test_agent_registration_uses_configured_name_and_preserves_identity(tmp_path
     assert captured[0]["device_id"] != captured[1]["device_id"]
     assert captured[0]["device_id"] == captured[2]["device_id"]
     assert json.loads(states[0].read_text())["device_id"] == captured[0]["device_id"]
+
+
+def write_shared_config(tmp_path, cfg):
+    path = tmp_path / "config" / "agents.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cfg))
+    return path
+
+
+def test_per_instance_gateway_override_preserves_shared_config(tmp_path):
+    """An instance may name its own Gateway and enrollment token; the shared values stay defaults."""
+    from src.main import resolve_agent_config
+    cfg = {"gateway_url": "https://mesh-a.example.com", "enroll_token": "token-a",
+           "agents": {"default": {}, "beta": {
+               "gateway_url": "https://mesh-b.example.com", "enroll_token": "token-b"}}}
+    original = json.dumps(cfg)
+    path = tmp_path / "config" / "agents.json"
+    first = resolve_agent_config(path, cfg, "default")
+    second = resolve_agent_config(path, cfg, "beta")
+    assert first["enroll_token"] == "token-a"
+    assert second["gateway_url"] == "https://mesh-b.example.com"
+    assert second["enroll_token"] == "token-b"
+    assert first["state_file"] != second["state_file"]
+    assert json.dumps(cfg) == original
+
+
+def test_cli_recognises_all_instances_on_its_own(tmp_path):
+    """--all-instances is a real flag, not a typo: asking for every instance is parseable on its own."""
+    from src.main import build_parser
+    args = build_parser().parse_args(
+        ["--mode", "agent", "--config", str(tmp_path / "agents.json"), "--all-instances"])
+    assert args.all_instances is True
+    assert args.instance is None
+
+
+def test_cli_rejects_all_instances_next_to_a_named_instance(tmp_path):
+    """Every instance and one named instance contradict each other, so the combination is refused."""
+    from src.main import build_parser
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(
+            ["--mode", "agent", "--config", str(tmp_path / "agents.json"),
+             "--instance", "default", "--all-instances"])
+    assert excinfo.value.code == 2
+
+
+def test_cli_accepts_all_instances_in_gateway_mode(tmp_path):
+    """Gateway mode parses the flag too, so its refusal below is a decision and not an unknown option."""
+    from src.main import build_parser
+    args = build_parser().parse_args(
+        ["--mode", "gateway", "--config", str(tmp_path / "gateway.json"), "--all-instances"])
+    assert args.all_instances is True
+
+
+def test_all_instances_is_rejected_in_gateway_mode(tmp_path, monkeypatch):
+    """The Gateway serves devices and never supervises Agents, so the flag is refused there."""
+    from src.main import main
+    path = write_shared_config(tmp_path, {
+        "gateway_url": "https://mesh-a.example.com", "enroll_token": "token-a",
+        "agents": {"default": {"opencode_url": "http://127.0.0.1:4096"}}})
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the Gateway server must not start for --all-instances")
+
+    monkeypatch.setattr("src.main.uvicorn.run", refuse)
+    monkeypatch.setattr(sys, "argv", ["src.main", "--mode", "gateway",
+                                       "--config", str(path), "--all-instances"])
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+    assert excinfo.value.code == 2
