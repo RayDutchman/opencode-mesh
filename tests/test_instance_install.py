@@ -419,6 +419,48 @@ def test_gateway_install_uses_the_selected_port(tmp_path):
     assert read_json(inst / "config/gateway.json")["listen_port"] == 18443
 
 
+@pytest.mark.parametrize("broken", ["python", "pip", "dependencies"])
+def test_gateway_retry_repairs_runtime_without_overwriting_configuration(tmp_path, broken):
+    fakebin, logs = make_fakebin(tmp_path)
+    source = make_source(tmp_path)
+    inst = tmp_path / "partial"
+    seed_shared_code(inst)
+    (inst / "config").mkdir()
+    config = inst / "config/gateway.json"
+    config.write_text('{"enroll_token":"keep-token","auth":{"password":"keep-password"}}\n')
+    seed_unit(tmp_path, "opencode-mesh-gateway", inst)
+    unit = unit_dir(tmp_path) / "opencode-mesh-gateway.service"
+    config_before, unit_before = config.read_bytes(), unit.read_bytes()
+    python = inst / ".venv/bin/python"
+    marker = tmp_path / "dependencies-installed"
+    if broken == "python":
+        python.unlink()
+    elif broken == "pip":
+        python.write_text("#!/bin/sh\nexit 1\n")
+    else:
+        python.write_text(f'''#!{REAL_PY}
+import sys
+from pathlib import Path
+marker = Path({str(marker)!r})
+if sys.argv[1:4] == ['-m', 'pip', 'install']:
+    if '-e' in sys.argv: marker.touch()
+    sys.exit(0)
+if sys.argv[1:4] == ['-m', 'pip', '--version']: sys.exit(0)
+sys.exit(0 if marker.exists() else 1)
+''')
+    env = base_env(tmp_path, fakebin, logs, MESH_SOURCE_DIR=str(source), MESH_INSTALL_DIR=str(inst),
+                   FAKE_ACTIVE_UNITS="opencode-mesh-gateway.service")
+    result = run_script("install.sh", ["gateway"], env)
+    assert result.returncode == 0, result.stderr
+    assert config.read_bytes() == config_before
+    assert unit.read_bytes() == unit_before
+    assert (inst / "src/SENTINEL").read_text() == "keep-me\n"
+    assert "restart opencode-mesh-gateway.service" in logs["systemctl"].read_text()
+    assert "keep-token" not in result.stdout and "keep-password" not in result.stdout
+    if broken == "dependencies":
+        assert marker.exists()
+
+
 def test_install_gateway_rejects_instance(tmp_path):
     fakebin, logs = make_fakebin(tmp_path)
     source = make_source(tmp_path)

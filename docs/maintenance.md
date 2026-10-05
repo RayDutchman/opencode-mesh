@@ -4,6 +4,13 @@
 
 ## 1. 先确认事实来源
 
+### 安装中断后的虚拟环境修复（2026-10-06）
+
+- 已确认现场：首次缺少 `python3-venv`，补装后重跑留下有 Python 但无 pip、无项目依赖的虚拟环境；Gateway 因缺少 `anyio` 循环退出。旧安装器看到源码目录就跳过整个依赖安装阶段，已有 unit 又阻止进一步重跑。
+- 修正：检查 pip、依赖一致性和 `src.main` 导入；必要时原地重新初始化 venv、安装现有源码声明的依赖，验证失败则中止，不再用 system-site-packages 回退掩盖缺包。已有同目录 Gateway unit 允许修复重跑，保留配置、加入密钥、身份和 unit；不覆盖现有源码，不把修复当成版本升级。URL 提示补充带 HTTPS 的标准/自选端口示例，token 生成和打印时机不变。
+- 验证：全量 pytest **467 passed in 37.70s**；Shell 语法与 `git diff --check` 通过。隔离安装测试覆盖 Python 缺失、pip 缺失、依赖缺失时的恢复，以及原配置和 unit 字节不变、完成后重启 Gateway。
+- 用户要求提交、推送后自行在新 VPS 用原 curl 命令重跑；本轮不远程补依赖、不重启真实 Gateway。真实 curl 安装验收待用户反馈。
+
 ### 统一 Agent 服务成为唯一安装方式（2026-10-05）
 
 - 用户确认取消独立实例 service 安装选项，`--mode agent --config config/agents.json` 默认托管全部实例；移除公开的 `--instance`、`--all-instances` 和安装开关 `MESH_ALL_INSTANCES`。子进程选择只保留隐藏的内部 worker 参数，监督、退避与身份派生不变。旧单元的识别仅用于拒绝混装、升级发现及卸载清理。

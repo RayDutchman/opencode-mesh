@@ -177,6 +177,7 @@ if [[ $# == 2 && ( -z "$INSTANCE" || "$INSTANCE" == default ) ]]; then
 fi
 [[ "$INSTANCE" =~ ^[A-Za-z0-9_-]+$ ]] || { err "invalid instance name"; exit 2; }
 [[ "$MODE" == agent || "$INSTANCE" == default ]] || { err "instances require agent mode"; exit 2; }
+REPAIR_GATEWAY=0
 if [[ "$MODE" == agent ]]; then
   # One unit supervises the whole mapping, so a leftover per-instance unit would manage it twice.
   for unit in "$UNIT_DIR"/opencode-mesh-agent@*.service; do
@@ -189,7 +190,9 @@ if [[ "$MODE" == agent ]]; then
     unit_belongs_here "$UNIT_DIR/opencode-mesh-agent.service" || { err "the existing opencode-mesh-agent.service belongs to another directory; remove it before installing here"; exit 1; }
   fi
 elif [[ -e "$UNIT_DIR/${SERVICE_NAME}.service" ]]; then
-  err "service already installed; edit configuration or use upgrade.sh"; exit 1
+  unit_belongs_here "$UNIT_DIR/${SERVICE_NAME}.service" || { err "service belongs to another directory"; exit 1; }
+  [[ -f "$INSTALL_DIR/config/gateway.json" ]] || { err "existing Gateway configuration is missing; restore it before retrying"; exit 1; }
+  REPAIR_GATEWAY=1
 fi
 # The supervisor reads its instance set once at start-up. Adding one under INSTALL_ONLY
 # would sit in the configuration unused until an unrelated restart, and only then register.
@@ -233,19 +236,42 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 if [ -d "$INSTALL_DIR/src" ]; then
-  [[ -x "$INSTALL_DIR/.venv/bin/python" ]] || { err "incomplete existing installation"; exit 1; }
-  info "reusing existing source and virtual environment"
+  [[ -f "$INSTALL_DIR/pyproject.toml" ]] || { err "existing source is incomplete; restore pyproject.toml before retrying"; exit 1; }
+  info "reusing existing source; checking the Python environment"
 else
 cp -r "$SRC"/src "$SRC"/pyproject.toml "$SRC"/scripts "$INSTALL_DIR"/
-
-if [ ! -d "$INSTALL_DIR/.venv" ]; then
-  info "creating Python virtual environment..."
-  python3 -m venv "$INSTALL_DIR/.venv" 2>/dev/null || python3 -m venv --system-site-packages "$INSTALL_DIR/.venv"
 fi
 
-info "installing dependencies (first run may take a while; aiortc needs a wheel or build)..."
-"$INSTALL_DIR/.venv/bin/python" -m pip install --upgrade pip -q
-"$INSTALL_DIR/.venv/bin/python" -m pip install -e "$INSTALL_DIR" -q
+PYTHON="$INSTALL_DIR/.venv/bin/python"
+if [[ ! -x "$PYTHON" ]] || ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
+  info "creating or repairing the Python virtual environment..."
+  python3 -m venv "$INSTALL_DIR/.venv" || {
+    err "could not initialize venv/pip; install the matching python3-venv package (Debian/Ubuntu: apt install python3-venv), then rerun this installer"
+    exit 1
+  }
+fi
+
+runtime_ready() {
+  "$PYTHON" -m pip --version >/dev/null 2>&1 &&
+    "$PYTHON" -m pip check >/dev/null 2>&1 &&
+    (cd "$INSTALL_DIR" && "$PYTHON" -c 'import src.main') >/dev/null 2>&1
+}
+if ! runtime_ready; then
+  info "installing missing or incomplete dependencies (aiortc needs a wheel or build)..."
+  "$PYTHON" -m pip install --upgrade pip -q
+  "$PYTHON" -m pip install -e "$INSTALL_DIR" -q
+fi
+runtime_ready || { err "Python runtime validation failed; installation is incomplete"; exit 1; }
+
+# A retry repairs dependencies without replacing credentials, configuration or the unit.
+if [[ "$REPAIR_GATEWAY" == 1 ]]; then
+  if [[ "${MESH_INSTALL_ONLY:-0}" != 1 ]]; then
+    $SC_CMD restart "${SERVICE_NAME}.service"
+    $SC_CMD is-active --quiet "${SERVICE_NAME}.service"
+  fi
+  info "Gateway runtime checked/repaired; existing configuration and service unit retained"
+  info "configuration: ${INSTALL_DIR}/config/gateway.json"
+  exit 0
 fi
 
 mkdir -p "$INSTALL_DIR/config" "$INSTALL_DIR/data"
@@ -259,7 +285,7 @@ if [ "$MODE" = "agent" ]; then
   (cd "$INSTALL_DIR" && "$INSTALL_DIR/.venv/bin/python" -c \
     'from src.main import build_parser; build_parser().parse_args(["--mode", "agent", "--config", "config/agents.json", "--agent-instance", "default"])') \
     || { err "installed code predates the unified Agent entry; upgrade it before adding instances"; exit 1; }
-  GATEWAY_URL="$(ask "Gateway public URL (required)" "${MESH_GATEWAY_URL:-}")"
+  GATEWAY_URL="$(ask "Gateway public URL (required, e.g. https://mesh.example.com or https://mesh.example.com:8443)" "${MESH_GATEWAY_URL:-}")"
   require_value "Gateway URL" "$GATEWAY_URL"
   ALLOW_INSECURE=""
   case "$GATEWAY_URL" in
@@ -328,7 +354,7 @@ else
   if [ -z "$ENROLL_TOKEN" ]; then
     ENROLL_TOKEN="$("$INSTALL_DIR/.venv/bin/python" -c 'import secrets;print(secrets.token_urlsafe(32))')"
   fi
-  PUBLIC_URL="$(ask "Gateway public URL (used to print the agent command, optional)" "${MESH_PUBLIC_URL:-}")"
+  PUBLIC_URL="$(ask "Gateway public URL (optional, e.g. https://mesh.example.com or https://mesh.example.com:8443)" "${MESH_PUBLIC_URL:-}")"
   CONFIG_FILE="$INSTALL_DIR/config/gateway.json"
   INSTALL_DIR="$INSTALL_DIR" LISTEN_PORT="$LISTEN_PORT" USERNAME="$USERNAME" PASSWORD="$PASSWORD" ENROLL_TOKEN="$ENROLL_TOKEN" \
     python3 - "$CONFIG_FILE" <<'PY'
@@ -417,7 +443,7 @@ if [ "$MODE" = agent ]; then
 fi
 
 if [ "$MODE" = "gateway" ]; then
-  SHOWN_URL="${PUBLIC_URL:-<your-gateway-url>}"
+  SHOWN_URL="${PUBLIC_URL:-https://mesh.example.com}"
   cat <<INFO
 
 ========================================================================
