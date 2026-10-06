@@ -53,6 +53,29 @@ def backoff_delay(attempt: int, base: float = 1.0, cap: float = 60.0,
     return delay
 
 
+def describe_connection_error(exc: BaseException) -> str:
+    """Render an exception with its cause chain so a transport failure keeps its underlying detail.
+
+    HTTP/TLS failures usually arrive as a wrapper whose own message is empty while the useful
+    text (for example the underlying SSL error) sits on __cause__ or __context__. Reporting
+    only str(exc) hid the real reason in the field, so the chain is flattened here.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        try:
+            message = str(current)
+        except Exception:
+            message = ""
+        rendered = type(current).__name__ + (f": {message}" if message else "")
+        if not parts or parts[-1] != rendered:
+            parts.append(rendered)
+        current = current.__cause__ if current.__cause__ is not None else current.__context__
+    return " <- ".join(parts)
+
+
 def load_json(path: str) -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
         return json.load(f)
@@ -2088,7 +2111,7 @@ class Agent:
             except Exception as exc:
                 attempt += 1
                 delay = backoff_delay(attempt)
-                print(f"agent connection/register retry: {type(exc).__name__}: {exc}; retry in {delay:.1f}s", flush=True)
+                print(f"agent connection/register retry: {describe_connection_error(exc)}; retry in {delay:.1f}s", flush=True)
                 await asyncio.sleep(delay)
 
 

@@ -29,8 +29,8 @@ from pathlib import Path
 import httpx
 import websockets
 
-from src.main import (Agent, Gateway, StreamState, backoff_delay, filter_response_headers,
-                      forwarding_headers, inject_mesh_bar,
+from src.main import (Agent, Gateway, StreamState, backoff_delay, describe_connection_error,
+                      filter_response_headers, forwarding_headers, inject_mesh_bar,
                       parse_retry_after,
                       parse_server_route, rewrite_device_html)
 from src.static_adapter import TRANSPORT_ADAPTER
@@ -744,6 +744,80 @@ def test_backoff_delay_is_bounded_and_respects_retry_after():
     assert parse_retry_after("5") == 5.0
     assert parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT") is None
     assert parse_retry_after(None) is None
+
+
+def test_describe_connection_error_keeps_the_underlying_cause():
+    """A wrapper with an empty message must still reveal the nested transport failure."""
+    try:
+        try:
+            raise OSError("tls handshake reset by middlebox")
+        except OSError as cause:
+            raise httpx.ConnectError("") from cause
+    except httpx.ConnectError as exc:
+        text = describe_connection_error(exc)
+    assert text.startswith("ConnectError")
+    assert "OSError" in text and "tls handshake reset by middlebox" in text
+    assert " <- " in text
+
+
+def test_describe_connection_error_leaves_a_plain_message_unchanged():
+    assert describe_connection_error(httpx.ConnectError("[Errno -2] Name or service not known")) == \
+        "ConnectError: [Errno -2] Name or service not known"
+
+
+def test_describe_connection_error_tolerates_a_cause_cycle():
+    """A malformed or self-referential chain must terminate instead of looping forever."""
+    first, second = ValueError("first"), ValueError("second")
+    first.__cause__ = second
+    second.__context__ = first
+    text = describe_connection_error(first)
+    assert text.count("ValueError") == 2
+
+
+def test_registration_retry_log_reports_the_nested_cause(tmp_path, monkeypatch):
+    """The retry line must carry the underlying reason when the httpx wrapper message is empty."""
+    import contextlib
+    import io
+
+    import src.main as mesh
+
+    class FailingClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+        async def post(self, *args, **kwargs):
+            try:
+                raise OSError("tls handshake reset by middlebox")
+            except OSError as cause:
+                raise httpx.ConnectError("") from cause
+
+    monkeypatch.setattr(mesh.httpx, "AsyncClient", FailingClient)
+    monkeypatch.setattr(mesh, "backoff_delay", lambda *args, **kwargs: 3600.0)
+    agent = Agent({"opencode_url": "http://127.0.0.1:4096",
+                   "gateway_url": "https://mesh.example.com",
+                   "enroll_token": "enroll-token",
+                   "state_file": str(tmp_path / "agent-state.json")})
+    output = io.StringIO()
+
+    async def scenario():
+        task = asyncio.create_task(agent.run())
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    with contextlib.redirect_stdout(output):
+        asyncio.run(scenario())
+    line = next(line for line in output.getvalue().splitlines()
+                if "connection/register retry" in line)
+    assert "ConnectError" in line
+    assert "OSError" in line and "tls handshake reset by middlebox" in line
 
 
 def test_register_rotates_token_with_valid_enroll_token(tmp_path):
