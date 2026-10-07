@@ -116,6 +116,10 @@ def test_transport_manifest_and_p2p_offer_use_the_freshness_criterion():
                 fresh = (await client.get('/_mesh/transport-manifest', params={'device': 'fresh-b'})).json()
                 assert stale['device_id'] == 'stale-a' and stale['p2p']['enabled'] is False
                 assert fresh['device_id'] == 'fresh-b' and fresh['p2p']['enabled'] is True
+                # An offline device must stay distinguishable from the administrative
+                # switch: both report enabled=false, only the switch reports disabled=true.
+                assert stale['p2p']['disabled'] is False
+                assert fresh['p2p']['disabled'] is False
                 assert fresh['server_url'] == 'http://test/_mesh/device/fresh-b'
                 # A stale device is refused before any signaling is forwarded; no close logic is added.
                 refused = await client.post('/_mesh/p2p/offer', json={'device_id': 'stale-a'})

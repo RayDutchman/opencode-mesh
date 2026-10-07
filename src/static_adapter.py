@@ -1236,6 +1236,9 @@ TRANSPORT_ADAPTER = r"""
       // stay on Relay without negotiating, and resolve instead of throwing so no
       // reconnect is scheduled. A merely unavailable device (enabled=false) keeps
       // the original retry behaviour below.
+      // `state.p2pDisabled` mirrors the last manifest for observation and tests; the
+      // decision below uses this local value, because a device switch re-reads it
+      // here rather than when reconnectForDevice clears state.manifest.
       state.p2pDisabled = Boolean(manifest.p2p && manifest.p2p.disabled);
       if (state.p2pDisabled) return dispose();
       if (!manifest.p2p || !manifest.p2p.enabled || !window.RTCPeerConnection) throw new Error('p2p unavailable');

@@ -278,6 +278,14 @@ def test_administratively_disabled_p2p_stays_on_relay_without_reconnecting():
   advance(120000); await tick(); await tick();
   assert.equal(manifestFetches.length, 1, 'the disabled switch does not loop on the manifest');
   assert.equal(s.reconnectTimer, null, 'still no reconnect after two minutes');
+  // A network hint may re-check the manifest, but it must not build anything nor loop.
+  fireOnline(); advance(300); await tick(); await tick();
+  assert.equal(pcs.length, 0, 'a hint does not negotiate while disabled');
+  assert.equal(s.channel, null, 'a hint does not open a channel while disabled');
+  assert.equal(s.reconnectTimer, null, 'a hint does not schedule a reconnect while disabled');
+  const afterHint = manifestFetches.length;
+  advance(120000); await tick();
+  assert.equal(manifestFetches.length, afterHint, 'the hint path does not loop either');
   await nativeFetchProbe();
   async function nativeFetchProbe() {
     const before = global.fetchCalls.length;
@@ -289,6 +297,37 @@ def test_administratively_disabled_p2p_stays_on_relay_without_reconnecting():
 })().then(() => { completed = true; }).catch(e => { completed = true; console.error(e); process.exitCode = 1; });
 """
     run_adapter(HARNESS_WITH_CONN_JS, "global.MANIFEST_BEHAVIOR = 'p2p-admin-disabled';", body)
+
+
+def test_switching_from_a_disabled_to_an_enabled_device_negotiates_again():
+    """The switch is read per manifest, not sticky: moving to a device with P2P enabled
+    must negotiate normally after leaving a disabled one."""
+    preamble = r"""
+storage.set('opencode.global.dat:server', JSON.stringify({ list: [
+  { type: 'http', displayName: 'A', http: { url: 'https://mesh.test/_mesh/device/device-a' } },
+  { type: 'http', displayName: 'B', http: { url: 'https://mesh.test/_mesh/device/device-b' } },
+] }));
+storage.set('opencode.global.dat:layout',
+  JSON.stringify({ home: { selection: { server: 'https://mesh.test/_mesh/device/device-a' } } }));
+global.MANIFEST_BEHAVIOR = 'p2p-admin-disabled';
+"""
+    body = FINISHER + r"""
+  const s = window.__ocmTransport;
+  await tick(); await tick(); await tick();
+  assert.equal(s.p2pDisabled, true, 'device-a is administratively disabled');
+  assert.equal(pcs.length, 0, 'no peer connection for the disabled device');
+  storage.set('opencode.global.dat:layout',
+    JSON.stringify({ home: { selection: { server: 'https://mesh.test/_mesh/device/device-b' } } }));
+  global.MANIFEST_BEHAVIOR = 'ok';
+  history.pushState(null, '', '/other');
+  await tick(); await tick(); await tick();
+  assert.equal(manifestFetches.length, 2, 'device-b attempt started');
+  assert.ok(manifestFetches[1].url.includes('device=device-b'), 'the fresh attempt targets device-b');
+  assert.equal(s.p2pDisabled, false, 'the switch is re-read from the new manifest');
+  assert.equal(pcs.length, 1, 'device-b negotiates normally');
+})().then(() => { completed = true; }).catch(e => { completed = true; console.error(e); process.exitCode = 1; });
+"""
+    run_adapter(HARNESS_WITH_CONN_JS, preamble, body)
 
 
 def test_open_p2p_is_not_torn_down_by_network_hint():
