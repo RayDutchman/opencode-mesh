@@ -4,6 +4,14 @@
 
 ## 1. 先确认事实来源
 
+### P2P 总开关与久置发送故障的定位（2026-10-07，Relay-only 现场结果待最终定论）
+
+- **背景**：此前记录的“久置后新消息发送阻塞”一直没有定位到根因（见下文 2026-10-04 条目）。为了判定是否只与 P2P 有关，新增 Gateway 配置 `p2p_enabled`（默认 `true`）。
+- **实现**：`p2p_enabled=false` 时 `/_mesh/transport-manifest` 返回 `p2p.disabled=true`、`enabled=false`，`/_mesh/p2p/offer` 返回 409；浏览器适配层把“管理侧关闭”当作稳定 Relay 终态，不建数据通道、不排重连（与设备离线的 `enabled=false` 区分）。见 `src/main.py`、`src/static_adapter.py`；回归见 `tests/test_v2_offline_page.py` 与 `tests/test_v2_reconnect_network.py`。
+- **现场状态**：Gateway `8.138.155.107:/opt/opencode-mesh` 运行提交 `7e2b356`，`config/gateway.json` 已设 `p2p_enabled: false`，服务 active，manifest 为 `disabled=true`，offer 409。**这是本地运行态改动，不在仓库里**；恢复 P2P 需把该键改回 `true`（或删除）并重启 Gateway。
+- **用户观察（初步，未最终定论）**：切换到 Relay-only 后连续使用数小时，此前反复出现的“发送不出去消息”没有再出现。这是用户的现场反馈，不是受控实验；在明确结论前不要据此宣称故障已根治，也不要把 P2P 写成长期不可用。
+- **下一步**：继续观察；若确认，更新本条为结论并决定默认策略；同时把 README 与 docs 的说明补齐（README 已加指向，部署/架构/协议已记录该开关）。
+
 ### 单台设备持续连接失败：公网路径重置 TLS 握手（2026-10-06，已切换客户端 TLS 环境绕过）
 
 - **现象**：一台设备的 Agent 持续输出 `connection/register retry`，重启服务与升级到最新版均无效。

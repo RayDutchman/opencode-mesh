@@ -72,6 +72,7 @@ P2P 上所有浏览器请求、响应 body、流数据和 WebSocket 控制/数�
 - SSE 通过 fetch 响应流转发首帧状态、响应头及原始数据顺序，并传播取消。事件解析与业务重连由 V2 SDK 负责；Mesh 不模拟 EventSource，也不自行承诺 `Last-Event-ID` 重连策略。
 - 每个 WebSocket bridge 的转发队列默认最多 128 帧、4 MiB，预算包含已入队和正在发送的帧；生产者不等待共享接收循环，溢出产生显式 `ws_error` 并终止桥接，而不静默丢帧。单个 bridge 的发送保持串行；文本和二进制帧均保持原始内容，subprotocol 和关闭码透传。
 - P2P 不可用或协商失败时，单个请求可以回退 Relay，不应让旧设备的 P2P 状态污染当前设备。
+- Gateway 可用 `p2p_enabled=false` 关闭 P2P：`/_mesh/transport-manifest` 报 `p2p.disabled=true`、`p2p.enabled=false`，浏览器保持 Relay 且不进入重连退避（与 `enabled=false` 的设备离线态不同），`/_mesh/p2p/offer` 返回 409。该字段是 manifest 的一部分，属传输选择契约。
 - 带副作用的请求不因 P2P/Relay 切换自动重复提交，除非上层明确允许重试。
 
 ## 错误与清理
