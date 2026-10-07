@@ -112,6 +112,7 @@ global.fetch = (input, init = {}) => {
     if (behavior === 'fail') rec.resolve({ ok: false, status: 503, json: async () => ({}) });
     const deviceId = (url.match(/[?&]device=([^&]+)/) || [, 'device-a'])[1];
     if (behavior === 'p2p-disabled') rec.resolve({ ok: true, json: async () => ({ device_id: deviceId, p2p: { enabled: false }, stun_servers: [] }) });
+    if (behavior === 'p2p-admin-disabled') rec.resolve({ ok: true, json: async () => ({ device_id: deviceId, p2p: { enabled: false, disabled: true, offer: '/_mesh/offers/' + manifestFetches.length }, stun_servers: [] }) });
     if (behavior === 'ok') rec.resolve({ ok: true, json: async () => ({ device_id: deviceId, p2p: { enabled: true, offer: '/_mesh/offers/' + manifestFetches.length }, stun_servers: [] }) });
     if (behavior === 'ok-hang') rec.resolve({ ok: true, json: async () => ({ device_id: deviceId, p2p: { enabled: true, offer: '/_mesh/offers-hang/' + manifestFetches.length }, stun_servers: [] }) });
     return p;
@@ -260,6 +261,34 @@ def test_stale_negotiation_abort_never_pollutes_new_attempt():
 })().then(() => { completed = true; }).catch(e => { completed = true; console.error(e); process.exitCode = 1; });
 """
     run_adapter(HARNESS_WITH_CONN_JS, "global.MANIFEST_BEHAVIOR = 'p2p-disabled';", body)
+
+
+def test_administratively_disabled_p2p_stays_on_relay_without_reconnecting():
+    """p2p.disabled is a switch, not an outage: no peer connection, no channel and no
+    backoff, so the page settles on Relay instead of retrying forever."""
+    body = FINISHER + r"""
+  const s = window.__ocmTransport;
+  await s.ready.catch(() => {});
+  await tick();
+  assert.equal(s.p2pDisabled, true, 'the switch is recorded from the manifest');
+  assert.equal(pcs.length, 0, 'no peer connection is created');
+  assert.equal(createdChannels.length, 0, 'no data channel is opened');
+  assert.equal(s.channel, null, 'the transport has no P2P channel');
+  assert.equal(s.reconnectTimer, null, 'no reconnect is scheduled');
+  advance(120000); await tick(); await tick();
+  assert.equal(manifestFetches.length, 1, 'the disabled switch does not loop on the manifest');
+  assert.equal(s.reconnectTimer, null, 'still no reconnect after two minutes');
+  await nativeFetchProbe();
+  async function nativeFetchProbe() {
+    const before = global.fetchCalls.length;
+    await window.fetch('https://mesh.test/api/info');
+    await tick();
+    assert.equal(global.fetchCalls.length, before + 1, 'the request reached the Relay fetch path');
+    assert.equal(s.channel, null);
+  }
+})().then(() => { completed = true; }).catch(e => { completed = true; console.error(e); process.exitCode = 1; });
+"""
+    run_adapter(HARNESS_WITH_CONN_JS, "global.MANIFEST_BEHAVIOR = 'p2p-admin-disabled';", body)
 
 
 def test_open_p2p_is_not_torn_down_by_network_hint():

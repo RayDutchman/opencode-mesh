@@ -73,7 +73,7 @@ TRANSPORT_ADAPTER = r"""
   const DEVICE_SNAPSHOT_TTL_MS = 15000;
   const OFFLINE_BODY_ERROR = 'Specified device offline or not found';
 
-  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), incoming: new Map(), incomingBytes: 0, incomingTombstones: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, networkTimer: null, lastNetworkAttempt: null, lastAttemptTime: null, activeController: null, isInitialAttempt: false, devices: [], defaultDevice: null, deviceSnapshotAt: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null, p2pSendTail: Promise.resolve(), probing: false, probe: null, transportStarted: false, handoffPending: !!rootHandoffDevice };
+  const state = { manifest: null, pc: null, channel: null, ready: null, pending: new Map(), streams: new Map(), sockets: new Map(), incoming: new Map(), incomingBytes: 0, incomingTombstones: new Map(), closed: false, deviceId: null, routeDeviceId: undefined, generation: 0, reconnectTimer: null, reconnectDelay: 1000, networkTimer: null, lastNetworkAttempt: null, lastAttemptTime: null, activeController: null, isInitialAttempt: false, devices: [], defaultDevice: null, deviceSnapshotAt: null, rtt: null, pingSent: null, pingTimer: null, relayRtt: null, p2pSendTail: Promise.resolve(), probing: false, probe: null, transportStarted: false, handoffPending: !!rootHandoffDevice, p2pDisabled: false };
 
   // Single source for the bar height. The bar, the app box fallback and the
   // script that measures the visible area all read it, so changing the bar can
@@ -1232,6 +1232,12 @@ TRANSPORT_ADAPTER = r"""
       // The server picks the default device when no explicit route was known;
       // keep the route in sync so periodic re-checks do not treat it as a switch.
       state.routeDeviceId = deviceId || manifest.device_id || state.routeDeviceId;
+      // An administrative switch (p2p_enabled=false) is not a transient outage:
+      // stay on Relay without negotiating, and resolve instead of throwing so no
+      // reconnect is scheduled. A merely unavailable device (enabled=false) keeps
+      // the original retry behaviour below.
+      state.p2pDisabled = Boolean(manifest.p2p && manifest.p2p.disabled);
+      if (state.p2pDisabled) return dispose();
       if (!manifest.p2p || !manifest.p2p.enabled || !window.RTCPeerConnection) throw new Error('p2p unavailable');
       pc = new RTCPeerConnection({ iceServers: (manifest.stun_servers || []).map(urls => ({ urls })) });
       const channel = pc.createDataChannel('opencode-mesh', { ordered: true });

@@ -66,6 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 - `device_name` 只影响显示名，不是身份。默认实例状态为 `data/agent-state.json`，具名实例为 `data/agent-state-<name>.json`；统一配置不接受 `state_file`。
 - `listen_host`、`listen_port` 仅属于 Gateway；Agent 连接 `opencode_url`，不监听该端口。旧 `agent.json` 须按下文迁移为 `agents.json`。
 - `p2p_loopback_candidate` 默认 true，可让同机或宿主机浏览器尝试通过 loopback 建立 P2P。
+- `p2p_enabled` 默认 true，是 Gateway 侧的 P2P 总开关。设为 false 后下发的 manifest 标记 `p2p.disabled`：浏览器不再协商数据通道，全部业务请求走 Relay，且不会因为“关闭”而进入重连循环；`/_mesh/p2p/offer` 同时被拒绝。用于排查“仅 P2P 出问题”的故障。**改动需重启 Gateway，已打开的页面要刷新**；已建立的旧通道在页面刷新前仍然有效。
 
 普通配置修改后重启对应服务，不需要 `daemon-reload`：
 

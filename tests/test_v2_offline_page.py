@@ -126,6 +126,49 @@ def test_transport_manifest_and_p2p_offer_use_the_freshness_criterion():
     asyncio.run(scenario())
 
 
+def test_p2p_manifest_is_enabled_and_not_disabled_by_default():
+    async def scenario():
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = _gateway(Path(directory) / 'registry.json')
+            now = time.time()
+            gateway.registry.devices = {
+                'fresh-b': {'device_id': 'fresh-b', 'name': 'Fresh B', 'ws': object(), 'last_seen': now},
+            }
+            transport = httpx.ASGITransport(app=gateway.app)
+            async with httpx.AsyncClient(transport=transport, base_url='http://test',
+                                         auth=('test', 'test-pass')) as client:
+                manifest = (await client.get('/_mesh/transport-manifest',
+                                             params={'device': 'fresh-b'})).json()
+                assert manifest['p2p']['enabled'] is True
+                assert manifest['p2p']['disabled'] is False
+    asyncio.run(scenario())
+
+
+def test_p2p_disabled_configuration_switches_off_the_manifest_and_offers():
+    """p2p_enabled=false is an administrative switch: the manifest reports disabled and
+    an already-open page cannot rebuild a channel, while Relay keeps serving requests."""
+    async def scenario():
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = Gateway({'state_file': str(Path(directory) / 'registry.json'),
+                               'auth': {'username': 'test', 'password': 'test-pass'},
+                               'p2p_enabled': False})
+            now = time.time()
+            gateway.registry.devices = {
+                'fresh-b': {'device_id': 'fresh-b', 'name': 'Fresh B', 'ws': object(), 'last_seen': now},
+            }
+            transport = httpx.ASGITransport(app=gateway.app)
+            async with httpx.AsyncClient(transport=transport, base_url='http://test',
+                                         auth=('test', 'test-pass')) as client:
+                manifest = (await client.get('/_mesh/transport-manifest',
+                                             params={'device': 'fresh-b'})).json()
+                assert manifest['p2p']['disabled'] is True
+                assert manifest['p2p']['enabled'] is False
+                refused = await client.post('/_mesh/p2p/offer', json={'device_id': 'fresh-b'})
+                assert refused.status_code == 409
+                assert refused.json()['error'] == 'P2P disabled'
+    asyncio.run(scenario())
+
+
 # ---------- browser WebSocket gate uses the same freshness criterion ----------
 #
 # A browser link to an explicit device must use exactly the criterion the list

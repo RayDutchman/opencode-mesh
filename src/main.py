@@ -830,6 +830,10 @@ class Gateway:
 
         @app.get("/_mesh/transport-manifest")
         async def transport_manifest(req: Request):
+            # `p2p_enabled=false` is an administrative switch, not a transient outage: the
+            # manifest reports it separately so the browser stays on Relay instead of
+            # treating it as an unavailable device and retrying forever.
+            p2p_disabled = not bool(self.cfg.get("p2p_enabled", True))
             device_id = req.query_params.get("device") or self.cfg.get("default_device") or ""
             device = self.registry.devices.get(str(device_id)) if device_id else None
             if not device:
@@ -842,13 +846,19 @@ class Gateway:
                 "server_url": f"{str(req.base_url).rstrip('/')}/_mesh/device/{quote(str(device_id), safe='')}" if device_id else None,
                 "relay": str(req.base_url).rstrip("/"),
                 "lan": self.cfg.get("lan_base_url"),
-                "p2p": {"enabled": bool(device and self.is_online(device)), "offer": "/_mesh/p2p/offer"},
+                "p2p": {"enabled": bool(device and self.is_online(device)) and not p2p_disabled,
+                        "disabled": p2p_disabled,
+                        "offer": "/_mesh/p2p/offer"},
                 "stun_servers": self.cfg.get("stun_servers") or DEFAULT_STUN_SERVERS,
                 "capabilities": {"http": True, "sse": True, "websocket": True, "pty": True},
             }
 
         @app.post("/_mesh/p2p/offer")
         async def p2p_offer(req: Request):
+            # Refuse signaling while P2P is administratively off so an already-open page
+            # cannot rebuild a channel after the switch is flipped.
+            if not self.cfg.get("p2p_enabled", True):
+                return JSONResponse({"error": "P2P disabled"}, status_code=409)
             client_ip = req.client.host if req.client else "unknown"
             if not self.allow_rate(self.register_attempts, f"p2p:{client_ip}", 20):
                 return JSONResponse({"error": "too many P2P offers"}, status_code=429)
