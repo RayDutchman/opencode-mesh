@@ -4,10 +4,19 @@
 
 ## 1. 先确认事实来源
 
+### PWA 历史差异核查与原版图标恢复（2026-10-08）
+
+- **范围**：按用户要求对比 `7271cb7` 与 `1afe763`，恢复原版图标后结束本轮；安装失败根因仍未确定。
+- **历史纠正**：首次记录真机安装成功的 `7271cb7` 提交于 10-03 17:34，`216f2e6` 提交于同日 20:36，后者不能作为成功时运行版本的证据。成功记录当时文档称 `91cd283` 已部署，但缺少该时点独立的运行 revision 核验。
+- **差异结果**：manifest 仅 `short_name` 从 `Mesh` 改为 `OpenCode Mesh`；两个图标已替换；SW 响应仅首行版本从 `0.3.2` 变为 `0.3.3`，逻辑未改。HTML 链接扫描的行偏移计算做过优化，PWA 规范化规则未变。认证、匿名图标白名单、PWA 资源路由与设备 HTML 重写入口未变。其他改动涉及状态栏、P2P 和 Agent 管理；未发现能据此确定安装失败根因的证据，回退仍失败也不能排除代码或运行环境。
+- **图标修正**：`1afe763` 曾将上游透明圆角填成不透明 RGB，造成与原版的字节及透明度差异。本轮恢复 `ce1255c` 的原样 PNG；已直接读取运行中的原版 `/site.webmanifest` 及其两个图标，SHA-256 与恢复文件完全一致。真实上游源码路径和哈希见 `src/assets/pwa/README.md`。
+- **验证状态**：已先更新既有哈希/透明度测试，确认填充版出现 2 项预期失败；恢复后全量 `python -m pytest -q -p no:cacheprovider -W error::DeprecationWarning -rs --tb=short` 为 **484 passed in 34.87s**，`git diff --check` 通过。
+- **边界/剩余项**：本轮修正尚未提交或部署；真机安装与启动器最终显示未验证。保留 Mesh 的 `any maskable` 声明，平台裁切效果不由字节一致性保证。按用户要求到此收束，后续发布依据授权执行。
+
 ### PWA 名称/图标与离线注册清理（2026-10-08）
 
 - **PWA 应用名**：用户报告安装后启动器显示 `Mesh`。根因是 manifest 的 `short_name` 为 `Mesh`（`name` 才是 `OpenCode Mesh`），部分启动器取 `short_name`。已把 `short_name` 与 `name` 统一为 `OpenCode Mesh`；manifest 测试新增两条断言。
-- **PWA 图标**：用户报告安装图标与原版不同。根因是仓库用的是上游 **v2.0.18 的标签页 favicon**（`favicon-v3.svg`）栅格化的小 logo，而上游现在用于安装的是一套 `packages/ui/public/icons/prod/web-app-manifest-*.png`（圆角深色方块 + 立体标志）。已按用户确认的方案 1，把上游这套 192/512 图标**原样放进** `src/assets/pwa/`（Gateway 自己托管，安装不依赖 Agent 在线），删除不再使用的 `favicon-v3-2.0.18.svg`，并更新 `src/assets/pwa/README.md`、`tests/test_v2_pwa.py` 的哈希与几何断言（透明圆角、不透明中心、声明尺寸）。
+- **PWA 图标**：用户报告安装图标与原版不同。仓库此前使用上游 **v2.0.18 的标签页 favicon**（`favicon-v3.svg`）栅格化的小 logo，而上游安装图标来自 `packages/desktop/icons/prod/`，构建后发布为 `/icons/prod/web-app-manifest-*.png`（圆角深色方块 + 立体标志）。已按用户确认的方案 1，把上游这套 192/512 图标原样放进 `src/assets/pwa/`（Gateway 自己托管，安装不依赖 Agent 在线），删除不再使用的 `favicon-v3-2.0.18.svg`，并更新来源、哈希与几何断言。后续填充及恢复见上节。
 - **离线注册清理**：此前 Gateway 只在显式 `DELETE /_mesh/deregister/{id}` 时删除设备；Agent 离线后条目与令牌永久保留。新增 `Registry.prune_stale(now, ttl)` 与 `Gateway.device_sweep()` 后台任务：每小时清理“离线且最近活动（`last_seen` 或注册时间 `updated_at`）超过 TTL”的注册并持久化；在线设备永不清理。阈值配置 `device_offline_ttl_seconds` 默认 `86400`，`0`/负值关闭。清理只影响注册与令牌，设备重新上线用同一 `device_id` 重建。
 - **未验证**：以上均未部署、未在真机验收；PWA 名称/图标需在真机重新安装或刷新 manifest 后确认，TTL 清理需在 Gateway 运行观察。
 - **验证**：全量 pytest **484 passed**；`git diff --check` 通过。

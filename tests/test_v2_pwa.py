@@ -29,12 +29,12 @@ from src.frontend import (PWA_ICON_DIR, PWA_ICON_SIZES, PWA_LINK_BLOCK, PWA_MANI
 from src.main import Gateway, OFFLINE_PAGE, rewrite_device_html
 
 # Provenance of the launcher icons, recorded in src/assets/pwa/README.md.
-# Upstream source: packages/ui/public/icons/prod/web-app-manifest-*.png @
-# anomalyco/opencode (MIT, Copyright (c) 2025 opencode); the transparent corners
-# are edge-filled so the committed icons are opaque RGB, as a maskable icon must be.
+# Upstream source: packages/desktop/icons/prod/ in anomalyco/opencode v2.0.18
+# (MIT, Copyright (c) 2025 opencode). Preserve the original PNG bytes, including
+# alpha, as served by the upstream /site.webmanifest icon URLs.
 ICON_SHA256 = {
-    192: '6dee7f9abbcf1dec1393dccb98ccac8b33dc249c05b9dc969f7e09c0b3e2b843',
-    512: '4e887d25a349305165a108ec63c3faed4c67567fc54af9ea2b56a7364f2e20b9',
+    192: 'a2aedd1def885e3b7d7adc7668725c3772996f1699c4524252f752f55707101b',
+    512: '324bd6ab9499f006519209eaa883519f37b9373a59d6eb01235189d4ac67ea27',
 }
 
 # Upstream v2.0.18 packages/app/index.html head, reduced to the link tags Mesh replaces.
@@ -246,15 +246,8 @@ def test_icons_are_served_from_gateway_bytes_with_recorded_hashes(tmp_path):
     assert 'Copyright (c) 2025 opencode' in (PWA_ICON_DIR / 'LICENSE-OpenCode.txt').read_text()
 
 
-def test_icons_are_opaque_full_bleed_pngs(tmp_path):
-    """``purpose="any maskable"`` requires an opaque, full-bleed icon.
-
-    A transparent background is masked to black on Android, so the committed
-    icons must be 8-bit RGB with no alpha channel and a non-blank canvas. The
-    upstream ``prod`` artwork ships with transparent rounded corners; the
-    committed copies edge-fill those corners, which is why their hashes differ
-    from the upstream files.
-    """
+def test_icons_preserve_upstream_transparency(tmp_path):
+    """Filling the upstream corners changes the visible launcher artwork."""
     async def scenario():
         gateway = _gateway(tmp_path / 'registry.json')
         async with _client(gateway) as client:
@@ -263,11 +256,11 @@ def test_icons_are_opaque_full_bleed_pngs(tmp_path):
 
     for size, body in icons.items():
         width, height, pixels, channels = _decode_png(body)
-        assert channels == 3, 'the icons must be opaque RGB, without an alpha channel'
+        assert channels == 4, 'preserve the upstream alpha channel'
         assert (width, height) == (size, size)
-        sampled = [pixels[i] for i in range(0, len(pixels), 997)]
-        assert min(sampled) < 60, 'the artwork must keep its dark background'
-        assert max(sampled) > 150, 'the artwork must not be a blank canvas'
+        for x, y in ((0, 0), (size - 1, 0), (0, size - 1), (size - 1, size - 1)):
+            assert pixels[(y * width + x) * channels + 3] == 0
+        assert pixels[((size // 2) * width + size // 2) * channels + 3] == 255
 
 
 def test_missing_icon_files_fail_at_startup(tmp_path, monkeypatch):

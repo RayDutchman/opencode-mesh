@@ -328,7 +328,7 @@ PWA 由 Gateway 单独提供，不随所服务的设备变化，也不依赖任�
 
 manifest 的 `id` 与同源的旧原生应用（`id` 为 `/`）分开：浏览器按「源 + id」识别已安装应用，复用 `/` 会把两次安装合并成一个启动器条目，名称与图标随最后一次写入而变。`id` 只是身份标识，不要求可导航；`start_url` 与 `scope` 保持 `/`，应用仍从网关根打开。
 
-Service Worker 脚本只有 `install`（`skipWaiting`）与 `activate`（`clients.claim`）两个监听器，没有 `fetch` 处理函数，也不读写 CacheStorage。它与上游 `/sw.js` 同 URL、同根 scope，因此注册即接管；旧 Workbox precache 不再被使用，但 Mesh 不枚举、不删除任何 CacheStorage 条目。脚本内嵌 `src.__version__` 作为首行注释，浏览器比较字节后才决定是否安装新 worker。递增 `src.__version__` 会改变这些字节；注意 `scripts/upgrade.sh` 按 revision 而非版本号放行部署，同一版本下可发多次，因此改动该脚本必须同提交递增版本号，规则见 [maintenance.md §5](./maintenance.md#发布前必查service-worker-的字节契约)。图标由上游 v2.0.18 `favicon-v3.svg` 派生，来源、工具版本与哈希记录在 `src/assets/pwa/README.md`；缺少图标文件时 Gateway 启动即报错。
+Service Worker 脚本只有 `install`（`skipWaiting`）与 `activate`（`clients.claim`）两个监听器，没有 `fetch` 处理函数，也不读写 CacheStorage。它与上游 `/sw.js` 同 URL、同根 scope，因此注册即接管；旧 Workbox precache 不再被使用，但 Mesh 不枚举、不删除任何 CacheStorage 条目。脚本内嵌 `src.__version__` 作为首行注释，浏览器比较字节后才决定是否安装新 worker。递增 `src.__version__` 会改变这些字节；注意 `scripts/upgrade.sh` 按 revision 而非版本号放行部署，同一版本下可发多次，因此改动该脚本必须同提交递增版本号，规则见 [maintenance.md §5](./maintenance.md#发布前必查service-worker-的字节契约)。图标原样取自上游 v2.0.18 的 `packages/desktop/icons/prod/`，保留透明圆角，不重新栅格化或填充；来源及哈希记录在 `src/assets/pwa/README.md`，缺少图标文件时 Gateway 启动即报错。
 
 HTML 改写（`rewrite_device_html`）先做 PWA 规范化：删除所有 `rel="manifest"`、`rel="icon"`、`rel="apple-touch-icon"` 链接，再在 `</head>` 前插入唯一一组网关链接，其中 manifest 带 `crossorigin="use-credentials"`——manifest 走 Basic Auth，缺少该属性时浏览器不会随请求发送凭据。`og:image` 等设备语义属性不改指。规范化是幂等的，缺标签或没有 `</head>` 的片段都只追加、不报错。恢复页（`OFFLINE_PAGE`）带同一组链接并内联注册 `/sw.js`，继续保持 `no-store`。
 
