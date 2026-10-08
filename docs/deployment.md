@@ -66,6 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/RayDutchman/opencode-mesh/main/scri
 - `device_name` 只影响显示名，不是身份。默认实例状态为 `data/agent-state.json`，具名实例为 `data/agent-state-<name>.json`；统一配置不接受 `state_file`。
 - `listen_host`、`listen_port` 仅属于 Gateway；Agent 连接 `opencode_url`，不监听该端口。旧 `agent.json` 须按下文迁移为 `agents.json`。
 - `p2p_loopback_candidate` 默认 true，可让同机或宿主机浏览器尝试通过 loopback 建立 P2P。
+- `device_offline_ttl_seconds` 默认 `86400`（1 天）：Gateway 每小时清理一次“离线且最近活动超过该时长”的设备注册，包含只注册过、从未连上的条目；在线设备永不清理，`0` 或负值关闭清理。清理只删除注册与令牌，设备再次上线会用同一 `device_id` 重新注册。
 - `p2p_enabled` 默认 true，是 Gateway 侧的 P2P 总开关。设为 false 后下发的 manifest 标记 `p2p.disabled`：浏览器不再协商数据通道，新请求走 Relay，且不会因为“关闭”而进入重连循环；`/_mesh/p2p/offer` 同时被拒绝。用于排查“仅 P2P 出问题”的故障。**改动需重启 Gateway，并刷新页面**：已建立的旧通道在刷新前仍然有效；仍加载旧版适配器的页面（无从识别 `disabled`）会按“设备不可用”退避重试，刷新后即停止。
 
 普通配置修改后重启对应服务，不需要 `daemon-reload`：

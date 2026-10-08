@@ -183,6 +183,18 @@ def device_online(device: dict[str, Any] | None, stale_after: float = 45) -> boo
     return not last_seen or (time.time() - float(last_seen)) <= stale_after
 
 
+DEVICE_SWEEP_INTERVAL_SECONDS = 3600.0
+DEFAULT_DEVICE_OFFLINE_TTL_SECONDS = 86400.0
+
+
+def device_offline_ttl_seconds(cfg: dict[str, Any]) -> float:
+    """Seconds an offline registration is kept before pruning; <= 0 disables pruning."""
+    try:
+        return float(cfg.get("device_offline_ttl_seconds", DEFAULT_DEVICE_OFFLINE_TTL_SECONDS))
+    except (TypeError, ValueError):
+        return DEFAULT_DEVICE_OFFLINE_TTL_SECONDS
+
+
 DEFAULT_STUN_SERVERS = ["stun:stun.l.google.com:19302"]
 
 OFFLINE_PAGE = """<!doctype html>
@@ -369,6 +381,32 @@ class Registry:
                    for key, value in self.devices.items()}
         private_json(self.path, {"devices": devices})
 
+    def last_activity(self, device: dict[str, Any]) -> float | None:
+        """Most recent wall-clock stamp for a device: its last heartbeat or its registration."""
+        stamps = [float(v) for v in (device.get("last_seen"), device.get("updated_at"))
+                  if type(v) in (int, float)]
+        return max(stamps) if stamps else None
+
+    def prune_stale(self, now: float, ttl: float) -> list[str]:
+        """Remove registrations that have been offline longer than ``ttl`` seconds.
+
+        An online device is never removed. ``ttl <= 0`` disables pruning. A device
+        that registered but never connected falls back to its ``updated_at`` stamp.
+        """
+        if ttl <= 0:
+            return []
+        removed = []
+        for device_id, device in list(self.devices.items()):
+            if device_online(device):
+                continue
+            last = self.last_activity(device)
+            if last is None or now - last >= ttl:
+                removed.append(device_id)
+                del self.devices[device_id]
+        if removed:
+            self.save()
+        return removed
+
     def public(self):
         result = []
         for d in self.devices.values():
@@ -535,9 +573,13 @@ class Gateway:
         min_status = access_log_status_min(self.cfg)
         if min_status is not None:
             install_access_log_filter(min_status)
+        sweep = asyncio.create_task(self.device_sweep())
         try:
             yield
         finally:
+            sweep.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sweep
             for state in list(self.streams.values()):
                 state.fail("Gateway is shutting down")
             for bridge in list(self.browser_ws.values()):
@@ -557,6 +599,17 @@ class Gateway:
     def is_online(device: dict[str, Any] | None, stale_after: float = 45) -> bool:
         """Routing alias of the shared freshness criterion used by the device list too."""
         return device_online(device, stale_after)
+
+    async def device_sweep(self) -> None:
+        """Periodically drop registrations whose Agent has stayed offline past the TTL."""
+        ttl = device_offline_ttl_seconds(self.cfg)
+        if ttl <= 0:
+            return
+        while True:
+            await asyncio.sleep(DEVICE_SWEEP_INTERVAL_SECONDS)
+            removed = self.registry.prune_stale(time.time(), ttl)
+            if removed:
+                print(f"gateway: pruned {len(removed)} offline device registration(s)", flush=True)
 
     def choose_device(self) -> tuple[str, dict[str, Any]] | None:
         preferred = str(self.cfg.get("default_device") or "")

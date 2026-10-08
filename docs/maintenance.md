@@ -4,6 +4,14 @@
 
 ## 1. 先确认事实来源
 
+### PWA 名称/图标与离线注册清理（2026-10-08）
+
+- **PWA 应用名**：用户报告安装后启动器显示 `Mesh`。根因是 manifest 的 `short_name` 为 `Mesh`（`name` 才是 `OpenCode Mesh`），部分启动器取 `short_name`。已把 `short_name` 与 `name` 统一为 `OpenCode Mesh`；manifest 测试新增两条断言。
+- **PWA 图标**：用户报告安装图标与原版不同。根因是仓库用的是上游 **v2.0.18 的标签页 favicon**（`favicon-v3.svg`）栅格化的小 logo，而上游现在用于安装的是一套 `packages/ui/public/icons/prod/web-app-manifest-*.png`（圆角深色方块 + 立体标志）。已按用户确认的方案 1，把上游这套 192/512 图标**原样放进** `src/assets/pwa/`（Gateway 自己托管，安装不依赖 Agent 在线），删除不再使用的 `favicon-v3-2.0.18.svg`，并更新 `src/assets/pwa/README.md`、`tests/test_v2_pwa.py` 的哈希与几何断言（透明圆角、不透明中心、声明尺寸）。
+- **离线注册清理**：此前 Gateway 只在显式 `DELETE /_mesh/deregister/{id}` 时删除设备；Agent 离线后条目与令牌永久保留。新增 `Registry.prune_stale(now, ttl)` 与 `Gateway.device_sweep()` 后台任务：每小时清理“离线且最近活动（`last_seen` 或注册时间 `updated_at`）超过 TTL”的注册并持久化；在线设备永不清理。阈值配置 `device_offline_ttl_seconds` 默认 `86400`，`0`/负值关闭。清理只影响注册与令牌，设备重新上线用同一 `device_id` 重建。
+- **未验证**：以上均未部署、未在真机验收；PWA 名称/图标需在真机重新安装或刷新 manifest 后确认，TTL 清理需在 Gateway 运行观察。
+- **验证**：全量 pytest **484 passed**；`git diff --check` 通过。
+
 ### P2P 总开关与久置发送故障的定位（2026-10-07，Relay-only 现场结果待最终定论）
 
 - **背景**：此前记录的“久置后新消息发送阻塞”一直没有定位到根因（见下文 2026-10-04 条目）。为了判定是否只与 P2P 有关，新增 Gateway 配置 `p2p_enabled`（默认 `true`）。

@@ -10,7 +10,6 @@ import asyncio
 import base64
 import hashlib
 import json
-import math
 import re
 import struct
 import subprocess
@@ -29,12 +28,12 @@ from src.frontend import (PWA_ICON_DIR, PWA_ICON_SIZES, PWA_LINK_BLOCK, PWA_MANI
                           asset_prefix, normalize_pwa_links, pwa_service_worker_source)
 from src.main import Gateway, OFFLINE_PAGE, rewrite_device_html
 
-# Provenance of the derived launcher icons, recorded in src/assets/pwa/README.md.
-# Upstream source: packages/ui/src/assets/favicon/favicon-v3.svg @ anomalyco/opencode v2.0.18
-# (MIT, Copyright (c) 2025 opencode), rasterized with rsvg-convert 2.61.3.
+# Provenance of the launcher icons, recorded in src/assets/pwa/README.md.
+# Upstream source: packages/ui/public/icons/prod/web-app-manifest-*.png @
+# anomalyco/opencode (MIT, Copyright (c) 2025 opencode), committed verbatim.
 ICON_SHA256 = {
-    192: 'fb83ff4391107a9cdf4534e7ea5a7de9941d03e44d45e472b7324dfeab538073',
-    512: 'd8ee214f92544ec477bef8928e15b77a0de0f1ae5210f88f249562f285f80e9a',
+    192: 'a2aedd1def885e3b7d7adc7668725c3772996f1699c4524252f752f55707101b',
+    512: '324bd6ab9499f006519209eaa883519f37b9373a59d6eb01235189d4ac67ea27',
 }
 
 # Upstream v2.0.18 packages/app/index.html head, reduced to the link tags Mesh replaces.
@@ -77,10 +76,10 @@ async def _fetch_icons(client: httpx.AsyncClient) -> dict[int, bytes]:
     return icons
 
 
-def _decode_png_rgb(body: bytes) -> tuple[int, int, bytearray]:
-    """Decode the 8-bit non-interlaced RGB PNGs committed here, without an image dependency."""
+def _decode_png(body: bytes) -> tuple[int, int, bytearray, int]:
+    """Decode the 8-bit non-interlaced PNGs committed here, without an image dependency."""
     assert body[:8] == b'\x89PNG\r\n\x1a\n', 'icons must be real PNG bytes'
-    width = height = 0
+    width = height = channels = 0
     compressed = bytearray()
     position = 8
     while position < len(body):
@@ -88,14 +87,16 @@ def _decode_png_rgb(body: bytes) -> tuple[int, int, bytearray]:
         chunk = body[position + 8:position + 8 + length]
         if kind == b'IHDR':
             width, height, depth, color, _, _, interlace = struct.unpack('>IIBBBBB', chunk)
-            assert (depth, color, interlace) == (8, 2, 0), 'icons must be 8-bit non-interlaced RGB'
+            assert depth == 8 and interlace == 0, 'icons must be 8-bit non-interlaced'
+            assert color in (2, 6), 'icons must be RGB or RGBA'
+            channels = 3 if color == 2 else 4
         elif kind == b'IDAT':
             compressed += chunk
         elif kind == b'IEND':
             break
         position += 12 + length
     raw = zlib.decompress(bytes(compressed))
-    stride = width * 3
+    stride = width * channels
     pixels = bytearray(height * stride)
     previous = bytearray(stride)
     for row in range(height):
@@ -103,9 +104,9 @@ def _decode_png_rgb(body: bytes) -> tuple[int, int, bytearray]:
         filter_type = raw[start]
         line = bytearray(raw[start + 1:start + 1 + stride])
         for index in range(stride):
-            left = line[index - 3] if index >= 3 else 0
+            left = line[index - channels] if index >= channels else 0
             up = previous[index]
-            upper_left = previous[index - 3] if index >= 3 else 0
+            upper_left = previous[index - channels] if index >= channels else 0
             if filter_type == 1:
                 line[index] = (line[index] + left) & 0xFF
             elif filter_type == 2:
@@ -118,7 +119,7 @@ def _decode_png_rgb(body: bytes) -> tuple[int, int, bytearray]:
                 line[index] = (line[index] + (left, up, upper_left)[distances.index(min(distances))]) & 0xFF
         pixels[row * stride:(row + 1) * stride] = line
         previous = line
-    return width, height, pixels
+    return width, height, pixels, channels
 
 
 # ---------- worker ----------
@@ -184,6 +185,9 @@ def test_manifest_describes_one_gateway_scoped_application(tmp_path):
 
     assert document['start_url'] == '/' and document['scope'] == '/'
     assert document['display'] == 'standalone'
+    assert document['name'] == 'OpenCode Mesh'
+    # The installed label must not abbreviate to 'Mesh' on launchers that prefer short_name.
+    assert document['short_name'] == 'OpenCode Mesh'
     # A per-launch handoff parameter would break last-route restore and single-app identity.
     assert '?' not in document['start_url'] and '#' not in document['start_url']
     sizes = {icon['sizes']: icon for icon in document['icons']}
@@ -241,11 +245,13 @@ def test_icons_are_served_from_gateway_bytes_with_recorded_hashes(tmp_path):
     assert 'Copyright (c) 2025 opencode' in (PWA_ICON_DIR / 'LICENSE-OpenCode.txt').read_text()
 
 
-def test_icons_keep_their_content_inside_the_maskable_safe_zone(tmp_path):
-    """``purpose="any maskable"`` only holds while the logo survives an aggressive circular mask.
+def test_icons_are_opaque_centred_artwork_with_transparent_corners(tmp_path):
+    """The launcher icons are upstream's rounded-square artwork, committed verbatim.
 
-    A maskable icon is cropped to a circle of diameter 80%, and its background
-    must be opaque: a transparent canvas is masked to black on Android.
+    They are declared ``purpose="any maskable"`` exactly as the upstream manifest
+    declares the same files, so an Android launcher masks them the same way; the
+    artwork itself supplies a rounded square with transparent corners and an
+    opaque centre. This pins those properties without an image dependency.
     """
     async def scenario():
         gateway = _gateway(tmp_path / 'registry.json')
@@ -254,22 +260,19 @@ def test_icons_keep_their_content_inside_the_maskable_safe_zone(tmp_path):
     icons = asyncio.run(scenario())
 
     for size, body in icons.items():
-        width, height, pixels = _decode_png_rgb(body)
+        width, height, pixels, channels = _decode_png(body)
+        assert channels == 4, 'the committed icons carry an alpha channel'
         assert (width, height) == (size, size)
-        background = bytes(pixels[:3])
-        assert background == b'\x13\x10\x10', 'the icon paints its own full-bleed background'
-        xs, ys = [], []
-        for y in range(height):
-            for x in range(width):
-                offset = (y * width + x) * 3
-                if bytes(pixels[offset:offset + 3]) != background:
-                    xs.append(x)
-                    ys.append(y)
-        assert xs, 'the icon must not be a blank canvas'
-        center = (size - 1) / 2
-        radius = max(math.hypot(x - center, y - center) for x, y in zip(xs, ys))
-        assert radius <= 0.4 * size, f'content at {radius:.1f}px exceeds the {0.4 * size:.1f}px safe radius'
-        assert abs(center - (min(xs) + max(xs)) / 2) <= 1 and abs(center - (min(ys) + max(ys)) / 2) <= 1
+
+        def alpha_at(x, y):
+            return pixels[(y * width + x) * channels + 3]
+
+        corners = [alpha_at(0, 0), alpha_at(width - 1, 0), alpha_at(0, height - 1), alpha_at(width - 1, height - 1)]
+        assert corners == [0, 0, 0, 0], 'the rounded square leaves the corners transparent'
+        assert alpha_at(width // 2, height // 2) == 255, 'the artwork must not be blank'
+        sampled = sum(1 for y in range(0, height, 4) for x in range(0, width, 4) if alpha_at(x, y) > 0)
+        total = (height // 4) * (width // 4)
+        assert sampled > 0.5 * total, 'the artwork must fill most of the canvas'
 
 
 def test_missing_icon_files_fail_at_startup(tmp_path, monkeypatch):

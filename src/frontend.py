@@ -73,7 +73,9 @@ def pwa_manifest_document() -> dict:
     """One Gateway-scoped application, independent of which device serves a page."""
     return {
         'name': 'OpenCode Mesh',
-        'short_name': 'Mesh',
+        # Launchers may prefer short_name for the installed label; keep it the same
+        # product name instead of the abbreviated 'Mesh' users saw on their home screen.
+        'short_name': 'OpenCode Mesh',
         # Distinct from the native app's id '/' on this origin, and fixed so a
         # reinstall keeps the same identity. A per-launch handoff parameter
         # would break last-route restore and turn one installation into many.

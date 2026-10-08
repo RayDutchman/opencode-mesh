@@ -173,6 +173,77 @@ def test_p2p_disabled_configuration_switches_off_the_manifest_and_offers():
     asyncio.run(scenario())
 
 
+# ---------- offline registration pruning ----------
+
+def test_offline_registrations_are_pruned_after_the_ttl(tmp_path):
+    """A device offline past the TTL is dropped; online and recent ones are kept."""
+    registry = mesh_main.Registry({'state_file': str(tmp_path / 'registry.json')})
+    now = time.time()
+    registry.devices = {
+        'online-a': {'device_id': 'online-a', 'ws': object(), 'last_seen': now},
+        'fresh-b': {'device_id': 'fresh-b', 'ws': object(), 'last_seen': now - 10},
+        'stale-c': {'device_id': 'stale-c', 'ws': object(), 'last_seen': now - 100000},
+        'never-d': {'device_id': 'never-d', 'updated_at': now - 100000},
+        'recent-e': {'device_id': 'recent-e', 'updated_at': now - 5},
+    }
+
+    removed = registry.prune_stale(now, 86400)
+
+    assert sorted(removed) == ['never-d', 'stale-c']
+    assert set(registry.devices) == {'online-a', 'fresh-b', 'recent-e'}
+    saved = json.loads((tmp_path / 'registry.json').read_text())['devices']
+    assert 'stale-c' not in saved and 'online-a' in saved
+
+
+def test_pruning_uses_the_registration_time_of_a_device_that_never_connected(tmp_path):
+    registry = mesh_main.Registry({'state_file': str(tmp_path / 'registry.json')})
+    now = time.time()
+    registry.devices = {'never-a': {'device_id': 'never-a', 'updated_at': now - 10}}
+    assert registry.prune_stale(now, 86400) == []
+    assert registry.prune_stale(now, 5) == ['never-a']
+
+
+def test_a_device_online_is_never_pruned_even_with_a_stale_updated_at(tmp_path):
+    registry = mesh_main.Registry({'state_file': str(tmp_path / 'registry.json')})
+    now = time.time()
+    registry.devices = {'online-a': {'device_id': 'online-a', 'ws': object(),
+                                     'last_seen': now, 'updated_at': now - 100000}}
+    assert registry.prune_stale(now, 1) == []
+
+
+@pytest.mark.parametrize('value,expected', [
+    (None, 86400.0), (0, 0.0), (-1, -1.0), ('3600', 3600.0), ('bad', 86400.0),
+])
+def test_device_offline_ttl_seconds_reads_config(value, expected):
+    cfg = {} if value is None else {'device_offline_ttl_seconds': value}
+    assert mesh_main.device_offline_ttl_seconds(cfg) == expected
+
+
+def test_gateway_sweep_removes_an_offline_registration(tmp_path, monkeypatch):
+    """The lifespan task prunes the registry and persists it; an online device survives."""
+    monkeypatch.setattr(mesh_main, 'DEVICE_SWEEP_INTERVAL_SECONDS', 0.01)
+    gateway = Gateway({'state_file': str(tmp_path / 'registry.json'),
+                       'auth': {'username': 'test', 'password': 'test-pass'},
+                       'device_offline_ttl_seconds': 100})
+    now = time.time()
+    gateway.registry.devices = {
+        'online-a': {'device_id': 'online-a', 'ws': object(), 'last_seen': now},
+        'stale-b': {'device_id': 'stale-b', 'updated_at': now - 1000},
+    }
+
+    async def scenario():
+        async with gateway.lifespan(None):
+            for _ in range(200):
+                if 'stale-b' not in gateway.registry.devices:
+                    break
+                await asyncio.sleep(0.01)
+        return dict(gateway.registry.devices)
+
+    devices = asyncio.run(scenario())
+    assert set(devices) == {'online-a'}
+    assert 'stale-b' not in json.loads((tmp_path / 'registry.json').read_text())['devices']
+
+
 # ---------- browser WebSocket gate uses the same freshness criterion ----------
 #
 # A browser link to an explicit device must use exactly the criterion the list
