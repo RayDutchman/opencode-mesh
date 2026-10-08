@@ -30,10 +30,11 @@ from src.main import Gateway, OFFLINE_PAGE, rewrite_device_html
 
 # Provenance of the launcher icons, recorded in src/assets/pwa/README.md.
 # Upstream source: packages/ui/public/icons/prod/web-app-manifest-*.png @
-# anomalyco/opencode (MIT, Copyright (c) 2025 opencode), committed verbatim.
+# anomalyco/opencode (MIT, Copyright (c) 2025 opencode); the transparent corners
+# are edge-filled so the committed icons are opaque RGB, as a maskable icon must be.
 ICON_SHA256 = {
-    192: 'a2aedd1def885e3b7d7adc7668725c3772996f1699c4524252f752f55707101b',
-    512: '324bd6ab9499f006519209eaa883519f37b9373a59d6eb01235189d4ac67ea27',
+    192: '6dee7f9abbcf1dec1393dccb98ccac8b33dc249c05b9dc969f7e09c0b3e2b843',
+    512: '4e887d25a349305165a108ec63c3faed4c67567fc54af9ea2b56a7364f2e20b9',
 }
 
 # Upstream v2.0.18 packages/app/index.html head, reduced to the link tags Mesh replaces.
@@ -245,13 +246,14 @@ def test_icons_are_served_from_gateway_bytes_with_recorded_hashes(tmp_path):
     assert 'Copyright (c) 2025 opencode' in (PWA_ICON_DIR / 'LICENSE-OpenCode.txt').read_text()
 
 
-def test_icons_are_opaque_centred_artwork_with_transparent_corners(tmp_path):
-    """The launcher icons are upstream's rounded-square artwork, committed verbatim.
+def test_icons_are_opaque_full_bleed_pngs(tmp_path):
+    """``purpose="any maskable"`` requires an opaque, full-bleed icon.
 
-    They are declared ``purpose="any maskable"`` exactly as the upstream manifest
-    declares the same files, so an Android launcher masks them the same way; the
-    artwork itself supplies a rounded square with transparent corners and an
-    opaque centre. This pins those properties without an image dependency.
+    A transparent background is masked to black on Android, so the committed
+    icons must be 8-bit RGB with no alpha channel and a non-blank canvas. The
+    upstream ``prod`` artwork ships with transparent rounded corners; the
+    committed copies edge-fill those corners, which is why their hashes differ
+    from the upstream files.
     """
     async def scenario():
         gateway = _gateway(tmp_path / 'registry.json')
@@ -261,18 +263,11 @@ def test_icons_are_opaque_centred_artwork_with_transparent_corners(tmp_path):
 
     for size, body in icons.items():
         width, height, pixels, channels = _decode_png(body)
-        assert channels == 4, 'the committed icons carry an alpha channel'
+        assert channels == 3, 'the icons must be opaque RGB, without an alpha channel'
         assert (width, height) == (size, size)
-
-        def alpha_at(x, y):
-            return pixels[(y * width + x) * channels + 3]
-
-        corners = [alpha_at(0, 0), alpha_at(width - 1, 0), alpha_at(0, height - 1), alpha_at(width - 1, height - 1)]
-        assert corners == [0, 0, 0, 0], 'the rounded square leaves the corners transparent'
-        assert alpha_at(width // 2, height // 2) == 255, 'the artwork must not be blank'
-        sampled = sum(1 for y in range(0, height, 4) for x in range(0, width, 4) if alpha_at(x, y) > 0)
-        total = (height // 4) * (width // 4)
-        assert sampled > 0.5 * total, 'the artwork must fill most of the canvas'
+        sampled = [pixels[i] for i in range(0, len(pixels), 997)]
+        assert min(sampled) < 60, 'the artwork must keep its dark background'
+        assert max(sampled) > 150, 'the artwork must not be a blank canvas'
 
 
 def test_missing_icon_files_fail_at_startup(tmp_path, monkeypatch):
