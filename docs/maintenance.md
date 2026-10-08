@@ -11,7 +11,8 @@
 - **差异结果**：manifest 仅 `short_name` 从 `Mesh` 改为 `OpenCode Mesh`；两个图标已替换；SW 响应仅首行版本从 `0.3.2` 变为 `0.3.3`，逻辑未改。HTML 链接扫描的行偏移计算做过优化，PWA 规范化规则未变。认证、匿名图标白名单、PWA 资源路由与设备 HTML 重写入口未变。其他改动涉及状态栏、P2P 和 Agent 管理；未发现能据此确定安装失败根因的证据，回退仍失败也不能排除代码或运行环境。
 - **图标修正**：`1afe763` 曾将上游透明圆角填成不透明 RGB，造成与原版的字节及透明度差异。本轮恢复 `ce1255c` 的原样 PNG；已直接读取运行中的原版 `/site.webmanifest` 及其两个图标，SHA-256 与恢复文件完全一致。真实上游源码路径和哈希见 `src/assets/pwa/README.md`。
 - **验证状态**：已先更新既有哈希/透明度测试，确认填充版出现 2 项预期失败；恢复后全量 `python -m pytest -q -p no:cacheprovider -W error::DeprecationWarning -rs --tb=short` 为 **484 passed in 34.87s**，`git diff --check` 通过。
-- **边界/剩余项**：本轮修正尚未提交或部署；真机安装与启动器最终显示未验证。保留 Mesh 的 `any maskable` 声明，平台裁切效果不由字节一致性保证。按用户要求到此收束，后续发布依据授权执行。
+- **发布核验**：获用户授权后，修正提交 `78a2434` 已推送并部署 VPS Gateway；远端 `.mesh-revision` 一致、服务 active。两个图标经公网 HTTPS 匿名 GET 均为 200，响应字节与仓库及原版完全一致；manifest 名称/简称均为 `OpenCode Mesh`，传输 manifest 的 `p2p.disabled=true`。本节部署记录为随后追加的文档提交，运行源码仍为 `78a2434`。
+- **边界/剩余项**：真机安装与启动器最终显示未验证。保留 Mesh 的 `any maskable` 声明，平台裁切效果不由字节一致性保证。按用户要求到此收束。
 
 ### PWA 名称/图标与离线注册清理（2026-10-08）
 
