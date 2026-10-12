@@ -1394,6 +1394,7 @@ class Agent:
         self.cfg = cfg
         self.app = FastAPI(title="OpenCode Mesh Agent")
         self.target = cfg["opencode_url"].rstrip("/")
+        self._http_ssl_context = None
         self.ws_queues: dict[str, asyncio.Queue] = {}
         self.p2p_peers: set[Any] = set()
         self.p2p_tasks: dict[tuple[int, str], asyncio.Task] = {}
@@ -1411,6 +1412,13 @@ class Agent:
         self.upstream_health = "unknown"
         self.upstream_health_completed = None
         self.routes()
+
+    def http_ssl_context(self):
+        # Reuse the native CA store, but keep clients and cookies request-local.
+        # HTTPX also creates TLS contexts for plain HTTP and environment proxies.
+        if self._http_ssl_context is None:
+            self._http_ssl_context = httpx.create_ssl_context()
+        return self._http_ssl_context
 
     def routes(self):
         @self.app.get("/_mesh/health")
@@ -1538,7 +1546,8 @@ class Agent:
         auth = httpx.BasicAuth(str(basic["username"]), str(basic.get("password", ""))) if isinstance(basic, dict) else None
         guard = ResponseSizeGuard(response_limit(self.cfg))
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10), auth=auth, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10), auth=auth,
+                                         follow_redirects=True, verify=self.http_ssl_context()) as client:
                 body = decode_strict(item.get("body", ""))
                 async with client.stream(item["method"], url, headers=headers, content=body) as r:
                     out_headers = filter_response_headers(r.headers)
@@ -1950,7 +1959,8 @@ class Agent:
         if isinstance(basic, dict) and basic.get("username") is not None:
             auth = httpx.BasicAuth(str(basic["username"]), str(basic.get("password", "")))
         limit = response_limit(self.cfg)
-        async with httpx.AsyncClient(timeout=timeout, auth=auth, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=timeout, auth=auth, follow_redirects=True,
+                                     verify=self.http_ssl_context()) as client:
             try:
                 body = decode_strict(item.get("body", ""))
                 async with client.stream(item["method"], url, headers=headers, content=body) as r:
@@ -1994,7 +2004,8 @@ class Agent:
         failures = 0
         basic = self.cfg.get("opencode_basic_auth")
         auth = httpx.BasicAuth(str(basic["username"]), str(basic.get("password", ""))) if isinstance(basic, dict) and basic.get("username") else None
-        async with httpx.AsyncClient(auth=auth, follow_redirects=False) as client:
+        async with httpx.AsyncClient(auth=auth, follow_redirects=False,
+                                     verify=self.http_ssl_context()) as client:
             while True:
                 status = "unhealthy"
                 try:
@@ -2052,7 +2063,7 @@ class Agent:
         attempt = 0
         while True:
             try:
-                async with httpx.AsyncClient(timeout=20) as client:
+                async with httpx.AsyncClient(timeout=20, verify=self.http_ssl_context()) as client:
                     r = await client.post(gateway_url + "/_mesh/register", json={
                         "device_id": data["device_id"], "name": self.cfg.get("device_name") or hostname(), "platform": platform.platform(),
                          "enroll_token": self.cfg["enroll_token"], "agent_token": data.get("agent_token", ""),

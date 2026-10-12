@@ -1659,6 +1659,64 @@ def test_transient_connection_failure_uses_connection_failed_reason():
     assert _decode_error_body(result).get("reason") == CONNECTION_FAILED_REASON
 
 
+def test_agent_http_requests_reuse_verified_tls_context_without_sharing_cookies(monkeypatch):
+    """Repeated short requests must not reload native CA stores or retain cookies."""
+    import ssl
+
+    contexts = []
+    create_context = ssl.create_default_context
+
+    def record_context(*args, **kwargs):
+        context = create_context(*args, **kwargs)
+        contexts.append(context)
+        return context
+
+    monkeypatch.setattr(ssl, "create_default_context", record_context)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+
+    async def scenario():
+        requests = []
+
+        async def serve(reader, writer):
+            try:
+                requests.append(await reader.readuntil(b"\r\n\r\n"))
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                             b"Set-Cookie: session=private\r\nConnection: close\r\n\r\nok")
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        async with server:
+            port = server.sockets[0].getsockname()[1]
+            agent = Agent({"opencode_url": f"http://127.0.0.1:{port}"})
+            frames = []
+
+            async def send(ws, frame):
+                frames.append(frame)
+
+            agent.stream_send = send
+            for index in range(6):
+                item = {"id": str(index), "method": "GET", "path": "/", "body": ""}
+                if index % 2:
+                    await agent.local_stream(item, None)
+                    assert frames[-1]["type"] == "stream_end"
+                    assert unb64(frames[-2]["body"]) == b"ok"
+                else:
+                    response = await agent.local_request(item)
+                    assert response["status"] == 200
+                    assert unb64(response["body"]) == b"ok"
+        assert len(requests) == 6
+        assert all(b"\r\ncookie:" not in request.lower() for request in requests)
+
+    asyncio.run(scenario())
+    assert len(contexts) == 1
+    assert contexts[0].verify_mode == ssl.CERT_REQUIRED
+    assert contexts[0].check_hostname
+    assert contexts[0].cert_store_stats()["x509_ca"] > 0
+
+
 def test_local_request_follows_redirects():
     """The Agent proxy must follow redirects (matching native fetch's default redirect:'follow')."""
     import threading
