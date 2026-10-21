@@ -39,8 +39,9 @@ def test_asset_namespace_preserves_device_and_rejects_api():
         parse_asset_route(prefix + '/api/session')
 
 
-def test_entry_adapter_only_changes_bootstrap_getter():
-    original = b'function a(){return location.origin}const config={currentServerUrl:a(),defaultServerUrl:b()};let link=location.origin;'
+@pytest.mark.parametrize('legacy_default', [b',defaultServerUrl:b()', b''])
+def test_entry_adapter_only_changes_bootstrap_getter(legacy_default):
+    original = b'function a(){return location.origin}const config={currentServerUrl:a()' + legacy_default + b'};let link=location.origin;'
     result = adapt_entry('/_assets/index-test.js', original).decode()
     assert result.startswith('await window.__ocmBootstrap.ready;')
     assert 'function a(){return window.__ocmBootstrap.serverUrl}' in result
@@ -48,7 +49,8 @@ def test_entry_adapter_only_changes_bootstrap_getter():
     assert adapt_entry('/_assets/library-test.js', original) == original
 
 
-@pytest.mark.parametrize('source', [b'unknown frontend', b'function a(){return location.origin}function b(){return location.origin}currentServerUrl;defaultServerUrl;'])
+@pytest.mark.parametrize('source', [b'unknown frontend', b'function a(){return location.origin}function b(){return location.origin}currentServerUrl;defaultServerUrl;',
+                                  b'function a(){return location.origin}const config={currentServerUrl:other(),defaultServerUrl:b()};'])
 def test_unknown_entry_contract_fails_explicitly(source):
     with pytest.raises(ValueError, match='bootstrap'):
         adapt_entry('/_assets/index-test.js', source)
@@ -63,7 +65,7 @@ def test_gateway_serves_adapted_assets_and_rejects_implicit_api(tmp_path):
         async def respond(ws, item, **kwargs):
             paths.append(item['path'])
             if item['path'].startswith('/_assets/'):
-                body = b'function a(){return location.origin}currentServerUrl;defaultServerUrl;'
+                body = b'function a(){return location.origin}const config={currentServerUrl:a()};'
                 if '/preload-helper-' in item['path']:
                     body = b'var asset=function(e){return`/`+e};'
                 mime = 'text/javascript'

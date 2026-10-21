@@ -218,10 +218,14 @@ def adapt_entry(path: str, body: bytes, device_id: str | None = None) -> bytes:
         return re.sub(prefix, lambda m: b'function(' + m[1] + b'){return ' + root + b'+' + m[1] + b'}', body)
     if not re.fullmatch(r'/_assets/index-[\w-]+\.js', path):
         return body
-    # The getter must be unique in a real V2.0.6 bundle; if a newer build changes
-    # the structure, fail explicitly instead of guessing a replacement.
-    getter = rb'(function [\w$]+\(\)\{return )location\.origin(\})'
-    if b'currentServerUrl' not in body or b'defaultServerUrl' not in body or len(re.findall(getter, body)) != 1:
+    # V2.1 removed defaultServerUrl. Bind the unique origin getter to the
+    # currentServerUrl initializer instead of relying on that unrelated field.
+    getter = rb'(function ([\w$]+)\(\)\{return )location\.origin(\})'
+    matches = list(re.finditer(getter, body))
+    if len(matches) != 1:
         raise ValueError('Unsupported OpenCode bootstrap contract')
-    patched = re.sub(getter, rb'\1window.__ocmBootstrap.serverUrl\2', body)
+    initializer = rb'\bcurrentServerUrl\s*:\s*' + re.escape(matches[0][2]) + rb'\(\)\s*[,}]'
+    if len(re.findall(initializer, body)) != 1:
+        raise ValueError('Unsupported OpenCode bootstrap contract')
+    patched = re.sub(getter, rb'\1window.__ocmBootstrap.serverUrl\3', body)
     return b'await window.__ocmBootstrap.ready;\n' + patched

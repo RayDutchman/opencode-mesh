@@ -4,6 +4,13 @@
 
 ## 1. 先确认事实来源
 
+### OpenCode 2.1.x 前端入口兼容修复（2026-10-21）
+
+- **现象/根因**：升级后设备健康但页面只有 Mesh 横条。实际读取 WSL、Windows 的 2.1.2 入口 `index-W_M9BTih.js`，发现上游删除了 `defaultServerUrl`；旧适配器将该字段作为必要条件，导致入口资源返回 `502 Unsupported OpenCode bootstrap contract`。健康探测成功并不代表前端入口兼容。
+- **修复**：保留唯一 `location.origin` getter 检查，进一步核验 `currentServerUrl` 初始化实际调用该 getter；不再要求无关的 `defaultServerUrl`。入口仍等待 Mesh bootstrap，只替换已确认的 getter；未知结构、重复 getter 和不匹配的初始化调用仍拒绝。
+- **验证**：先复现三个预期失败（新版入口、Gateway 入口响应、错误 getter 绑定），修复后全量 **487 passed in 35.51s**。临时回环 Gateway 和两个临时 Agent 接入真实 WSL、Windows 2.1.2，在隔离 Chrome 上验证原生界面挂载、项目区显示、原生设备选择及 Mesh 设备菜单切换；两个设备的 `/api/info` 均为 200，未见脚本加载失败或控制台 error/warn。
+- **边界/剩余项**：未提交、推送或部署线上 Gateway；真实 PVE 2.1.0–2.1.2、线上认证/传输环境及 P2P 未在本轮验收（本地浏览器使用 Relay）。部署后需要复验三台设备。
+
 ### Agent HTTP TLS 上下文复用（本机验证）
 
 - **现象与定位**：多实例 Agent 长时间运行后 RSS 明显增长，主要为 native heap。限制普通请求并发的试验没有改善，已完整撤回。Python 3.14.4 / HTTPX 0.28.1 下，500 次串行、每次仅返回 2 字节的回环 HTTP 请求即可使原版 RSS 从约 57 MiB 增至 356 MiB；结束时有 424 个待 GC 的 SSLContext。显式 GC 能回收上下文，但 RSS 没有随之下降，不能将 RSS 全部视为存活 Python 对象。
